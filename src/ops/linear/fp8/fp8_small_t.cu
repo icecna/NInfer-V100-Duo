@@ -71,6 +71,13 @@ void launch_fp8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cuda
 #else
         break;
 #endif
+    case Fp8Problem::VocabularyTp2Column:
+#ifdef NINFER_VOLTA_BUILD
+        launch_registered<Fp8VocabularyTp2ColumnGeometry>(x, weight, out, stream);
+        return;
+#else
+        break;
+#endif
     case Fp8Problem::Residual6144:
         launch_registered<Fp8Residual6144Geometry>(x, weight, out, stream);
         return;
@@ -87,10 +94,12 @@ void launch_fp8_small_t(const Tensor& x, const Weight& weight, Tensor& out, cuda
     case Fp8Problem::GdnInputTp2Column:
         launch_registered<Fp8GdnInputTp2ColumnGeometry>(x, weight, out, stream);
         return;
-    case Fp8Problem::VocabularyTp2Column:
     case Fp8Problem::MlpGateUpTp2Column:
+        launch_registered<Fp8MlpGateUpTp2ColumnGeometry>(x, weight, out, stream);
+        return;
     case Fp8Problem::AttnInputTp2Column:
-        break;
+        launch_registered<Fp8AttnInputTp2ColumnGeometry>(x, weight, out, stream);
+        return;
     }
     throw std::logic_error("FP8 vocabulary small-T uses its A16 MMA route");
 }

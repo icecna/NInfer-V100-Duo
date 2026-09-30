@@ -25,12 +25,9 @@ bool fp8_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t) noe
     // 32x8 route, so here the alternative is chunking -- reading the whole weight twice -- and the
     // second tile wins easily.
     //
-    // The vocabulary problem has no legal Volta SIMT fallback: its generic decode entry point is
-    // intentionally reserved for the A16 MMA family, which requires sm_75. QPN is slightly slower
-    // than the specialized SIMT decoder at T=1 on shapes that own one, but it is the executable
-    // A16 route for the full and TP2 vocabulary heads and is numerically valid for both native and
-    // prepacked layouts.
-    return t >= 1 && t <= 4 * S::kRowsPerTile;
+    // T=1 is excluded: the SIMT decode kernel reads 446.7 GB/s there against this kernel's 434.5,
+    // because a single row leaves seven of the tile's eight A rows padded with zeros.
+    return t >= 2 && t <= 4 * S::kRowsPerTile;
 }
 
 void launch_fp8_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {

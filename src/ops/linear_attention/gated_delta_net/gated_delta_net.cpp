@@ -186,6 +186,15 @@ ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t q
                                             std::int32_t value_heads, std::int32_t tokens,
                                             bool normalize_qk) {
     ChunkedWorkspace out;
+#ifdef NINFER_VOLTA_BUILD
+    if (normalize_qk && tokens >= detail::gated_delta_net::kChunkSize) {
+        out.normalized_q =
+            allocator.alloc(DType::FP32, {detail::gated_delta_net::kStateDim, qk_heads, tokens});
+        out.normalized_k =
+            allocator.alloc(DType::FP32, {detail::gated_delta_net::kStateDim, qk_heads, tokens});
+    }
+    (void)value_heads;
+#else
     const std::int32_t full =
         (tokens / detail::gated_delta_net::kChunkSize) * detail::gated_delta_net::kChunkSize;
     if (full == 0) { return out; }
@@ -197,6 +206,7 @@ ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t q
     }
     out.stage =
         allocator.alloc_bytes(detail::gated_delta_net::chunked_workspace_bytes(value_heads, full));
+#endif
     return out;
 }
 
@@ -252,23 +262,20 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
     auto scratch_scope   = ws.scope();
     const std::int32_t T = q.ne[2];
 #ifdef NINFER_VOLTA_BUILD
-    // launch_chunked (gated_delta_net/chunked/*) is the parallel/matmul GDN formulation and
-    // needs Ampere+ mma.sync -- trap-stubbed on sm_70. Forcing T_full=0 routes the entire width
-    // through the tail path below (launch_recurrent_inout), which is the same per-token
-    // sequential-in-one-launch kernel already used for T<kChunkSize tails and for decode
-    // (recurrent_bf16_direct_kernel: `for (token = 0; token < width; ++token)`, state kept in
-    // registers, no compile-time width bound). This matches llama.cpp's own ggml-cuda GDN
-    // kernel, which has no separate chunked/matmul path at all (see its own
-    // "TODO: Add chunked kernel for even faster pre-fill") and vLLM/FLA's default backend,
-    // whose only Volta-specific customization is elsewhere (attention), not GDN's recurrence.
-    // Slower than a real chunk-parallel tensor-core kernel for very long prompts, but correct,
-    // and per 1Cat-vLLM's own SM70 profiling, GDN is a single-digit-percent share of prefill
-    // time next to the GEMM/attention cost anyway. See the V100 performance summary.
-    const std::int32_t T_full = 0;
+    // The SM70 route retains the FP32 sequential state transition. For wide normalized
+    // inputs, prepare Q/K once instead of repeating their norms for every state tile.
+    ChunkedWorkspace scratch = allocate_chunked_workspace(ws, q.ne[1], v.ne[1], T, normalize_qk);
+    if (normalize_qk && T >= detail::gated_delta_net::kChunkSize) {
+        detail::gated_delta_net::launch_recurrent_prepared(
+            q, k, v, g, beta, scale, scratch.normalized_q, scratch.normalized_k,
+            ssm_state_in, ssm_state_out, out, stream);
+    } else {
+        detail::gated_delta_net::launch_recurrent_inout(
+            q, k, v, g, beta, scale, normalize_qk, ssm_state_in, ssm_state_out, out, stream);
+    }
 #else
     const std::int32_t T_full =
         (T / detail::gated_delta_net::kChunkSize) * detail::gated_delta_net::kChunkSize;
-#endif
     ChunkedWorkspace scratch = allocate_chunked_workspace(ws, q.ne[1], v.ne[1], T, normalize_qk);
     Tensor q_compute         = q;
     Tensor k_compute         = k;
@@ -308,6 +315,7 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                                                         scale, recurrent_normalize, tail_in,
                                                         ssm_state_out, out_tail, stream);
     }
+#endif
 }
 
 } // namespace ninfer::ops

@@ -106,11 +106,9 @@ void fp8_gdn_input_a16_dispatch_shard(const Tensor& x, const Weight& weight, Ten
         fp8_gdn_input_cutlass_sm70_launch_shard(x, weight, qkv, z, *workspace, stream);
         return;
     }
-#endif
-#ifdef NINFER_VOLTA_BUILD
-    const bool qpn = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens);
-    const std::int32_t kChunk =
-        qpn ? kFp8VoltaQpnMaxTokens : kFp8LinearSmallTMax<Fp8GdnInputTp2ColumnGeometry>;
+    const std::int32_t kChunk = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens)
+                                    ? kFp8VoltaQpnMaxTokens
+                                    : kFp8LinearSmallTMax<Fp8GdnInputTp2ColumnGeometry>;
 #else
     constexpr std::int32_t kChunk = kFp8LinearSmallTMax<Fp8GdnInputTp2ColumnGeometry>;
 #endif
@@ -140,25 +138,6 @@ void fp8_gdn_input_a16_dispatch_shard(const Tensor& x, const Weight& weight, Ten
     }
 }
 
-std::size_t fp8_gdn_input_shard_workspace_capacity_bytes(LinearPolicy policy,
-                                                          std::int32_t min_tokens,
-                                                          std::int32_t max_tokens) {
-    if (min_tokens <= 0 || max_tokens < min_tokens) {
-        throw std::invalid_argument("fp8 gdn_input_proj shard workspace: invalid token interval");
-    }
-    (void)resolve_route(policy, min_tokens);
-    if (resolve_route(policy, max_tokens) == Fp8GdnInputRoute::A8) {
-        return fp8_a8_workspace_capacity_bytes(max_tokens,
-                                               Fp8GdnInputTp2ColumnGeometry::kInputRows);
-    }
-#ifdef NINFER_VOLTA_BUILD
-    if (max_tokens >= kVoltaCutlassMinT) {
-        return fp8_gdn_input_cutlass_shard_workspace_bytes(max_tokens);
-    }
-#endif
-    return 0;
-}
-
 void fp8_gdn_input_a8_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope                   = workspace.scope();
@@ -178,7 +157,10 @@ void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, 
     fp8_gdn_input_a8_dispatch(x, weight, qkv, z, *workspace, stream);
 }
 
-// The tp2 column shard sizes the A16 CUTLASS projection plane to its halved output extent.
+// The tp2 column shard. Workspace capacity is a pure function of (tokens, K), and
+// K=5120 is unchanged by the shard, so fp8_gdn_input_workspace_capacity_bytes (tp1) is reused
+// unchanged -- no `_shard` capacity function exists or is needed, the same rule NVFP4's shard of
+// this family follows.
 void fp8_gdn_input_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                   LinearPolicy policy, WorkspaceArena* workspace,
                                   cudaStream_t stream) {

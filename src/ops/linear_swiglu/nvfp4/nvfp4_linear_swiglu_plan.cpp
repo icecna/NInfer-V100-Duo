@@ -2,6 +2,7 @@
 
 #include "core/layout.h"
 #include "ninfer/ops/silu_mul.h"
+#include "ops/linear_swiglu/swiglu_fp32.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma_launch.h"
@@ -44,24 +45,15 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (policy == LinearPolicy::A16Only) {
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
 #ifdef NINFER_VOLTA_BUILD
-        // T>=2 on Volta: two independent QPN2 passes (one per weight half). Gate is retained in
-        // fp32 scratch and the up pass applies silu(gate)*up before the single BF16 round -- not
-        // the fused single-kernel route (VoltaQpnFused, still built and correct, now unused in production)
-        // and not the unfused linear()+silu_mul() composition (tried first, failed the
-        // correctness test the same way the fused kernel's own precision note explains). Measured
-        // against the fused kernel directly at T=4: 371.6 GB/s per QPN2 pass against the fused
-        // kernel's 225.4 GB/s across the same total weight -- the fused kernel's doubled
-        // accumulator and decode registers cost more than sharing the activation load saves.
-        // Splitting also extends the fast, precision-safe route through T=32 (kNvfp4VoltaQpnMaxTokens),
-        // where T=17..32 previously fell to the same untested-precision composition this route
-        // replaces at T<=16. See the NVFP4 decode sweep.
         if (nvfp4_linear_swiglu_qpn_split_supported(
                 Nvfp4MlpGateUpGeometry::kOutputRows,
                 Nvfp4MlpGateUpGeometry::kInputRows, tokens)) {
             return Nvfp4LinearSwiGluRoute::VoltaQpnSplit;
         }
+        // Keep the independent dequantize+CUTLASS route outside the QPN2 shape domain.
         return Nvfp4LinearSwiGluRoute::VoltaCutlass;
 #else
+        if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
         if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
 #endif
         // Above the fused A16 registration, take the same baseline the A4 policy uses for wide T:
@@ -124,8 +116,7 @@ Nvfp4QpnSplitWorkspace allocate_qpn_split_workspace(Allocator& allocator, std::i
     Nvfp4QpnSplitWorkspace out;
     out.gate = allocator.alloc_bytes(bytes, 256);
     out.activation = allocator.alloc_bytes(
-        static_cast<std::size_t>(Geometry::kInputRows) * tokens * sizeof(std::uint16_t),
-        256);
+        static_cast<std::size_t>(Geometry::kInputRows) * tokens * sizeof(std::uint16_t), 256);
     return out;
 }
 
@@ -139,7 +130,7 @@ std::size_t qpn_split_workspace_bytes(std::int32_t tokens) {
 template <class Geometry>
 std::size_t cutlass_route_workspace_bytes(std::int32_t tokens) {
     const std::size_t projected = static_cast<std::size_t>(
-        Geometry::kOutputRows) * tokens * sizeof(std::uint16_t);
+        Geometry::kOutputRows) * tokens * sizeof(float);
     return projected + nvfp4_cutlass_sm70_workspace_bytes(
                            Geometry::kOutputRows, Geometry::kInputRows, tokens);
 }
@@ -160,17 +151,25 @@ std::size_t capacity_bytes_impl(LinearPolicy policy, std::int32_t min_tokens,
     }
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
+    std::size_t maximum = 0;
     if (policy == LinearPolicy::A16Only) {
-        // The fused A16 kernel (T==1 only) needs no transient; the baseline route needs its
-        // projected plane; the Volta split route needs its gate fp32 scratch plane. Checked via
-        // resolve_route rather than a hardcoded token threshold since the boundary differs by
-        // build.
+#ifdef NINFER_VOLTA_BUILD
+        // The Volta decode fast path is selected before resolve_route() for T=1. Keep the
+        // capacity query in lock-step with that dispatch override; otherwise the caller creates
+        // a one-byte arena and the QPN split's gate/activation scratch fails with bad_alloc.
+        if (min_tokens <= 1 && max_tokens >= 1 &&
+            nvfp4_linear_swiglu_qpn_split_supported(
+                Geometry::kOutputRows, Geometry::kInputRows, 1)) {
+            maximum = qpn_split_workspace_bytes<Geometry>(1);
+        }
+#endif
+        // On Volta all A16 widths use dequantize+CUTLASS. Other builds use the fused kernel at
+        // small widths and the materialized baseline for wider calls.
         const Nvfp4LinearSwiGluRoute route = resolve_route(policy, max_tokens);
         if (route == Nvfp4LinearSwiGluRoute::LinearW4A4Post) {
             return baseline_workspace_bytes<Geometry>(max_tokens);
         }
 #ifdef NINFER_VOLTA_BUILD
-        if (max_tokens == 1) { return qpn_split_workspace_bytes<Geometry>(1); }
         if (route == Nvfp4LinearSwiGluRoute::VoltaQpnSplit) {
             return qpn_split_workspace_bytes<Geometry>(max_tokens);
         }
@@ -178,11 +177,10 @@ std::size_t capacity_bytes_impl(LinearPolicy policy, std::int32_t min_tokens,
             return cutlass_route_workspace_bytes<Geometry>(max_tokens);
         }
 #endif
-        return 0;
+        return maximum;
     }
     if (max_tokens <= 4) { return 0; }
 
-    std::size_t maximum = 0;
     if (min_tokens <= 48 && max_tokens >= 5) {
         maximum = fused_workspace_bytes<Geometry>(std::min(max_tokens, 48));
     }
@@ -253,21 +251,16 @@ void dispatch_impl(const Tensor& x, const Weight& weight, Tensor& out, LinearPol
 #ifdef NINFER_VOLTA_BUILD
     if (workspace && policy == LinearPolicy::A16Only && x.ne[1] == 1 &&
         nvfp4_linear_swiglu_qpn_split_supported(weight.n, weight.k, x.ne[1])) {
-        auto scope                    = workspace->scope();
+        auto scope = workspace->scope();
         Nvfp4QpnSplitWorkspace scratch =
             allocate_qpn_split_workspace<Geometry>(*workspace, x.ne[1]);
-        nvfp4_linear_swiglu_qpn_split_launch(x, weight, out,
-                                             reinterpret_cast<float*>(scratch.gate.data),
-                                             scratch.activation.data, stream);
+        nvfp4_linear_swiglu_qpn_split_launch(
+            x, weight, out, static_cast<float*>(scratch.gate.data), scratch.activation.data, stream);
         return;
     }
 #endif
     switch (resolve_route(policy, x.ne[1])) {
     case Nvfp4LinearSwiGluRoute::DecodeFusedA16:
-        if (weight.layout == QuantLayout::VoltaQpnPrepacked) {
-            throw std::invalid_argument(
-                "prepacked nvfp4 linear_swiglu decode requires caller workspace");
-        }
         launch_decode<Geometry>(x, weight, out, stream);
         return;
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
@@ -281,12 +274,11 @@ void dispatch_impl(const Tensor& x, const Weight& weight, Tensor& out, LinearPol
         if (workspace == nullptr) {
             throw std::invalid_argument("nvfp4 linear_swiglu QPN requires caller workspace");
         }
-        auto scope                       = workspace->scope();
+        auto scope = workspace->scope();
         Nvfp4QpnSplitWorkspace scratch =
             allocate_qpn_split_workspace<Geometry>(*workspace, x.ne[1]);
-        nvfp4_linear_swiglu_qpn_split_launch(x, weight, out,
-                                             reinterpret_cast<float*>(scratch.gate.data),
-                                             scratch.activation.data, stream);
+        nvfp4_linear_swiglu_qpn_split_launch(
+            x, weight, out, static_cast<float*>(scratch.gate.data), scratch.activation.data, stream);
         return;
     }
     case Nvfp4LinearSwiGluRoute::VoltaCutlass: {
@@ -294,12 +286,10 @@ void dispatch_impl(const Tensor& x, const Weight& weight, Tensor& out, LinearPol
             throw std::invalid_argument("nvfp4 linear_swiglu CUTLASS requires caller workspace");
         }
         auto scope = workspace->scope();
-        Tensor projected = workspace->alloc(
-            DType::BF16, {Geometry::kOutputRows, x.ne[1]}, 256);
-        nvfp4_cutlass_sm70_launch(x, weight, projected, *workspace, stream);
-        constexpr std::int32_t kIntermediate = Geometry::kOutputRows / 2;
-        silu_mul(projected.slice(0, 0, kIntermediate),
-                 projected.slice(0, kIntermediate, kIntermediate), out, stream);
+        // Keep both dot products in FP32 until the fused nonlinearity and final BF16 store.
+        Tensor projected = workspace->alloc(DType::FP32, {Geometry::kOutputRows, x.ne[1]}, 256);
+        nvfp4_cutlass_sm70_fp32_launch(x, weight, projected, *workspace, stream);
+        swiglu_fp32_launch(projected, nullptr, out, stream);
         return;
     }
 #endif

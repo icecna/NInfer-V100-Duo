@@ -1,9 +1,6 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 
 #include "ops/linear/nvfp4/nvfp4_config.h"
-#ifdef NINFER_VOLTA_BUILD
-#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_cutlass_sm70.h"
-#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -11,8 +8,6 @@
 
 namespace ninfer::ops::detail {
 namespace {
-
-constexpr std::int32_t kVoltaCutlassMinT = 33;
 
 enum class Nvfp4GdnInputRoute : std::uint8_t {
     A16,
@@ -27,13 +22,7 @@ Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                WorkspaceArena* workspace, cudaStream_t stream) {
-#ifdef NINFER_VOLTA_BUILD
-    if (x.ne[1] >= kVoltaCutlassMinT && workspace != nullptr) {
-        nvfp4_gdn_input_cutlass_sm70_launch(x, weight, qkv, z, *workspace, stream);
-        return;
-    }
-#endif
+                cudaStream_t stream) {
     constexpr std::int32_t kChunk   = kNvfp4LastSmallT;
     constexpr std::int32_t kQkvRows = 10240;
     constexpr std::int32_t kZRows   = 6144;
@@ -60,13 +49,7 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
 // The tp2 column shard -- same chunking discipline, halved row counts
 // (Nvfp4GdnInputTp2ColumnGeometry's own qkv=5120=1024+1024+3072, z=3072).
 void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                      WorkspaceArena* workspace, cudaStream_t stream) {
-#ifdef NINFER_VOLTA_BUILD
-    if (x.ne[1] >= kVoltaCutlassMinT && workspace != nullptr) {
-        nvfp4_gdn_input_cutlass_sm70_launch_shard(x, weight, qkv, z, *workspace, stream);
-        return;
-    }
-#endif
+                      cudaStream_t stream) {
     constexpr std::int32_t kChunk   = kNvfp4LastSmallT;
     constexpr std::int32_t kQkvRows = 5120;
     constexpr std::int32_t kZRows   = 3072;
@@ -98,42 +81,15 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
         throw std::invalid_argument("nvfp4 gdn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
-    if (resolve_route(policy, max_tokens) == Nvfp4GdnInputRoute::W4A4) {
-        return nvfp4_w4a4_workspace_capacity_bytes(max_tokens,
-                                                   Nvfp4GdnInputGeometry::kInputRows);
-    }
-#ifdef NINFER_VOLTA_BUILD
-    if (max_tokens >= kVoltaCutlassMinT) {
-        return nvfp4_gdn_input_cutlass_workspace_bytes(max_tokens);
-    }
-#endif
-    return 0;
-}
-
-std::size_t nvfp4_gdn_input_shard_workspace_capacity_bytes(LinearPolicy policy,
-                                                            std::int32_t min_tokens,
-                                                            std::int32_t max_tokens) {
-    if (min_tokens <= 0 || max_tokens < min_tokens) {
-        throw std::invalid_argument(
-            "nvfp4 gdn_input_proj shard workspace: invalid token interval");
-    }
-    (void)resolve_route(policy, min_tokens);
-    if (resolve_route(policy, max_tokens) == Nvfp4GdnInputRoute::W4A4) {
-        return nvfp4_w4a4_workspace_capacity_bytes(max_tokens,
-                                                   Nvfp4GdnInputTp2ColumnGeometry::kInputRows);
-    }
-#ifdef NINFER_VOLTA_BUILD
-    if (max_tokens >= kVoltaCutlassMinT) {
-        return nvfp4_gdn_input_cutlass_shard_workspace_bytes(max_tokens);
-    }
-#endif
-    return 0;
+    return resolve_route(policy, max_tokens) == Nvfp4GdnInputRoute::W4A4
+               ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4GdnInputGeometry::kInputRows)
+               : 0;
 }
 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Nvfp4GdnInputRoute::A16) {
-        launch_a16(x, weight, qkv, z, workspace, stream);
+        launch_a16(x, weight, qkv, z, stream);
         return;
     }
     if (workspace == nullptr) {
@@ -144,12 +100,15 @@ void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv
     nvfp4_gdn_input_w4a4_launch(x, weight, qkv, z, scratch, stream);
 }
 
-// The tp2 column shard sizes the A16 CUTLASS projection plane to its halved output extent.
+// The tp2 column shard. The W4A4 activation-quantize workspace is a pure function of
+// (tokens, K), and K=5120 is unchanged by the shard (only the output row count N halves) -- so
+// nvfp4_gdn_input_workspace_capacity_bytes (tp1) is reused unchanged, the same rule
+// attn_input_proj's own shard follows; no `_shard` capacity function exists or is needed.
 void nvfp4_gdn_input_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                     LinearPolicy policy, WorkspaceArena* workspace,
                                     cudaStream_t stream) {
     if (resolve_route(policy, x.ne[1]) == Nvfp4GdnInputRoute::A16) {
-        launch_a16_shard(x, weight, qkv, z, workspace, stream);
+        launch_a16_shard(x, weight, qkv, z, stream);
         return;
     }
     if (workspace == nullptr) {

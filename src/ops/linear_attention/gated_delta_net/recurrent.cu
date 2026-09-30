@@ -34,7 +34,7 @@ void launch_recurrent_fp32_fixed(const Tensor& q, const Tensor& k, const Tensor&
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool NormalizeQK>
+template <bool NormalizeQK, typename QK = __nv_bfloat16>
 void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& state_read, Tensor& state_write, Tensor& out,
@@ -42,13 +42,31 @@ void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tenso
     const auto heads = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(kStateDim / kBlockDv));
     const dim3 block(kWarpSize, kNumWarps, 1);
-    recurrent_bf16_direct_kernel<NormalizeQK><<<grid, block, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
+    recurrent_direct_kernel<NormalizeQK><<<grid, block, 0, stream>>>(
+        static_cast<const QK*>(q.data), static_cast<const QK*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), static_cast<const float*>(g.data),
         static_cast<const float*>(beta.data), static_cast<const float*>(state_read.data),
         static_cast<float*>(state_write.data), static_cast<__nv_bfloat16*>(out.data), q.ne[2],
         heads, scale);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Each Q/K row is shared by multiple value heads and all their state tiles. Computing
+// its norm once removes repeated warp reductions from the sequential token loop. FP32
+// storage retains the fused route's normalized values without a BF16 rounding boundary.
+__global__ void prepare_recurrent_qk_kernel(const __nv_bfloat16* q, const __nv_bfloat16* k,
+                                            float* normalized_q, float* normalized_k,
+                                            std::int64_t rows) {
+    const std::int64_t row = static_cast<std::int64_t>(blockIdx.x) * kNumWarps + threadIdx.y;
+    if (row >= rows) { return; }
+    const int lane = threadIdx.x;
+    const std::uint32_t dqk_base = lane * kQkPerLane;
+    QkLane qr = load_recurrent_qk(q + row * kStateDim, dqk_base);
+    QkLane kr = load_recurrent_qk(k + row * kStateDim, dqk_base);
+    normalize_qk_lane<true>(qr.value, lane);
+    normalize_qk_lane<true>(kr.value, lane);
+    store_qk_lane(qr.value, normalized_q + row * kStateDim, dqk_base);
+    store_qk_lane(kr.value, normalized_k + row * kStateDim, dqk_base);
 }
 
 template <bool NormalizeInputs, bool Batched, bool Masked>
@@ -176,6 +194,20 @@ void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, c
         launch_recurrent_direct_fixed<false>(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out,
                                              out, stream);
     }
+}
+
+void launch_recurrent_prepared(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                               const Tensor& beta, float scale, Tensor& normalized_q,
+                               Tensor& normalized_k, const Tensor& state_in, Tensor& state_out,
+                               Tensor& out, cudaStream_t stream) {
+    const std::int64_t rows = q.ne[1] * q.ne[2];
+    prepare_recurrent_qk_kernel<<<static_cast<unsigned>((rows + kNumWarps - 1) / kNumWarps),
+                                  dim3(kWarpSize, kNumWarps), 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
+        static_cast<float*>(normalized_q.data), static_cast<float*>(normalized_k.data), rows);
+    CUDA_CHECK(cudaGetLastError());
+    launch_recurrent_direct_fixed<false, float>(normalized_q, normalized_k, v, g, beta, scale,
+                                                state_in, state_out, out, stream);
 }
 
 void launch_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,

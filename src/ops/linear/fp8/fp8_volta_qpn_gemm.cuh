@@ -110,7 +110,8 @@ __global__ __launch_bounds__(
     // line.
     const int blocks = k / S::kKPerBlock;
     const int bq     = blocks / SPLITK;
-    // A TP2 residual K=8704 has 68 blocks for eight warps; spread its four extra blocks.
+    // TP2 residual K=8704 has 68 blocks for eight warps; spread the remainder instead of
+    // making the last warp carry the entire tail.
     const int extra  = blocks % SPLITK;
     const int b0     = warp * bq + min(warp, extra);
     const int bend   = b0 + bq + (warp < extra);
@@ -133,11 +134,13 @@ __global__ __launch_bounds__(
         for (int e = 0; e < 8; ++e) {
             if constexpr (Prepacked) {
                 const std::int64_t index =
-                    (((static_cast<std::int64_t>(blockIdx.x) * blocks + b) * 8 + e) * 32) + lane;
+                    (((static_cast<std::int64_t>(blockIdx.x) * blocks + b) * 8 + e) * 32) +
+                    lane;
                 cw[e] = __ldg(reinterpret_cast<const uint4*>(codes) + index);
             } else {
                 // One 128-byte line per lane per iteration: 128 adjacent k, eight uint4 loads.
-                const std::uint8_t* p = crow + static_cast<std::int64_t>(b) * S::kKPerBlock;
+                const std::uint8_t* p =
+                    crow + static_cast<std::int64_t>(b) * S::kKPerBlock;
                 cw[e] = __ldg(reinterpret_cast<const uint4*>(p + 16 * e));
             }
         }
@@ -247,49 +250,30 @@ void launch_fp8_volta_qpn_with_output(const Tensor& x, const Weight& w, OutputPo
     // everywhere, matching the NVFP4 SwiGLU kernel's finding: extra accumulator chains just cost
     // registers on a kernel that is already issue/DRAM-bound, not dependency-bound.
     const bool wide_k_headroom = k == 6144;
+#define NINFER_FP8_QPN_LAUNCH(TILES, SPLITK, NACC)                                      \
+    do {                                                                                 \
+        if (w.layout == QuantLayout::VoltaQpnPrepacked) {                                \
+            fp8_volta_qpn_gemm_kernel<TILES, SPLITK, NACC, true>                        \
+                <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, xd, n, k, t, output); \
+        } else {                                                                         \
+            fp8_volta_qpn_gemm_kernel<TILES, SPLITK, NACC, false>                       \
+                <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, xd, n, k, t, output); \
+        }                                                                                \
+    } while (false)
     if (t <= S::kRowsPerTile) {
         if (vocabulary) {
-            if (w.layout == QuantLayout::VoltaQpnPrepacked) {
-                fp8_volta_qpn_gemm_kernel<1, 4, 1, true><<<grid, 4 * 32, 0, stream>>>(
-                    codes, scales, xd, n, k, t, output);
-            } else {
-                fp8_volta_qpn_gemm_kernel<1, 4, 1, false><<<grid, 4 * 32, 0, stream>>>(
-                    codes, scales, xd, n, k, t, output);
-            }
+            NINFER_FP8_QPN_LAUNCH(1, 4, 1);
         } else if (wide_k_headroom) {
-            if (w.layout == QuantLayout::VoltaQpnPrepacked) {
-                fp8_volta_qpn_gemm_kernel<1, 16, 1, true><<<grid, 16 * 32, 0, stream>>>(
-                    codes, scales, xd, n, k, t, output);
-            } else {
-                fp8_volta_qpn_gemm_kernel<1, 16, 1, false><<<grid, 16 * 32, 0, stream>>>(
-                    codes, scales, xd, n, k, t, output);
-            }
+            NINFER_FP8_QPN_LAUNCH(1, 16, 1);
         } else {
-            if (w.layout == QuantLayout::VoltaQpnPrepacked) {
-                fp8_volta_qpn_gemm_kernel<1, 8, 1, true><<<grid, 8 * 32, 0, stream>>>(
-                    codes, scales, xd, n, k, t, output);
-            } else {
-                fp8_volta_qpn_gemm_kernel<1, 8, 1, false><<<grid, 8 * 32, 0, stream>>>(
-                    codes, scales, xd, n, k, t, output);
-            }
+            NINFER_FP8_QPN_LAUNCH(1, 8, 1);
         }
     } else if (t <= 2 * S::kRowsPerTile) {
-        if (w.layout == QuantLayout::VoltaQpnPrepacked) {
-            fp8_volta_qpn_gemm_kernel<2, 8, 1, true><<<grid, 8 * 32, 0, stream>>>(
-                codes, scales, xd, n, k, t, output);
-        } else {
-            fp8_volta_qpn_gemm_kernel<2, 8, 1, false><<<grid, 8 * 32, 0, stream>>>(
-                codes, scales, xd, n, k, t, output);
-        }
+        NINFER_FP8_QPN_LAUNCH(2, 8, 1);
     } else {
-        if (w.layout == QuantLayout::VoltaQpnPrepacked) {
-            fp8_volta_qpn_gemm_kernel<4, 8, 1, true><<<grid, 8 * 32, 0, stream>>>(
-                codes, scales, xd, n, k, t, output);
-        } else {
-            fp8_volta_qpn_gemm_kernel<4, 8, 1, false><<<grid, 8 * 32, 0, stream>>>(
-                codes, scales, xd, n, k, t, output);
-        }
+        NINFER_FP8_QPN_LAUNCH(4, 8, 1);
     }
+#undef NINFER_FP8_QPN_LAUNCH
     CUDA_CHECK(cudaGetLastError());
 }
 

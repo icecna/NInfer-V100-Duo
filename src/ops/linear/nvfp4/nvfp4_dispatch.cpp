@@ -4,6 +4,9 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h"
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -58,26 +61,12 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
                 cudaStream_t stream) {
     const std::int32_t total_t = x.ne[1];
 #ifdef NINFER_VOLTA_BUILD
-    // Above QPN2's own range, a single wide-T MMA pass (nvfp4_volta_mma_gemm.cuh) beats
-    // chunking through QPN2 in kNvfp4VoltaQpnMaxTokens pieces -- QPN2's whole design assumes T is
-    // small enough that decoding the weight once per ~32 tokens is cheap; at prefill widths that
-    // means re-decoding the entire weight dozens of times. Measured directly against the
-    // 64-chunk QPN2 path at T=2048 on the gate_up shape: 45.5ms -> 31.3ms, 1.45x. Needs a real
-    // workspace only when split-K applies (rare at production shapes -- both registered NVFP4
-    // shapes measured splits=1 at prefill width); fall back to the chunked route rather than
-    // fault if a caller genuinely has none. See the V100 performance summary.
-    if (weight.layout != QuantLayout::VoltaQpnPrepacked && workspace != nullptr &&
-        total_t > kNvfp4VoltaQpnMaxTokens &&
-        nvfp4_volta_mma_supported(weight.n, weight.k, total_t)) {
-        const std::size_t need = nvfp4_volta_mma_workspace_bytes(weight.n, weight.k, total_t);
-        if (need == 0 || workspace->capacity() - workspace->used() >= need) {
-            launch_nvfp4_volta_mma(x, weight, out, *workspace, stream);
-            return;
-        }
+    // Materialize each weight once for the whole prefill call, including QPN-prepacked TP2
+    // shards. Repeated 32-token QPN launches reread the entire down projection per tile.
+    if (workspace != nullptr && total_t >= 128) {
+        nvfp4_cutlass_sm70_launch(x, weight, out, *workspace, stream);
+        return;
     }
-    // Where the quadpair route is available the chunk drops to its tile width, matching the FP8
-    // sibling's reasoning: several QPN passes over the weights beat one wider SIMT pass, because
-    // SIMT throughput decays with T while QPN's is flat across the tile.
     const bool qpn            = nvfp4_volta_qpn_supported(weight.n, weight.k, kNvfp4VoltaQpnMaxTokens);
     const std::int32_t kChunk = qpn ? kNvfp4VoltaQpnMaxTokens : kNvfp4LastSmallT;
 #else
@@ -118,13 +107,8 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t output_rows, std:
         return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
     }
 #ifdef NINFER_VOLTA_BUILD
-    // The wide-T MMA route in launch_a16 only needs workspace when split-K applies; report that
-    // so a caller sizing for the widest T this interval reaches has it available. A caller that
-    // doesn't (the zero-workspace linear() overload) still works -- launch_a16 falls back to the
-    // chunked route rather than fault.
-    if (policy == LinearPolicy::A16Only && max_tokens > kNvfp4VoltaQpnMaxTokens &&
-        nvfp4_volta_mma_supported(output_rows, input_rows, max_tokens)) {
-        return nvfp4_volta_mma_workspace_bytes(output_rows, input_rows, max_tokens);
+    if (max_tokens >= 128) {
+        return nvfp4_cutlass_sm70_workspace_bytes(output_rows, input_rows, max_tokens);
     }
 #endif
     return 0;

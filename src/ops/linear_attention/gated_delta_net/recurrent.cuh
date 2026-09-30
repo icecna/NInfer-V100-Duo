@@ -127,6 +127,10 @@ struct RawGatePair {
     float beta;
 };
 
+struct QkLane {
+    float value[kQkPerLane];
+};
+
 __device__ __forceinline__ RawQkLane load_raw_qk_lane(const __nv_bfloat16* base,
                                                       std::uint32_t dqk_base) {
     RawQkLane out;
@@ -137,6 +141,22 @@ __device__ __forceinline__ RawQkLane load_raw_qk_lane(const __nv_bfloat16* base,
     out.value[1]    = lo.y;
     out.value[2]    = hi.x;
     out.value[3]    = hi.y;
+    return out;
+}
+
+__device__ __forceinline__ QkLane load_recurrent_qk(const __nv_bfloat16* base,
+                                                   std::uint32_t dqk_base) {
+    const RawQkLane raw = load_raw_qk_lane(base, dqk_base);
+    QkLane out;
+#pragma unroll
+    for (int i = 0; i < kQkPerLane; ++i) { out.value[i] = raw.value[i]; }
+    return out;
+}
+
+__device__ __forceinline__ QkLane load_recurrent_qk(const float* base,
+                                                   std::uint32_t dqk_base) {
+    QkLane out;
+    load_qk_lane(out.value, base, dqk_base);
     return out;
 }
 
@@ -196,12 +216,12 @@ __device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][
     }
 }
 
-template <bool Normalize>
+template <bool Normalize, typename QK>
 __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQkPerLane],
-                                                  const __nv_bfloat16* query, __nv_bfloat16* output,
+                                                  const QK* query, __nv_bfloat16* output,
                                                   std::uint32_t dqk_base, std::uint32_t dv_base,
                                                   int lane, float scale) {
-    RawQkLane q = load_raw_qk_lane(query, dqk_base);
+    QkLane q = load_recurrent_qk(query, dqk_base);
     normalize_qk_lane<Normalize>(q.value, lane);
 
     float attn_val = 0.0f;
@@ -216,10 +236,10 @@ __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQk
     if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
 }
 
-template <bool NormalizeQK>
+template <bool NormalizeQK, typename QK>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
-    recurrent_bf16_direct_kernel(const __nv_bfloat16* __restrict__ q,
-                                 const __nv_bfloat16* __restrict__ k,
+    recurrent_direct_kernel(const QK* __restrict__ q,
+                                 const QK* __restrict__ k,
                                  const __nv_bfloat16* __restrict__ v, const float* __restrict__ g,
                                  const float* __restrict__ beta,
                                  const float* __restrict__ state_read,
@@ -241,7 +261,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                      dqk_base);
     }
 
-    RawQkLane key = load_raw_qk_lane(k + static_cast<std::int64_t>(h_qk) * kStateDim, dqk_base);
+    QkLane key = load_recurrent_qk(k + static_cast<std::int64_t>(h_qk) * kStateDim, dqk_base);
     normalize_qk_lane<NormalizeQK>(key.value, lane);
     for (std::int32_t token = 0; token < width; ++token) {
         const std::int64_t column = token;
@@ -251,7 +271,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
         apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
 
         if (token + 1 < width) {
-            key = load_raw_qk_lane(k + ((column + 1) * heads.H_qk + h_qk) * kStateDim, dqk_base);
+            key = load_recurrent_qk(k + ((column + 1) * heads.H_qk + h_qk) * kStateDim, dqk_base);
             normalize_qk_lane<NormalizeQK>(key.value, lane);
         }
 

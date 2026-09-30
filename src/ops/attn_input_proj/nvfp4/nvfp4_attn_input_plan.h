@@ -43,8 +43,6 @@ struct Nvfp4AttnInputSections<Nvfp4AttnInputTp2ColumnGeometry> {
 [[nodiscard]] std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy,
                                                                     std::int32_t min_tokens,
                                                                     std::int32_t max_tokens);
-[[nodiscard]] std::size_t nvfp4_attn_input_shard_workspace_capacity_bytes(
-    LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens);
 
 void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                     Tensor& k, Tensor& v, cudaStream_t stream);

@@ -33,6 +33,11 @@ void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, c
                             const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                             cudaStream_t stream);
 
+void launch_recurrent_prepared(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                               const Tensor& beta, float scale, Tensor& normalized_q,
+                               Tensor& normalized_k, const Tensor& state_in, Tensor& state_out,
+                               Tensor& out, cudaStream_t stream);
+
 void launch_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                                const Tensor& beta, float scale, bool normalize_qk,
                                Tensor& ssm_states, const Tensor& valid_columns,

@@ -1298,12 +1298,10 @@ std::size_t gdn_input_proj_column_parallel_workspace_capacity_bytes(QType qtype,
             kShardFusedRows, kShardHidden, max_tokens);
     }
     if (qtype == QType::NVFP4) {
-        return detail::nvfp4_gdn_input_shard_workspace_capacity_bytes(policy, min_tokens,
-                                                                       max_tokens);
+        return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
-        return detail::fp8_gdn_input_shard_workspace_capacity_bytes(policy, min_tokens,
-                                                                     max_tokens);
+        return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
     throw std::invalid_argument(
         "gdn_input_proj column-parallel workspace: unsupported weight format");
@@ -1484,12 +1482,10 @@ std::size_t shard_projection_workspace_bytes(QType qtype, LinearPolicy policy,
             kShardFusedRows, kShardHidden, max_columns);
     }
     if (qtype == QType::NVFP4) {
-        return detail::nvfp4_gdn_input_shard_workspace_capacity_bytes(policy, min_columns,
-                                                                       max_columns);
+        return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_columns, max_columns);
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
-        return detail::fp8_gdn_input_shard_workspace_capacity_bytes(policy, min_columns,
-                                                                     max_columns);
+        return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_columns, max_columns);
     }
     if (qtype == QType::Q4G64_F16S || qtype == QType::Q5G64_F16S) {
         return 0; // the Q4/Q5 grouped-MMA route allocates no transient storage.

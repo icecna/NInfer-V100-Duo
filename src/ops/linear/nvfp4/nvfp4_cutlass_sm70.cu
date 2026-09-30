@@ -30,7 +30,6 @@ __global__ void dequant_nvfp4_row_to_fp16(const std::uint8_t* __restrict__ codes
     const int byte_idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int bytes_per_row = k / 2;
     if (row >= n || byte_idx >= bytes_per_row) { return; }
-
     const int k0            = byte_idx * 2;
     const int group         = byte_idx / 8;
     const int scale_tile    = group / 4;
@@ -40,7 +39,6 @@ __global__ void dequant_nvfp4_row_to_fp16(const std::uint8_t* __restrict__ codes
     const std::int64_t scale_offset =
         static_cast<std::int64_t>((row / 128) * scales_per_m128 + scale_tile) * 512 +
         (row_inner & 31) * 16 + (row_inner >> 5) * 4 + scale_lane;
-
     const float coefficient = decode_nvfp4_e4m3(scales[scale_offset]) * inverse_weight_divisor;
     const float2 value = decode_nvfp4_e2m1x2(
         codes[static_cast<std::int64_t>(row) * bytes_per_row + byte_idx]);
@@ -53,35 +51,32 @@ __global__ void dequant_nvfp4_qpn_to_fp16(const std::uint8_t* __restrict__ codes
                                           const std::uint8_t* __restrict__ scales, int n, int k,
                                           float inverse_weight_divisor,
                                           cutlass::half_t* __restrict__ out) {
-    const int row      = static_cast<int>(blockIdx.y);
-    const int segment  = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int segments_per_row = k / 8;
-    if (row >= n || segment >= segments_per_row) { return; }
-
-    const int group      = segment / 2;
-    const int group_half = segment & 1;
-    const int local_row  = row & 31;
-    const int qp         = local_row / 8;
-    const int r          = local_row & 7;
-    const int lane       = (qp << 2) | (r & 3) | ((r & 4) << 2);
-    const int groups     = k / 16;
-    const std::int64_t tuple =
-        (static_cast<std::int64_t>(row / 32) * groups + group) * 32 + lane;
+    // Consecutive lanes read consecutive packed K16 tuples. The old row-wise traversal made
+    // adjacent lanes skip 256 input bytes and decoded every tuple twice. Each lane now loads
+    // its eight code bytes once and writes the complete, aligned 32-byte FP16 group.
+    const std::int64_t tuple = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int groups = k / 16;
+    if (tuple >= static_cast<std::int64_t>(n) * groups) { return; }
+    const int lane = static_cast<int>(tuple & 31);
+    const int group = static_cast<int>((tuple / 32) % groups);
+    const int row = static_cast<int>(tuple / (32 * groups)) * 32 +
+                    ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);
     constexpr int inverse_order[16] = {0, 4, 1, 5, 2, 6, 3, 7,
                                        8, 12, 9, 13, 10, 14, 11, 15};
-    const std::uint8_t* packed = codes + tuple * 8;
+    const uint2 packed_words = __ldg(reinterpret_cast<const uint2*>(codes) + tuple);
+    const auto* packed = reinterpret_cast<const std::uint8_t*>(&packed_words);
     const float coefficient = decode_nvfp4_e4m3(scales[tuple]) * inverse_weight_divisor;
-    cutlass::half_t values[8];
+    alignas(16) cutlass::half_t values[16];
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int logical_k = group_half * 8 + j;
-        const int position  = inverse_order[logical_k];
+    for (int j = 0; j < 16; ++j) {
+        const int position  = inverse_order[j];
         const float2 pair   = decode_nvfp4_e2m1x2(packed[position / 2]);
         values[j] = cutlass::half_t(((position & 1) == 0 ? pair.x : pair.y) * coefficient);
     }
     auto* destination = reinterpret_cast<uint4*>(
-        out + static_cast<std::int64_t>(row) * k + segment * 8);
-    *destination = *reinterpret_cast<const uint4*>(values);
+        out + static_cast<std::int64_t>(row) * k + group * 16);
+    destination[0] = reinterpret_cast<const uint4*>(values)[0];
+    destination[1] = reinterpret_cast<const uint4*>(values)[1];
 }
 
 __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
@@ -96,7 +91,6 @@ using ElementAccumulator     = float;
 using ElementComputeEpilogue = ElementAccumulator;
 using ElementInputA          = cutlass::half_t;
 using ElementInputB          = cutlass::half_t;
-using ElementOutput          = cutlass::bfloat16_t;
 using LayoutInputA           = cutlass::layout::RowMajor;
 using LayoutInputB           = cutlass::layout::ColumnMajor;
 using LayoutOutput           = cutlass::layout::RowMajor;
@@ -106,14 +100,17 @@ using ShapeMMAThreadBlock    = cutlass::gemm::GemmShape<128, 128, 32>;
 using ShapeMMAWarp           = cutlass::gemm::GemmShape<64, 64, 32>;
 using ShapeMMAOp             = cutlass::gemm::GemmShape<8, 8, 4>;
 using SwizzleThreadBlock = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
+constexpr int kNumStages = 2;
+template <class ElementOutput>
 using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
     ElementOutput, 128 / cutlass::sizeof_bits<ElementOutput>::value, ElementAccumulator,
     ElementComputeEpilogue>;
-constexpr int kNumStages = 2;
-using Gemm = cutlass::gemm::device::Gemm<ElementInputA, LayoutInputA, ElementInputB, LayoutInputB,
+template <class ElementOutput>
+using GemmFor = cutlass::gemm::device::Gemm<ElementInputA, LayoutInputA, ElementInputB, LayoutInputB,
                                          ElementOutput, LayoutOutput, ElementAccumulator, MMAOp,
                                          SmArch, ShapeMMAThreadBlock, ShapeMMAWarp, ShapeMMAOp,
-                                         EpilogueOp, SwizzleThreadBlock, kNumStages>;
+                                         EpilogueOp<ElementOutput>, SwizzleThreadBlock, kNumStages>;
+using Gemm = GemmFor<cutlass::bfloat16_t>;
 
 template <class Allocator>
 struct CutlassWorkspace {
@@ -133,10 +130,7 @@ CutlassWorkspace<Allocator> allocate_cutlass_workspace(Allocator& allocator, std
     return out;
 }
 
-} // namespace
-
-std::size_t nvfp4_cutlass_sm70_workspace_bytes(std::int32_t n, std::int32_t k,
-                                               std::int32_t cols) {
+std::size_t workspace_bytes_impl(std::int32_t n, std::int32_t k, std::int32_t cols) {
     WorkspaceLayoutBuilder layout;
     cutlass::gemm::GemmCoord problem_size(cols, n, k);
     typename Gemm::Arguments arguments{
@@ -147,8 +141,10 @@ std::size_t nvfp4_cutlass_sm70_workspace_bytes(std::int32_t n, std::int32_t k,
     return layout.peak_bytes(1);
 }
 
-void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
-                               cudaStream_t stream) {
+template <class ElementOutput>
+void launch_impl(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                 cudaStream_t stream) {
+    using Gemm = GemmFor<ElementOutput>;
     const std::int32_t k    = x.ne[0];
     const std::int32_t cols = x.ne[1];
     const std::int32_t n    = w.n;
@@ -156,7 +152,8 @@ void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Wo
     typename Gemm::Arguments sizing_arguments{
         problem_size, {nullptr, k}, {nullptr, k}, {nullptr, n}, {nullptr, n},
         {ElementComputeEpilogue(1), ElementComputeEpilogue(0)}, 1};
-    const std::size_t gemm_workspace_bytes = Gemm::get_workspace_size(sizing_arguments);
+    const std::size_t gemm_workspace_bytes =
+        Gemm::get_workspace_size(sizing_arguments);
 
     auto scratch_scope = ws.scope();
     CutlassWorkspace<WorkspaceArena> scratch =
@@ -166,7 +163,7 @@ void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Wo
 
     const dim3 block(256);
     if (w.layout == QuantLayout::VoltaQpnPrepacked) {
-        const dim3 grid(static_cast<unsigned>(div_up_i(k / 8, 256)), static_cast<unsigned>(n), 1u);
+        const dim3 grid(static_cast<unsigned>((static_cast<std::int64_t>(n) * (k / 16) + 255) / 256));
         dequant_nvfp4_qpn_to_fp16<<<grid, block, 0, stream>>>(
             static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), n, k, 1.0F / w.weight_scale_divisor,
@@ -204,6 +201,23 @@ void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Wo
         throw std::runtime_error("nvfp4_cutlass_sm70: CUTLASS gemm() failed");
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+std::size_t nvfp4_cutlass_sm70_workspace_bytes(std::int32_t n, std::int32_t k,
+                                               std::int32_t cols) {
+    return workspace_bytes_impl(n, k, cols);
+}
+
+void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                               cudaStream_t stream) {
+    launch_impl<cutlass::bfloat16_t>(x, w, out, ws, stream);
+}
+
+void nvfp4_cutlass_sm70_fp32_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                    WorkspaceArena& ws, cudaStream_t stream) {
+    launch_impl<float>(x, w, out, ws, stream);
 }
 
 } // namespace ninfer::ops::detail

@@ -130,11 +130,9 @@ void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& 
         fp8_attn_input_cutlass_sm70_launch_shard(x, weight, q, gate, k, v, *workspace, stream);
         return;
     }
-#endif
-#ifdef NINFER_VOLTA_BUILD
-    const bool qpn = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens);
-    const std::int32_t kChunk =
-        qpn ? kFp8VoltaQpnMaxTokens : kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry>;
+    const std::int32_t kChunk = fp8_volta_qpn_supported(weight.n, weight.k, kFp8VoltaQpnMaxTokens)
+                                    ? kFp8VoltaQpnMaxTokens
+                                    : kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry>;
 #else
     constexpr std::int32_t kChunk = kFp8LinearSmallTMax<Fp8AttnInputTp2ColumnGeometry>;
 #endif
@@ -173,25 +171,6 @@ void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& 
 }
 
 } // namespace
-
-std::size_t fp8_attn_input_shard_workspace_capacity_bytes(LinearPolicy policy,
-                                                           std::int32_t min_tokens,
-                                                           std::int32_t max_tokens) {
-    if (min_tokens <= 0 || max_tokens < min_tokens) {
-        throw std::invalid_argument("fp8 attn_input_proj shard workspace: invalid token interval");
-    }
-    (void)resolve_route(policy, min_tokens);
-    if (resolve_route(policy, max_tokens) == Fp8AttnInputRoute::A8) {
-        return fp8_a8_workspace_capacity_bytes(max_tokens,
-                                               Fp8AttnInputTp2ColumnGeometry::kInputRows);
-    }
-#ifdef NINFER_VOLTA_BUILD
-    if (max_tokens >= kVoltaCutlassMinT) {
-        return fp8_attn_input_cutlass_shard_workspace_bytes(max_tokens);
-    }
-#endif
-    return 0;
-}
 
 void fp8_attn_input_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                    Tensor& k, Tensor& v, LinearPolicy policy,

@@ -271,11 +271,9 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/linear_add/bf16/bf16_linear_add_volta.cu
     ops/attn_input_proj/fp8/fp8_attn_input_volta_qpn.cu
     ops/attn_input_proj/fp8/fp8_attn_input_cutlass_sm70.cu
-    ops/attn_input_proj/nvfp4/nvfp4_attn_input_cutlass_sm70.cu
     ops/attn_input_proj/q4_q5/q4_q5_attn_input_cutlass_sm70.cu
     ops/gdn_input_proj/fp8/fp8_gdn_input_volta_qpn.cu
     ops/gdn_input_proj/fp8/fp8_gdn_input_cutlass_sm70.cu
-    ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_cutlass_sm70.cu
     ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_cutlass_sm70.cu
     ops/gdn_input_proj/w8/w8_gdn_input_cutlass_sm70.cu
     ops/linear/fp8/fp8_volta_qpn_gemm.cu
@@ -292,11 +290,11 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/linear/w8/w8_volta_qpn_gemm.cu
     ops/linear_add/q5/q5_linear_add_cutlass_sm70.cu
     ops/linear_swiglu/q4/q4_linear_swiglu_cutlass_sm70.cu
-    ops/linear_swiglu/fp8/fp8_linear_swiglu_cutlass_sm70.cu
     ops/linear_swiglu/fp8/fp8_linear_swiglu_volta_qpn.cu
     ops/linear_swiglu/fp8/fp8_linear_swiglu_qpn_split.cu
     ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_volta_qpn.cu
     ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_qpn_split.cu
+    ops/linear_swiglu/swiglu_fp32.cu
     ops/launcher/gqa_attention_volta_flash.cu
     ops/launcher/vision_attention_volta_flash.cu)
   target_link_libraries(ninfer_ops PRIVATE nvidia::cutlass::cutlass)

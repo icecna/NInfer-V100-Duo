@@ -13,12 +13,11 @@
 // addresses, which every 64-bit Linux CUDA context has: a device pointer already names its
 // device, so this one entry point expresses a cross-device transfer as well as a local one. When
 // the driver grants peer access and startup validates it, the copy is a direct device-to-device
-// PCIe transfer. Linux translated IOMMU domains (DMA/DMA-FQ) prohibit direct P2P regardless of
-// advertised support or small-copy results. If either device uses such a domain, peer access is
-// unavailable, or copies fail the exact startup check, both directions are disabled and CUDA
-// stages the same copy through host memory. Startup validates
-// that route too before allowing inference. Both qualified paths are stream-ordered, so callers
-// need no peer-access branch; enable_peer_access() below reports which one is active.
+// PCIe transfer. On this V100 topology the translated IOMMU domain prevents direct P2P; CUDA's
+// UVA D2D implementation then selects its driver-managed staging path. Startup validates the
+// exact UVA D2D route in either case. The collectives never allocate or copy through an explicit
+// host buffer, and callers need no peer-access branch; enable_peer_access() only reports whether
+// direct peer access was qualified.
 //
 // The equivalent cudaMemcpyPeerAsync entry point is deliberately NOT used: it is rejected inside a
 // stream capture region (cudaErrorStreamCaptureUnsupported), which would make the whole
@@ -32,7 +31,7 @@
 //   stream(r):  ...producer of the rank-r inputs...
 //               record(inputs_ready[r])
 //               wait(inputs_ready[1-r])              // peer's source is complete
-//               memcpyPeer(peer source -> rank-r storage)
+//               peer source -> rank-r storage
 //               record(pull_done[r])
 //               wait(pull_done[1-r])                 // peer has finished reading MY source
 //               ...local combine, for allreduce_sum...
@@ -55,13 +54,13 @@
 // 128 all-reduces (64 layers x 2 row-parallel projections: the mixer output and the MLP down
 // projection) plus one allgather_rows per logit column, so 129 collectives at batch 1.
 //
-// Everything in a call is stream-ordered device work (memcpy, event record, event wait, kernel
-// launch): no host round trip, no host-memory spin flag, no device or stream synchronization. That
-// is what makes the sequence capturable. Measured: with both device streams enrolled in ONE
-// capture -- the peer's stream joined to the origin's by an event fork -- the record/wait pairs
+// Everything in a call is stream-ordered CUDA work (memcpy, event record, event wait, kernel
+// launch): there is no host round trip, host-memory spin flag, or explicit host staging allocation
+// in the hot path. That is what makes the sequence capturable. Measured: with both device streams
+// enrolled in ONE capture -- the peer's stream joined to the origin's by an event fork -- the record/wait pairs
 // above become graph EDGES rather than nodes, and the whole 128-collective decode program
-// instantiates as a single cross-device cudaGraphExec. Event objects and staging storage are
-// caller-owned and created once, because cudaEventCreate and cudaMalloc are not capturable.
+// instantiates as a single cross-device cudaGraphExec. Event objects are caller-owned and created
+// once, because cudaEventCreate is not capturable.
 //
 // CALLER OBLIGATION -- the legacy default stream. These ops read their inputs on
 // DeviceContext::stream, which core creates with cudaStreamNonBlocking and which therefore does
@@ -86,14 +85,14 @@
 namespace ninfer::ops {
 
 // Qualifies the actual cross-device copy route at startup. On Linux, first resolve both CUDA
-// devices' PCI bus IDs to /sys/bus/pci/devices/<BDF>/iommu_group/type. DMA and DMA-FQ select the
-// host-staged route without ever enabling direct P2P, even if a small probe could pass. Otherwise,
-// when both directions advertise peer access, enable them and check two distinct 16 KiB patterns
-// with the collectives' UVA D2D API on
-// their destination compute streams. Returns true only when both copies are exact. A data
-// mismatch or unavailable peer access disables both directions (including previously enabled
-// access), verifies the same copies through CUDA's host-staged route, emits one diagnostic, and
-// returns false. A failed staged check or CUDA API error throws; inference must not continue.
+// devices' PCI bus IDs to /sys/bus/pci/devices/<BDF>/iommu_group/type. DMA and DMA-FQ prevent
+// direct P2P, so the function leaves peer access disabled and validates CUDA's UVA D2D fallback
+// instead. Otherwise, when both directions advertise peer access, enable them and check two
+// distinct 16 KiB patterns with the collectives' UVA D2D API on their destination compute streams.
+// Returns true only when direct peer access is enabled and both copies are exact. If direct P2P is
+// unavailable or fails qualification, it is disabled and the same UVA D2D route is qualified with
+// driver-managed staging; the function returns false after emitting one diagnostic. A failed UVA
+// check or CUDA API error throws; inference must not continue.
 //
 // Call once during setup, before graph capture or concurrent inference. This function allocates
 // temporary probe buffers, synchronizes each compute stream, and releases its buffers while
@@ -190,5 +189,21 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
  */
 void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<Tensor, 2>& part,
                     const ExecutionContext& ec, const PeerEvents& events);
+
+/**
+ * Exact one-way vocabulary gather used by DFlash's rank-0 selector.  `destination` is the full
+ * `[C,T]` image on rank 0; `part[0]` and `part[1]` are the leading/trailing `[C_r,T]` shards on their owning
+ * ranks.  Rank 1 is deliberately not written because it never consumes DFlash proposal logits.
+ * The source lifetime edge still orders rank 1 after rank 0 has finished importing its shard,
+ * so the same work buffers may be reused by the next graph round.
+ */
+void gather_columns_rank0(const Tensor& destination, const std::array<Tensor, 2>& part,
+                          const ExecutionContext& ec, const PeerEvents& events);
+
+// Exact one-way relocation from rank 0 to rank 1. Both tensors have the same contiguous
+// dtype and shape. Uses the qualified UVA D2D transport and orders rank 0's next overwrite after
+// rank 1 has consumed the source, including under CUDA Graph capture.
+void broadcast_rank0(const Tensor& source, const Tensor& destination,
+                     const ExecutionContext& ec, const PeerEvents& events);
 
 } // namespace ninfer::ops

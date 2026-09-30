@@ -15,8 +15,6 @@ namespace ninfer::ops::detail {
 [[nodiscard]] std::size_t fp8_gdn_input_workspace_capacity_bytes(LinearPolicy policy,
                                                                  std::int32_t min_tokens,
                                                                  std::int32_t max_tokens);
-[[nodiscard]] std::size_t fp8_gdn_input_shard_workspace_capacity_bytes(
-    LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens);
 
 void fp8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                  cudaStream_t stream);

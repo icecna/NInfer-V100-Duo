@@ -5,7 +5,8 @@
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
 #ifdef NINFER_VOLTA_BUILD
-#include "ops/linear_swiglu/fp8/fp8_linear_swiglu_cutlass_sm70.h"
+#include "ops/linear/fp8/fp8_cutlass_sm70.h"
+#include "ops/linear_swiglu/swiglu_fp32.h"
 #endif
 
 #include <algorithm>
@@ -63,7 +64,7 @@ constexpr std::int32_t kVoltaCutlassMinT = 33;
 
 template <class Allocator>
 Tensor allocate_materialized_workspace(Allocator& allocator, std::int32_t rows, std::int32_t cols) {
-    return allocator.alloc(DType::BF16, {rows, cols});
+    return allocator.alloc(DType::FP32, {rows, cols});
 }
 
 std::size_t materialized_workspace_bytes(std::int32_t rows, std::int32_t cols) {
@@ -82,9 +83,8 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceAre
     if (x.ne[1] >= kVoltaCutlassMinT) {
         auto scratch_scope = workspace.scope();
         Tensor gate_up = allocate_materialized_workspace(workspace, weight.n, x.ne[1]);
-        fp8_linear_swiglu_cutlass_sm70_launch(x, weight, gate_up, workspace, stream);
-        silu_mul(gate_up.slice(0, 0, kIntermediate),
-                 gate_up.slice(0, kIntermediate, kIntermediate), out, stream);
+        fp8_cutlass_sm70_unscaled_fp32_launch(x, weight, gate_up, workspace, stream);
+        swiglu_fp32_launch(gate_up, weight.scales, out, stream);
         return;
     }
 #endif
@@ -138,10 +138,17 @@ std::size_t capacity_bytes_impl(LinearPolicy policy, std::int32_t min_tokens,
     }
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
+    // AllowA8 deliberately keeps T=2 on the A16 route (the activation quantizer is not
+    // worthwhile for that two-token verify shape).  A capacity interval can therefore contain
+    // both routes, e.g. [1, 1024], and must cover the larger of their transient workspaces.
     const bool interval_uses_a8 =
-        policy == LinearPolicy::AllowA8 && (min_tokens == 1 || max_tokens >= 3);
+        policy == LinearPolicy::AllowA8 && (min_tokens <= 1 || max_tokens >= 3);
+    const bool interval_uses_a16 =
+        policy == LinearPolicy::A16Only ||
+        (policy == LinearPolicy::AllowA8 && min_tokens <= 2 && max_tokens >= 2);
+    std::size_t need = 0;
     if (interval_uses_a8) {
-        return fp8_a8_workspace_capacity_bytes(max_tokens, Geometry::kInputRows);
+        need = fp8_a8_workspace_capacity_bytes(max_tokens, Geometry::kInputRows);
     }
 #ifdef NINFER_VOLTA_BUILD
     // The split route is reused per chunk inside launch_a16's loop, so it never needs more than
@@ -149,19 +156,19 @@ std::size_t capacity_bytes_impl(LinearPolicy policy, std::int32_t min_tokens,
     // kVoltaCutlassMinT, launch_a16 instead takes the single-shot CUTLASS route sized to the
     // interval's widest T; an interval straddling the threshold can reach either branch depending
     // on the actual call's T, so the capacity is the max of both, not either alone.
-    if (policy == LinearPolicy::A16Only && max_tokens >= 2) {
-        std::size_t need = qpn_split_workspace_bytes<Geometry>(
+    if (interval_uses_a16 && max_tokens >= 2) {
+        std::size_t a16_need = qpn_split_workspace_bytes<Geometry>(
             std::min(max_tokens, kFp8LinearSmallTMax<Geometry>));
-        if (max_tokens >= kVoltaCutlassMinT) {
-            need = std::max(
-                need, materialized_workspace_bytes(Geometry::kOutputRows, max_tokens) +
-                          fp8_linear_swiglu_cutlass_workspace_bytes(
+        if (policy == LinearPolicy::A16Only && max_tokens >= kVoltaCutlassMinT) {
+            a16_need = std::max(
+                a16_need, materialized_workspace_bytes(Geometry::kOutputRows, max_tokens) +
+                          fp8_cutlass_sm70_workspace_bytes(
                               Geometry::kOutputRows, Geometry::kInputRows, max_tokens));
         }
-        return need;
+        need = std::max(need, a16_need);
     }
 #endif
-    return 0;
+    return need;
 }
 
 std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,

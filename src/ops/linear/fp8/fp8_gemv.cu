@@ -48,6 +48,13 @@ void launch_fp8_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaS
 #else
         break;
 #endif
+    case Fp8Problem::VocabularyTp2Column:
+#ifdef NINFER_VOLTA_BUILD
+        launch_exact<Fp8VocabularyTp2ColumnGeometry>(x, weight, out, stream);
+        return;
+#else
+        break;
+#endif
     case Fp8Problem::Residual6144:
         launch_exact<Fp8Residual6144Geometry>(x, weight, out, stream);
         return;
@@ -67,10 +74,12 @@ void launch_fp8_decode(const Tensor& x, const Weight& weight, Tensor& out, cudaS
     case Fp8Problem::GdnInputTp2Column:
         launch_exact<Fp8GdnInputTp2ColumnGeometry>(x, weight, out, stream);
         return;
-    case Fp8Problem::VocabularyTp2Column:
     case Fp8Problem::MlpGateUpTp2Column:
+        launch_exact<Fp8MlpGateUpTp2ColumnGeometry>(x, weight, out, stream);
+        return;
     case Fp8Problem::AttnInputTp2Column:
-        break;
+        launch_exact<Fp8AttnInputTp2ColumnGeometry>(x, weight, out, stream);
+        return;
     }
     throw std::logic_error("FP8 vocabulary decode uses its A16 MMA route");
 }

@@ -401,8 +401,17 @@ struct Fp8LinearDecodeProductionSchedule<Fp8VocabularyGeometry> {
     using Type = Fp8GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>;
 };
 
+// The TP2 vocabulary shard uses the same Volta SIMT schedule as the full head.  It is a
+// separate geometry because the row count is part of the exact launch contract.
+template <>
+struct Fp8LinearDecodeProductionSchedule<Fp8VocabularyTp2ColumnGeometry>
+    : Fp8LinearDecodeProductionSchedule<Fp8VocabularyGeometry> {};
+
 template <>
 inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8VocabularyGeometry> = kFp8LastSmallT;
+
+template <>
+inline constexpr std::int32_t kFp8LinearSmallTMax<Fp8VocabularyTp2ColumnGeometry> = kFp8LastSmallT;
 #endif // NINFER_VOLTA_BUILD
 
 inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
@@ -416,9 +425,14 @@ inline std::int32_t fp8_linear_small_t_max(Fp8Problem problem) {
     case Fp8Problem::GdnInputTp2Column:
         return kFp8LinearSmallTMax<Fp8GdnInputTp2ColumnGeometry>;
     case Fp8Problem::Vocabulary:
-    case Fp8Problem::VocabularyTp2Column:
 #ifdef NINFER_VOLTA_BUILD
         return kFp8LinearSmallTMax<Fp8VocabularyGeometry>;
+#else
+        break;
+#endif
+    case Fp8Problem::VocabularyTp2Column:
+#ifdef NINFER_VOLTA_BUILD
+        return kFp8LinearSmallTMax<Fp8VocabularyTp2ColumnGeometry>;
 #else
         break;
 #endif
