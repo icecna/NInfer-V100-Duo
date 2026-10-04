@@ -44,6 +44,7 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
         return NumericFormat::Q6G64_F16S;
     case WeightsProfile::Qwen38GroupwiseInt:
     case WeightsProfile::Qwen36Nvfp4:
+    case WeightsProfile::Qwen38QuasarNvfp4:
         return NumericFormat::W8G32_F16S;
     case WeightsProfile::Qwen38Nvfp4:
         return NumericFormat::FP8_E4M3FN_ROW_BF16S;
@@ -389,8 +390,21 @@ bool binds_nvfp4(const artifact::Binder& binder, std::string_view name) {
     return tensor != nullptr && tensor->format == NumericFormat::NVFP4;
 }
 
-void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, bool ggml_k) {
-    const NumericFormat matrix_format = ggml_k ? NumericFormat::GGML_K : NumericFormat::FP8_E4M3FN_ROW_BF16S;
+void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out,
+                                   NumericFormat matrix_format) {
+    const bool ggml_k = matrix_format == NumericFormat::GGML_K;
+    // The QUASAR trial keeps every resident Text projection in NVFP4: attention and GDN input
+    // and output join the MLP in the paired-divisor NVFP4 path. The official mixed profile keeps
+    // its matrices in FP8_E4M3FN_ROW_BF16S (or GGML_K) and lets the dynamic check below pick the
+    // artifact's actual MLP format.
+    const bool full_nvfp4 = matrix_format == NumericFormat::NVFP4;
+    const auto bind_projection = [&](const std::string& name, std::int32_t rows,
+                                     std::int32_t columns, const std::string& divisor) {
+        return full_nvfp4 ? bind_nvfp4_weight(binder, name, rows, columns, divisor)
+                          : bind_weight(binder, name, matrix_format,
+                                        {static_cast<std::uint64_t>(rows),
+                                         static_cast<std::uint64_t>(columns)});
+    };
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
@@ -399,15 +413,17 @@ void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, b
         target.is_full_attention = is_full_layer(layer);
         if (target.is_full_attention) {
             target.attention.projection = FusedAttentionProjectionPlan{
-                .query_key_gate_value = bind_weight(
-                    binder, prefix + "attention/query_key_gate_value", matrix_format, {14336, 5120}),
+                .query_key_gate_value =
+                    bind_projection(prefix + "attention/query_key_gate_value", 14336, 5120,
+                                    prefix + "attention/input_projection/input_scale_divisor"),
             };
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
             target.attention.key_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
             target.attention.output =
-                bind_weight(binder, prefix + "attention/output", matrix_format, {5120, 6144});
+                bind_projection(prefix + "attention/output", 5120, 6144,
+                                prefix + "attention/output_projection/input_scale_divisor");
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
                                                                   NumericFormat::FP32, {48});
@@ -421,11 +437,14 @@ void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, b
             };
             target.gdn.input_projection = FusedGdnInputProjectionPlan{
                 .query_key_value_z =
-                    bind_weight(binder, prefix + "gdn/query_key_value_z", matrix_format, {16384, 5120}),
+                    bind_projection(prefix + "gdn/query_key_value_z", 16384, 5120,
+                                    prefix + "gdn/input_projection/input_scale_divisor"),
             };
             target.gdn.norm   = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                              NumericFormat::BF16, {128});
-            target.gdn.output = bind_weight(binder, prefix + "gdn/output", matrix_format, {5120, 6144});
+            target.gdn.output =
+                bind_projection(prefix + "gdn/output", 5120, 6144,
+                                prefix + "gdn/output_projection/input_scale_divisor");
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
@@ -886,6 +905,19 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     if (tp < 1 || tp > static_cast<int>(artifact::kMaximumDevices)) {
         throw std::invalid_argument("qwen3_6_27b: tp must be 1 or 2");
     }
+    if (weights_profile == WeightsProfile::Qwen38QuasarNvfp4) {
+        if (tp != 2) {
+            throw std::invalid_argument(
+                "qwen3.8-27b/quasar-nvfp4 supports TP2 Text/Vision/None/MTP only");
+        }
+        if (features.dflash()) {
+            throw std::invalid_argument(
+                "qwen3.8-27b/quasar-nvfp4 does not admit DFlash");
+        }
+#ifndef NINFER_VOLTA_BUILD
+        throw std::invalid_argument("QUASAR currently requires SM70");
+#endif
+    }
     // The binder's arena count and the shard map's device count are two halves of one decision.
     // If they disagree, nothing downstream notices: a tp2 map on a one-device binder would place
     // only device 0's half-shard and size the arena for half a model, and the load would "succeed".
@@ -926,10 +958,13 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         bind_nvfp4_text_layers(binder, out);
         break;
     case WeightsProfile::Qwen38Nvfp4:
-        bind_qwen38_fused_text_layers(binder, out, false);
+        bind_qwen38_fused_text_layers(binder, out, NumericFormat::FP8_E4M3FN_ROW_BF16S);
+        break;
+    case WeightsProfile::Qwen38QuasarNvfp4:
+        bind_qwen38_fused_text_layers(binder, out, NumericFormat::NVFP4);
         break;
     case WeightsProfile::Qwen38GgmlK:
-        bind_qwen38_fused_text_layers(binder, out, true);
+        bind_qwen38_fused_text_layers(binder, out, NumericFormat::GGML_K);
         break;
     default:
         throw std::invalid_argument("qwen3_6_27b: invalid weights profile");

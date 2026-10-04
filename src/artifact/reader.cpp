@@ -283,6 +283,15 @@ public:
     Qwen38Nvfp4V3Adapter(const Json& directory, const MappedFile& file,
                          std::uint64_t payload_start)
         : directory_(directory), file_(file), payload_start_(payload_start) {
+        // v3 has no weights-profile field. Register the published QUASAR trial artifact by its
+        // container identity, never by filename, object count, or a representative tensor's
+        // format. Other v3 artifacts retain the official mixed-profile contract.
+        constexpr std::array<std::byte, 16> kQuasarContainerId = {
+            std::byte{0x39}, std::byte{0xbe}, std::byte{0x22}, std::byte{0x99},
+            std::byte{0xc2}, std::byte{0xb9}, std::byte{0x45}, std::byte{0x12},
+            std::byte{0xab}, std::byte{0xd5}, std::byte{0x1f}, std::byte{0xfe},
+            std::byte{0x07}, std::byte{0x98}, std::byte{0x30}, std::byte{0xf2}};
+        quasar_ = std::equal(kQuasarContainerId.begin(), kQuasarContainerId.end(), file_.data() + 16);
         if (!directory_.is_object() || !directory_.contains("metadata") ||
             !directory_.at("metadata").is_object() ||
             directory_.at("metadata").value("name", "") != "qwen3.8-27b") {
@@ -330,42 +339,50 @@ public:
         add("text/draft_head", {"proposal/head"});
         add("text/draft_head_token_ids", {"proposal/token_ids"});
 
-        std::size_t nvfp4_mlp_layers = 0;
+        std::size_t nvfp4_projections = 0;
+        const auto add_projection = [&](const std::string& name,
+                                        std::initializer_list<std::string> logical_names,
+                                        const std::string& divisor) {
+            const auto& weight = add(name, logical_names);
+            if (require_string(weight.at("format"), "v3 tensor format") == "nvfp4") {
+                ++nvfp4_projections;
+                add_input_divisor(divisor, logical_names);
+            }
+        };
         for (int layer = 0; layer < 64; ++layer) {
             const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
             add(prefix + "input_norm", {prefix + "input_norm"});
             if (layer >= 3 && (layer - 3) % 4 == 0) {
-                add(prefix + "attention/query_key_gate_value",
-                    {prefix + "attention/query", prefix + "attention/key",
-                     prefix + "attention/gate", prefix + "attention/value"});
-                for (const char* role : {"query_norm", "key_norm", "output"}) {
+                add_projection(prefix + "attention/query_key_gate_value",
+                               {prefix + "attention/query", prefix + "attention/key",
+                                prefix + "attention/gate", prefix + "attention/value"},
+                               prefix + "attention/input_projection/input_scale_divisor");
+                for (const char* role : {"query_norm", "key_norm"}) {
                     add(prefix + "attention/" + role, {prefix + "attention/" + role});
                 }
+                add_projection(prefix + "attention/output", {prefix + "attention/output"},
+                               prefix + "attention/output_projection/input_scale_divisor");
             } else {
                 for (const char* role : {"a_log", "dt_bias", "convolution"}) {
                     add(prefix + "gdn/" + role, {prefix + "gdn/" + role});
                 }
                 add(prefix + "gdn/a_b_projection",
                     {prefix + "gdn/a_projection", prefix + "gdn/b_projection"});
-                add(prefix + "gdn/query_key_value_z",
-                    {prefix + "gdn/query", prefix + "gdn/key", prefix + "gdn/value",
-                     prefix + "gdn/z"});
-                for (const char* role : {"norm", "output"}) {
-                    add(prefix + "gdn/" + role, {prefix + "gdn/" + role});
-                }
+                add_projection(prefix + "gdn/query_key_value_z",
+                               {prefix + "gdn/query", prefix + "gdn/key", prefix + "gdn/value",
+                                prefix + "gdn/z"},
+                               prefix + "gdn/input_projection/input_scale_divisor");
+                add(prefix + "gdn/norm", {prefix + "gdn/norm"});
+                add_projection(prefix + "gdn/output", {prefix + "gdn/output"},
+                               prefix + "gdn/output_projection/input_scale_divisor");
             }
             add(prefix + "post_attention_norm", {prefix + "post_attention_norm"});
             const std::string gate = prefix + "mlp/gate";
             const std::string up   = prefix + "mlp/up";
-            const auto& gate_up = add(prefix + "mlp/gate_up", {gate, up});
-            add(prefix + "mlp/down", {prefix + "mlp/down"});
-            if (require_string(gate_up.at("format"), "v3 tensor format") == "nvfp4") {
-                ++nvfp4_mlp_layers;
-                add_input_divisor(prefix + "mlp/gate_up_projection/input_scale_divisor",
-                                  {gate, up});
-                add_input_divisor(prefix + "mlp/down_projection/input_scale_divisor",
-                                  {prefix + "mlp/down"});
-            }
+            add_projection(prefix + "mlp/gate_up", {gate, up},
+                           prefix + "mlp/gate_up_projection/input_scale_divisor");
+            add_projection(prefix + "mlp/down", {prefix + "mlp/down"},
+                           prefix + "mlp/down_projection/input_scale_divisor");
         }
 
         for (const char* name : {"input_projection", "embedding_norm", "hidden_norm", "final_norm"}) {
@@ -416,7 +433,7 @@ public:
         }
 
         constexpr std::size_t kStructuralObjects = 1012;
-        const std::size_t expected = kStructuralObjects + 2 * nvfp4_mlp_layers;
+        const std::size_t expected = kStructuralObjects + nvfp4_projections;
         if (selected_.size() != expected) {
             throw ArtifactError("qwen3.8-27b v3 projection produced " +
                                 std::to_string(selected_.size()) + " objects; expected " +
@@ -472,7 +489,9 @@ public:
         }
         (*template_it)["bytes"] = template_bytes.size();
         V3CompatibilityDirectory result;
-        result.directory = {{"identity", {{"model_id", "qwen3.8-27b"}, {"weights_id", "nvfp4"}}},
+        result.directory = {{"identity",
+                            {{"model_id", "qwen3.8-27b"},
+                             {"weights_id", quasar_ ? "quasar-nvfp4" : "nvfp4"}}},
                             {"objects", std::move(objects)}};
         result.payload_overrides.emplace("frontend/chat_template.jinja", template_bytes);
         return result;
@@ -627,6 +646,7 @@ private:
     const Json& directory_;
     const MappedFile& file_;
     std::uint64_t payload_start_;
+    bool quasar_ = false;
     std::map<std::string, const Json*, std::less<>> objects_;
     std::map<std::string, const Json*, std::less<>> selected_;
     std::map<std::string, std::string, std::less<>> physical_names_;

@@ -209,6 +209,15 @@ target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
 target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+# QUASAR trial artifact gate: host-only, requires the published 19.8 GiB v3 file via
+# NINFER_QUASAR_ARTIFACT; reports the skip code when it is absent.
+ninfer_add_test(ninfer_quasar_load_plan_test
+  SOURCES targets/qwen3_6_27b/test_quasar_load_plan.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_quasar_load_plan_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+set_tests_properties(ninfer_quasar_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_sharded_materialization_test
   SOURCES targets/qwen3_6_27b/test_sharded_materialization.cpp
   LIBRARIES ninfer_engine)

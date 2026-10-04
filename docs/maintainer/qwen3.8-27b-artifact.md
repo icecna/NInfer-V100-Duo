@@ -1,7 +1,8 @@
 # Qwen3.8-27B artifact reference
 
 This reference defines the registered Qwen3.8-27B `.ninfer` storage contracts: the
-`qwen3.8-27b/nvfp4` and preserved `qwen3.8-27b/gguf-q4-k-m` identities, their object inventories,
+`qwen3.8-27b/nvfp4`, experimental `qwen3.8-27b/quasar-nvfp4`, and preserved
+`qwen3.8-27b/gguf-q4-k-m` identities, their object inventories,
 shapes, numeric formats, storage layouts, fused row order, aliases, fixed sources, and
 source-to-object transforms. The existing registered `qwen3.8-27b/groupwise-int` contract remains
 defined in Section 13.
@@ -31,6 +32,30 @@ the artifact inventory or identity.
 
 The identity is read from the version-2 artifact directory. The filename, object count, and any
 representative tensor descriptor do not select the model or weights profile.
+
+## 1.1 QUASAR trial artifact
+
+The experimental identity `qwen3.8-27b/quasar-nvfp4` registers the published
+[QUASAR NInfer v3 artifact](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer)
+(revision tag `v3`, container ID `39be2299c2b94512abd51ffe079830f2`). The v3 directory has no
+weights-profile field, so the reader selects this identity by the 16-byte container ID at
+header offset 16, never by filename, object count, or a representative tensor's format; other
+v3 artifacts retain the official mixed-profile contract of Section 1.
+
+The trial is QAT, not lossless compression: every one of the 64 Text layers carries NVFP4
+attention and GDN input/output projections and MLP gate/up/down, 256 fused parents each paired
+with one FP32 activation divisor, while the vocabulary endpoints and MTP matrices keep W8 and
+the GDN fused A/B controls keep BF16. V100 executes A16 projections; the stored divisors are
+validated but no A4 activation quantization is enabled. The trial admits SM70 TP2 Text/Vision/
+None/MTP only; TP1 is rejected at binding, and DFlash residency is not implemented. Vision reuses
+the official encodings and the shared TP2 Vision route validated on the official artifact.
+
+The file's DFlash2 companion objects remain validation-only payload. The host-only
+`ninfer_quasar_load_plan_test` (NINFER_QUASAR_ARTIFACT) checks every NVFP4 parent's exact original
+packed range, all 256 scale pairs against the source FP32 words, and zero Vision objects placed
+on either GPU under text-only startup; a Vision startup instead places every Vision object on the
+primary device. QUASAR is not yet qualified on a real artifact; the load-plan gate and whole-model
+evidence are required before any performance or quality claim.
 
 ## 2. Fixed target facts
 
