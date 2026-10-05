@@ -204,7 +204,8 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
             (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported NVFP4 profile");
         }
-        return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return detail::nvfp4_attn_input_workspace_capacity_bytes(parent_rows, policy,
+                                                                  min_tokens, max_tokens);
     case QType::FP8_E4M3FN_ROW_BF16S:
         if (parent_rows != detail::Fp8AttnInputGeometry::kOutputRows ||
             input_rows != detail::Fp8AttnInputGeometry::kInputRows) {
@@ -400,7 +401,8 @@ std::size_t attn_input_proj_column_parallel_workspace_capacity_bytes(QType qtype
                                                 policy, min_tokens, max_tokens);
     }
     if (qtype == QType::NVFP4) {
-        return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return detail::nvfp4_attn_input_workspace_capacity_bytes(kShardFusedRows, policy,
+                                                                  min_tokens, max_tokens);
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         return detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);

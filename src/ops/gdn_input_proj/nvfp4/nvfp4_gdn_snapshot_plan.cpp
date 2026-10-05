@@ -19,10 +19,10 @@ template <class Allocator>
 Nvfp4GdnProjectedWorkspace allocate_workspace(Allocator& allocator, std::int32_t tokens) {
     Nvfp4GdnProjectedWorkspace out;
     out.projected = allocator.alloc(DType::BF16, {10240, tokens}, 256);
-    // Floored for the same reason as the linear_swiglu baseline: the A16 sub-projection declares
-    // no transient, and an arena allocation must be nonzero.
+    // Narrow A16 QPN declares no projection transient; borrowed arena storage must be nonempty.
+    // Wide SM70 calls instead reserve the complete CUTLASS projection workspace.
     const std::size_t projection_bytes = std::max<std::size_t>(
-        nvfp4_gdn_input_workspace_capacity_bytes(kNvfp4InternalPolicy, tokens, tokens), 256);
+        nvfp4_gdn_input_workspace_capacity_bytes(16384, kNvfp4InternalPolicy, tokens, tokens), 256);
     out.projection = allocator.alloc_bytes(projection_bytes, 256);
     return out;
 }
@@ -37,6 +37,11 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
     if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4) {
         throw std::invalid_argument("nvfp4 gdn conv admits only A16 or A4");
     }
+#ifdef NINFER_VOLTA_BUILD
+    // QPN owns the SM70 A16 projection, including load-time-prepacked weights. Preserve the
+    // convolution's explicit BF16 projected-input/state boundary through the existing post Op.
+    if (policy == LinearPolicy::A16Only) { return {Nvfp4GdnConvScheduleId::Materialized}; }
+#endif
     if (batch_size > 1) { return {Nvfp4GdnConvScheduleId::Materialized}; }
     if (policy == LinearPolicy::A16Only) {
         if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }

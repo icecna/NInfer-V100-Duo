@@ -836,7 +836,8 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
             (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA4)) {
             throw std::invalid_argument("gdn_input_proj workspace: unsupported NVFP4 profile");
         }
-        return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return detail::nvfp4_gdn_input_workspace_capacity_bytes(parent_rows, policy,
+                                                                  min_tokens, max_tokens);
     }
     if (parent_qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         if (parent_rows != detail::Fp8GdnInputGeometry::kOutputRows ||
@@ -1027,10 +1028,15 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
             throw std::logic_error("ReplaySSM record planner admitted NVFP4 decode");
         }
         if (maximum_plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) { return 0; }
-        return detail::nvfp4_gdn_input_workspace_capacity_bytes(detail::kNvfp4InternalPolicy,
-                                                                std::max(min_width, 4), max_width);
+#ifdef NINFER_VOLTA_BUILD
+        const std::int32_t first_materialized = min_width;
+#else
+        const std::int32_t first_materialized = std::max(min_width, 4);
+#endif
+        return detail::nvfp4_gdn_input_workspace_capacity_bytes(16384, detail::kNvfp4InternalPolicy,
+                                                                first_materialized, max_width);
     }
-    return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, batch_size * min_width,
+    return detail::nvfp4_gdn_input_workspace_capacity_bytes(16384, policy, batch_size * min_width,
                                                             batch_size * max_width);
 }
 
@@ -1298,7 +1304,8 @@ std::size_t gdn_input_proj_column_parallel_workspace_capacity_bytes(QType qtype,
             kShardFusedRows, kShardHidden, max_tokens);
     }
     if (qtype == QType::NVFP4) {
-        return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+        return detail::nvfp4_gdn_input_workspace_capacity_bytes(kShardFusedRows, policy,
+                                                                min_tokens, max_tokens);
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
@@ -1482,7 +1489,8 @@ std::size_t shard_projection_workspace_bytes(QType qtype, LinearPolicy policy,
             kShardFusedRows, kShardHidden, max_columns);
     }
     if (qtype == QType::NVFP4) {
-        return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, min_columns, max_columns);
+        return detail::nvfp4_gdn_input_workspace_capacity_bytes(kShardFusedRows, policy,
+                                                                min_columns, max_columns);
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_columns, max_columns);

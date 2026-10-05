@@ -12,9 +12,16 @@
 
 namespace ninfer::ops::detail {
 
-[[nodiscard]] std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy,
+[[nodiscard]] std::size_t nvfp4_gdn_input_workspace_capacity_bytes(std::int32_t output_rows,
+                                                                   LinearPolicy policy,
                                                                    std::int32_t min_tokens,
                                                                    std::int32_t max_tokens);
+
+#ifdef NINFER_VOLTA_BUILD
+[[nodiscard]] std::size_t nvfp4_gdn_input_sm70_workspace_bytes(int rows, int tokens);
+void nvfp4_gdn_input_sm70_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
+                                Tensor& z, WorkspaceArena* workspace, cudaStream_t stream);
+#endif
 
 void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                    cudaStream_t stream);

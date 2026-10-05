@@ -217,10 +217,16 @@ load_attention_projection(const FullAttentionPlan& plan,
         };
     }
     const auto& fused = std::get<FusedAttentionProjectionPlan>(plan.projection);
-    return FusedAttentionProjectionPayload{
+    FusedAttentionProjectionPayload out{
         .query_key_gate_value =
             materialized_weight(materialized, fused.query_key_gate_value, 14336 / tp, 5120, device),
     };
+#ifdef NINFER_VOLTA_BUILD
+    if (out.query_key_gate_value.qtype == QType::NVFP4) {
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.query_key_gate_value);
+    }
+#endif
+    return out;
 }
 
 GdnInputProjectionPayload
@@ -235,10 +241,16 @@ load_gdn_input_projection(const GdnPlan& plan, const artifact::MaterializedArtif
         };
     }
     const auto& fused = std::get<FusedGdnInputProjectionPlan>(plan.input_projection);
-    return FusedGdnInputProjectionPayload{
+    FusedGdnInputProjectionPayload out{
         .query_key_value_z =
             materialized_weight(materialized, fused.query_key_value_z, 16384 / tp, 5120, device),
     };
+#ifdef NINFER_VOLTA_BUILD
+    if (out.query_key_value_z.qtype == QType::NVFP4) {
+        ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(out.query_key_value_z);
+    }
+#endif
+    return out;
 }
 
 GdnControlProjectionPayload
@@ -1084,6 +1096,11 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
                                                               NumericFormat::BF16, {256}, device);
             target.output = materialized_weight(backing, source.attention.output, 5120, 6144 / tp,
                                                 device);
+#ifdef NINFER_VOLTA_BUILD
+            if (target.output.qtype == QType::NVFP4) {
+                ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(target.output);
+            }
+#endif
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {5120}, device);
             target.post_mixer = load_mlp(source.mlp, backing, tp, device);
@@ -1107,6 +1124,11 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
                                                         NumericFormat::BF16, {128}, device);
             target.output =
                 materialized_weight(backing, source.gdn.output, 5120, 6144 / tp, device);
+#ifdef NINFER_VOLTA_BUILD
+            if (target.output.qtype == QType::NVFP4) {
+                ::ninfer::ops::detail::nvfp4_prepack_qpn_sm70(target.output);
+            }
+#endif
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {5120}, device);
             target.post_mixer = load_mlp(source.mlp, backing, tp, device);

@@ -3,10 +3,6 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 
-#ifdef NINFER_VOLTA_BUILD
-#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_cutlass_sm70.h"
-#endif
-
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
@@ -18,11 +14,6 @@ enum class Nvfp4AttnInputRoute : std::uint8_t {
     A16,
     W4A4,
 };
-
-// Wide-token A16 threshold for the SM70 CUTLASS route: at T >= 128 one GEMM over the fused
-// parent plus a plane split beats the small-T chunk loop. Smaller T keeps the existing
-// decode/small-T kernels, so decode and verifier widths are untouched.
-constexpr std::int32_t kVoltaCutlassMinT = 128;
 
 Nvfp4AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 attn_input_proj: T must be positive"); }
@@ -36,14 +27,9 @@ Nvfp4AttnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                 Tensor& v, WorkspaceArena* workspace, cudaStream_t stream) {
 #ifdef NINFER_VOLTA_BUILD
-    if (x.ne[1] >= kVoltaCutlassMinT) {
-        if (workspace == nullptr) {
-            throw std::invalid_argument("nvfp4 Volta attention prefill requires caller workspace");
-        }
-        nvfp4_attn_input_cutlass_sm70_launch(x, weight, q, gate, k, v, *workspace, stream);
-        return;
-    }
-#endif
+    nvfp4_attn_input_sm70_launch(x, weight, q, gate, k, v, workspace, stream);
+#else
+    (void)workspace;
     constexpr std::int32_t kChunk  = kNvfp4LastSmallT;
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;
@@ -72,19 +58,15 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
                                             value_chunk, stream);
         }
     }
+#endif
 }
 
 void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
                       Tensor& v, WorkspaceArena* workspace, cudaStream_t stream) {
 #ifdef NINFER_VOLTA_BUILD
-    if (x.ne[1] >= kVoltaCutlassMinT) {
-        if (workspace == nullptr) {
-            throw std::invalid_argument("nvfp4 Volta attention prefill requires caller workspace");
-        }
-        nvfp4_attn_input_cutlass_sm70_launch_shard(x, weight, q, gate, k, v, *workspace, stream);
-        return;
-    }
-#endif
+    nvfp4_attn_input_sm70_launch(x, weight, q, gate, k, v, workspace, stream);
+#else
+    (void)workspace;
     constexpr std::int32_t kChunk  = kNvfp4LastSmallT;
     constexpr std::int32_t kQRows  = Nvfp4AttnInputSections<Nvfp4AttnInputTp2ColumnGeometry>::kQueryRows;
     constexpr std::int32_t kKvRows = Nvfp4AttnInputSections<Nvfp4AttnInputTp2ColumnGeometry>::kKeyRows;
@@ -113,13 +95,16 @@ void launch_a16_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& 
                                                   key_chunk, value_chunk, stream);
         }
     }
+#endif
 }
 
 } // namespace
 
-std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
+std::size_t nvfp4_attn_input_workspace_capacity_bytes(std::int32_t output_rows,
+                                                      LinearPolicy policy, std::int32_t min_tokens,
                                                       std::int32_t max_tokens) {
-    if (min_tokens <= 0 || max_tokens < min_tokens) {
+    if ((output_rows != 14336 && output_rows != 7168) ||
+        min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("nvfp4 attn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
@@ -127,13 +112,10 @@ std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::
         return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4AttnInputGeometry::kInputRows);
     }
 #ifdef NINFER_VOLTA_BUILD
-    if (max_tokens >= kVoltaCutlassMinT) {
-        // Sized at the parent row count; the tp2 column shard reuses the same arena and allocates
-        // its own smaller plane, so this bound covers both routes.
-        return nvfp4_attn_input_cutlass_workspace_bytes(max_tokens);
-    }
-#endif
+    return nvfp4_attn_input_sm70_workspace_bytes(output_rows, max_tokens);
+#else
     return 0;
+#endif
 }
 
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
@@ -154,9 +136,7 @@ void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q,
 // --- TP2 column-shard sibling --------------------------------------------------------------------
 // Route selection (resolve_route) is a pure function of (policy, token count), inherited unchanged
 // from the tp1 parent; only the underlying kernel Geometry (and its section offsets) differ. The
-// W4A4 quantize workspace size is a pure function of (tokens, K) and K=5120 is unchanged by the
-// shard (only the output row count N halves), so nvfp4_attn_input_workspace_capacity_bytes above is
-// reused as-is -- no separate shard capacity query is needed.
+// A4 scratch depends only on (T,K); wide SM70 A16 scratch also includes the shard output width.
 void nvfp4_attn_input_dispatch_shard(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, LinearPolicy policy,
                                      WorkspaceArena* workspace, cudaStream_t stream) {
