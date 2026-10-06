@@ -222,7 +222,10 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
 - L5 engine integration.
   - L5a `PrefixIndex` — done: `feat(runtime): add the prefix shortlist index`.
   - L5b cost model — done: `feat(runtime): add the context cost model`.
-  - L5c resource policy (retention, reclaim, session lineage) — pending.
+  - L5c resource policy (retention, reclaim, session lineage) — done:
+    `feat(runtime): add the context retention policy`. Owner/session lineage, shared vs private
+    candidate visibility, bounded demand LRU, demand-ordered victims, and the gain-above-loss
+    admission rule.
   - L5d executor integration and real-artifact verification — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 

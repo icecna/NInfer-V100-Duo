@@ -310,6 +310,8 @@ ninfer_add_test(ninfer_prefix_index_test
   SOURCES test_prefix_index.cpp)
 ninfer_add_test(ninfer_context_cost_test
   SOURCES test_context_cost.cpp)
+ninfer_add_test(ninfer_retention_policy_test
+  SOURCES test_retention_policy.cpp)
 ninfer_add_test(ninfer_openai_schema_test
   SOURCES test_openai_schema.cpp
   LIBRARIES ninfer_serve)
