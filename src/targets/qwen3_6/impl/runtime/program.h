@@ -174,12 +174,14 @@ enum class RetainedResidency : std::uint8_t {
 
 // The completed host copies of a retained prefix (a content-addressed table entry), one arena
 // allocation per device
-// pool. Page counts live in the allocations themselves. Empty unless `Host`.
+// pool. Page counts live in the allocations themselves. Empty unless `Host`. The handles are
+// shared so an optional shorter residency at an earlier frontier can reference the same whole
+// pages as its terminal instead of copying them; the arena charges each allocation once.
 struct HostKVResidency {
-    std::optional<HostKVAllocation> text_local;
-    std::optional<HostKVAllocation> text_peer;
-    std::optional<HostKVAllocation> backend_local;
-    std::optional<HostKVAllocation> backend_peer;
+    std::shared_ptr<HostKVAllocation> text_local;
+    std::shared_ptr<HostKVAllocation> text_peer;
+    std::shared_ptr<HostKVAllocation> backend_local;
+    std::shared_ptr<HostKVAllocation> backend_peer;
 };
 
 // Production payload of the content-addressed host prefix table (P2): a self-contained snapshot
@@ -481,14 +483,10 @@ public:
         std::optional<HostKVAllocation> gdn_local;
         std::optional<HostKVAllocation> gdn_peer;
         std::optional<HostKVAllocation> tail_local;
-        // Optional second residency at the rewrite-checkpoint frontier: the KV prefix plus the
-        // GDN state and hidden the rewrite checkpoint froze there. Publishing it lets a later
-        // request that re-renders only up to that boundary reuse the prefill state instead of
-        // recomputing the whole prompt.
-        std::optional<HostKVAllocation> prefix_text_local;
-        std::optional<HostKVAllocation> prefix_text_peer;
-        std::optional<HostKVAllocation> prefix_backend_local;
-        std::optional<HostKVAllocation> prefix_backend_peer;
+        // Optional second residency at the rewrite-checkpoint frontier: it shares the terminal's
+        // KV pages and owns only the GDN state and hidden the rewrite checkpoint froze there.
+        // Publishing it lets a later request that re-renders only up to that boundary reuse the
+        // prefill state instead of recomputing the whole prompt.
         std::optional<HostKVAllocation> prefix_gdn_local;
         std::optional<HostKVAllocation> prefix_gdn_peer;
         std::optional<HostKVAllocation> prefix_tail_local;

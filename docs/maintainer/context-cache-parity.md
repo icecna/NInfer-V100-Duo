@@ -49,7 +49,7 @@ different; **not implemented**.
 | Shortlist lookup on the real path | aligned | host residency matching via `PrefixIndex` + authoritative exact match; real-artifact gate |
 | Session lineage + demand retention | approximate | policy is authoritative, but the ordering/weights differ from upstream's `ResourceManager` |
 | Cost model | deviates | priced, but no calibrated presets; not used for ranking yet |
-| Multi-checkpoint capture at declared boundaries | partial | one extra residency at the rewrite-checkpoint frontier (the assistant opener / prompt frontier); prefix pages are duplicated rather than shared, and the prefix is published opportunistically from spare capacity (skipped when the arena is full, so it never evicts a terminal) |
+| Multi-checkpoint capture at declared boundaries | partial | one extra residency at the rewrite-checkpoint frontier (the assistant opener / prompt frontier); it shares the terminal's KV pages and owns only its GDN snapshot and hidden, and is published opportunistically from spare capacity (skipped when the arena is full, so it never evicts a terminal) |
 | Serving surface (`prompt_cache_retention` semantics, `cached_input_tokens` alignment, docs) | not implemented | pending |
 
 ## Deviation register (must stay explicit)
@@ -59,11 +59,12 @@ different; **not implemented**.
 3. Retention is a simplified owner/session/demand policy, not `ResourceManager`.
 4. Cost model is uncalibrated and unused for ranking.
 5. TP2, MTP, and DFlash handling is local; upstream has no TP counterpart.
-6. Multi-checkpoint capture is partial: only the rewrite-checkpoint frontier is captured, its KV
-   prefix pages are duplicated instead of shared (upstream shares via reference-counted prefix
-   views), and the prefix residency is skipped when the host arena has no spare capacity.
-7. Prefill is not split at capture frontiers; the prompt-internal boundaries resolved by the
-   frontend (`context_cache.boundaries`) are not captured yet.
+6. Multi-checkpoint capture is partial: only the rewrite-checkpoint frontier is captured, and
+   prompt-internal boundaries resolved by the frontend (`context_cache.boundaries`) are not. The
+   captured prefix shares the terminal's KV pages; it owns its own GDN snapshot and hidden, which
+   is the state image upstream also stores per checkpoint.
+7. Prefill is not split at capture frontiers; only the rewrite-checkpoint frontier is materialized
+   exactly, so the frontend's prompt-internal boundaries are not captured yet.
 
 ## Conformance evidence
 
