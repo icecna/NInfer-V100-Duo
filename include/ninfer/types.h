@@ -19,6 +19,12 @@ namespace ninfer {
 using TokenId = std::int32_t;
 
 inline constexpr std::uint32_t kMaximumConcurrency = 8;
+
+// Bound on a caller-supplied context-cache session key and on the explicit prompt-cache
+// breakpoints one request may declare. A protocol that supplies its own automatic policy may add
+// one further boundary on top of the explicit ones.
+inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
+inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
@@ -294,6 +300,78 @@ struct PromptCapabilities {
     ReasoningEffortCapabilities reasoning_effort;
 };
 
+// A reusable-prefix boundary declared by the caller or synthesized from a protocol's automatic
+// policy. `kind` states who may reuse the prefix; `evidence` records why the boundary exists.
+enum class PromptCacheMarkerKind : std::uint8_t {
+    SharedStablePrefix,
+    PrivateLongAnchor,
+};
+
+enum class SharedCandidateEvidence : std::uint8_t {
+    None               = 0,
+    ExplicitBoundary   = 1U << 0,
+    RequestedAutomatic = 1U << 1,
+    DefaultAutomatic   = 1U << 2,
+    EngineStructural   = 1U << 3,
+};
+
+[[nodiscard]] constexpr SharedCandidateEvidence operator|(SharedCandidateEvidence left,
+                                                          SharedCandidateEvidence right) noexcept {
+    return static_cast<SharedCandidateEvidence>(static_cast<std::uint8_t>(left) |
+                                                static_cast<std::uint8_t>(right));
+}
+
+constexpr SharedCandidateEvidence& operator|=(SharedCandidateEvidence& left,
+                                              SharedCandidateEvidence right) noexcept {
+    left = left | right;
+    return left;
+}
+
+[[nodiscard]] constexpr bool has_shared_candidate_evidence(SharedCandidateEvidence value,
+                                                           SharedCandidateEvidence evidence) noexcept {
+    return (static_cast<std::uint8_t>(value) & static_cast<std::uint8_t>(evidence)) != 0;
+}
+
+// Where a boundary sits in the rendered conversation. The frontend resolves each location to an
+// exact token frontier; a boundary without a unique output position is dropped.
+enum class PromptCacheMarkerLocation : std::uint8_t {
+    MessageBoundary,
+    MessagePartBoundary,
+    LeadingInstructionBoundary,
+    ToolBoundary,
+};
+
+struct PromptCacheMarker {
+    // Boundary after this many conversation messages (one-based) for MessageBoundary and
+    // MessagePartBoundary, where it also identifies the containing message.
+    std::uint32_t after_message_count = 0;
+    PromptCacheMarkerKind kind        = PromptCacheMarkerKind::SharedStablePrefix;
+    SharedCandidateEvidence evidence  = SharedCandidateEvidence::ExplicitBoundary;
+    PromptCacheMarkerLocation location = PromptCacheMarkerLocation::MessageBoundary;
+    // Byte count within the untrimmed leading System/Developer message.
+    std::uint32_t leading_instruction_bytes = 0;
+    // Boundary after this many tool definitions (one-based) for ToolBoundary.
+    std::uint32_t after_tool_count = 0;
+    // Number of serialized parts within the containing message for MessagePartBoundary.
+    std::uint32_t after_message_part_count = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(PromptCacheMarker,
+                                                   PromptCacheMarker) noexcept = default;
+};
+
+// Request-level context-cache hints forwarded to the target frontend. `session_key` names a
+// lineage whose published checkpoints may be restored by later requests; `markers` are the
+// boundaries this request wants retained.
+struct ContextCacheHints {
+    std::optional<std::string> session_key;
+    std::vector<PromptCacheMarker> markers;
+    // When false a protocol already decided the automatic/explicit write policy; the Engine must
+    // not add structural candidates. Exact reads of published shared prefixes stay enabled.
+    bool allow_engine_automatic_shared_prefixes = true;
+    // Advance the named session lineage when `session_key` is present.
+    bool update_session_index = true;
+};
+
 struct PromptOptions {
     bool add_generation_prompt = true;
     bool enable_thinking       = true;
@@ -306,6 +384,7 @@ struct PromptOptions {
 struct PromptInput {
     std::vector<ChatMessage> messages;
     PromptOptions options;
+    ContextCacheHints context_cache;
 };
 
 enum class RequestErrorKind : std::uint8_t {

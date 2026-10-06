@@ -138,7 +138,9 @@ The endpoint supports:
 - function tools, tool choices, assistant tool-call history, and tool-result messages;
 - the top-level `reasoning_effort` field;
 - the `enable_thinking` extension;
-- `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
+- `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias;
+- the prompt-cache hints `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, and
+  per-part `prompt_cache_breakpoint`.
 
 The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
 the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
@@ -166,6 +168,17 @@ select the corresponding template effort when available. The other OpenAI protoc
 prompts. It defaults to the server setting, which is off unless `--preserve-thinking` is used. If
 both OpenAI spellings are present they must carry the same boolean value. Unknown non-null
 `chat_template_kwargs` are rejected.
+
+Prompt-cache hints declare where a reusable prefix boundary may sit. A content part may carry
+`prompt_cache_breakpoint: {"mode":"explicit"}`. `prompt_cache_options.mode` selects the automatic
+policy: `implicit` (the default) also keeps a server-chosen boundary, while `explicit` retains only
+the declared boundaries. `prompt_cache_retention` accepts `in_memory` or `24h`, and
+`prompt_cache_options.ttl` accepts only `30m`. `prompt_cache_key` and `safety_identifier` must be
+strings of at most 64 characters. Without a declared boundary the server targets the end of the
+last assistant turn that produced tool calls, else the last turn carrying content, else the tool
+definitions. At most four explicit boundaries are retained; older ones are dropped. The cache
+stays content-addressed by the Engine, so a hint bounds where a prefix may be retained rather than
+naming a cache entry.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
@@ -275,6 +288,9 @@ wire response contains typed `output` Items.
 | `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
+| `prompt_cache_key`, `safety_identifier` | optional strings of at most 64 characters |
+| `prompt_cache_options`, `prompt_cache_retention` | the same cache-control policy as Chat Completions |
+| `user` | optional string accepted for compatibility |
 | `text.format` | omitted or `{"type":"text"}` only |
 | `tools` | flat Responses function definitions; see below |
 | `tool_choice` | `auto` or `none` |
@@ -287,7 +303,10 @@ wire response contains typed `output` Items.
 | `stream_options` | omitted or `{"include_obfuscation":false}` |
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
-with a field-specific 400 error instead of being silently ignored.
+with a field-specific 400 error instead of being silently ignored. When `store` is true, a stored
+Response also names a context-cache session lineage — its own `id` on the first request and the
+parent's key on every continuation — so the Engine can retain and restore that conversation's
+prefixes.
 
 ### Input Item contract
 
@@ -447,9 +466,9 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, prompt-cache controls, safety/user identifiers, Structured Outputs/JSON mode,
-non-empty `include`, background execution, compaction, files/audio, and OpenAI-hosted/MCP/custom
-tools. These are compatibility boundaries, not silently accepted placeholders.
+moderation, Structured Outputs/JSON mode, non-empty `include`, background execution, compaction,
+files/audio, and OpenAI-hosted/MCP/custom tools. These are compatibility boundaries, not silently
+accepted placeholders.
 
 ## Anthropic Messages
 
@@ -476,6 +495,15 @@ Consecutive system messages remain separate ordered turns.
 `thinking.type: "disabled"` disables thinking; other supported values enable it.
 The independent top-level `preserve_thinking` boolean controls closed-turn history and otherwise
 uses the server default.
+
+Block-level `cache_control: {"type":"ephemeral"}` (with an optional `ttl` of `5m` or `1h`)
+declares a reusable prefix boundary on a system text block, a user text/image block, a
+`tool_result`, assistant text, or the final `tool_use` of an assistant turn; any other placement is
+rejected with `invalid_cache_control`, and thinking/redacted_thinking blocks never accept it. A
+top-level `cache_control` supplies the automatic boundary with the same rules as Chat Completions.
+At most four block-level boundaries are accepted; a fifth, or an automatic boundary that needs a
+fifth distinct write, returns `too_many_cache_breakpoints`, and a request-level `cache_control`
+whose TTL conflicts with the boundary it targets returns `conflicting_cache_ttl`.
 
 Anthropic `output_config.effort` accepts the protocol values `low`, `medium`, `high`, `xhigh`, and
 `max`. The value is then checked against the loaded chat template in the same way as the OpenAI

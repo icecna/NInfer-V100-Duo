@@ -35,6 +35,9 @@ struct StoredResponse {
     std::vector<nlohmann::json> input_items;
     ResponseContext context;
     bool preserve_thinking = false;
+    // Context-cache lineage key published for this response; a later request with
+    // previous_response_id reuses the parent's key so one conversation keeps one lineage.
+    std::string session_key;
 };
 
 class ResponseStore {

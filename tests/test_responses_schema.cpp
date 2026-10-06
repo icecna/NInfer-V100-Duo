@@ -513,6 +513,29 @@ int test_input_tokens_schema() {
     return failures;
 }
 
+int test_prompt_cache_fields() {
+    int failures    = 0;
+    const Json base = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+    {
+        Json body                      = base;
+        body["prompt_cache_key"]       = "session-1";
+        body["prompt_cache_retention"] = "in_memory";
+        body["prompt_cache_options"]   = Json{{"mode", "implicit"}};
+        body["user"]                  = "u";
+        body["safety_identifier"]      = "s";
+        const ResponsesRequest req     = parse_responses_request(body, limits());
+        failures += check(!req.generation.allow_engine_automatic_shared_prefixes,
+                          "responses cache policy disables structural candidates");
+    }
+    {
+        Json body                      = base;
+        body["prompt_cache_retention"] = "forever";
+        failures += check(throws_api([&] { (void)parse_responses_request(body, limits()); }),
+                          "responses rejects invalid prompt_cache_retention");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -523,6 +546,7 @@ int main() {
     failures += test_reasoning_effort();
     failures += test_typed_items_and_tools();
     failures += test_explicit_rejections();
+    failures += test_prompt_cache_fields();
     failures += test_response_object();
     failures += test_sse_sequence();
     failures += test_sse_function_call();

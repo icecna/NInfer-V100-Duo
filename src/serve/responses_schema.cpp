@@ -1,3 +1,4 @@
+#include "serve/prompt_cache.h"
 #include "serve/responses_schema.h"
 
 #include "serve/generation_service.h"
@@ -614,8 +615,7 @@ void reject_unknown_top_level(const Json& body) {
 
 void reject_server_managed_features(const Json& body) {
     for (const char* key : {"context_management", "conversation", "max_tool_calls", "moderation",
-                            "prompt", "prompt_cache_key", "prompt_cache_options",
-                            "prompt_cache_retention", "safety_identifier", "user"}) {
+                            "prompt"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
             bad_request(std::string(key) + " is not supported", key, "parameter_not_supported");
         }
@@ -766,6 +766,7 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
         out.generation.max_tokens_set = false;
     }
     out.generation.messages = out.input_turns;
+    apply_openai_prompt_cache_policy(out.generation, parse_openai_prompt_cache_policy(body));
     return out;
 }
 

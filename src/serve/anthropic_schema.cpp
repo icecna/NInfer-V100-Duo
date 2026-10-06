@@ -109,6 +109,40 @@ std::string require_string_field(const Json& block, const char* field, const cha
     return block.at(field).get<std::string>();
 }
 
+// Anthropic cache_control vocabulary. Returns the requested TTL when the block declares
+// cache_control, nullopt when it does not, and throws with code `invalid_cache_control` otherwise.
+std::optional<CacheBoundary::Ttl> cache_boundary(const Json& value, const char* param) {
+    if (!value.contains("cache_control") || value.at("cache_control").is_null()) {
+        return std::nullopt;
+    }
+    const Json& control = value.at("cache_control");
+    if (!control.is_object() || !control.contains("type") || !control.at("type").is_string() ||
+        control.at("type").get<std::string>() != "ephemeral") {
+        bad_request("cache_control must be {type:'ephemeral'}", param, "invalid_cache_control");
+    }
+    CacheBoundary::Ttl ttl = CacheBoundary::Ttl::FiveMinutes;
+    if (control.contains("ttl") && !control.at("ttl").is_null()) {
+        if (!control.at("ttl").is_string()) {
+            bad_request("cache_control.ttl must be '5m' or '1h'", param, "invalid_cache_control");
+        }
+        const std::string ttl_value = control.at("ttl").get<std::string>();
+        if (ttl_value == "5m") {
+            ttl = CacheBoundary::Ttl::FiveMinutes;
+        } else if (ttl_value == "1h") {
+            ttl = CacheBoundary::Ttl::OneHour;
+        } else {
+            bad_request("cache_control.ttl must be '5m' or '1h'", param, "invalid_cache_control");
+        }
+    }
+    return ttl;
+}
+
+CacheBoundary explicit_cache_boundary(CacheBoundary::Ttl ttl) {
+    return CacheBoundary{.kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                         .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                         .ttl      = ttl};
+}
+
 ninfer::product::media_acquire::Source parse_image_source(const Json& block) {
     if (!block.contains("source") || !block.at("source").is_object()) {
         bad_request("image block must contain a source object", "messages");
@@ -170,6 +204,9 @@ void parse_tools(const Json& body, GenerationRequest& out) {
         // Normalized OpenAI-style function tool object consumed verbatim by the
         // Qwen chat template's <tools> block (render_tools_system_block).
         tool.definition_json = Json{{"type", "function"}, {"function", std::move(function)}}.dump();
+        if (const std::optional<CacheBoundary::Ttl> ttl = cache_boundary(item, "tools")) {
+            tool.cache_boundary_after = explicit_cache_boundary(*ttl);
+        }
         out.tools.push_back(std::move(tool));
     }
 }
@@ -204,29 +241,49 @@ void parse_tool_choice(const Json& body, GenerationRequest& out) {
 
 // Flatten only the content blocks within one system value. Callers preserve the
 // containing turn and its position in the conversation.
-std::string flatten_system_value(const Json& value, const char* param) {
-    std::string text;
+// Append the text blocks of a System/Developer value. The blocks stay joined in a single part
+// unless a block declares a cache boundary, which must be resolved against that block's own byte
+// offset and therefore needs its own part. Callers preserve the containing turn and its position.
+void append_system_content(const Json& value, const char* param, ChatTurn& turn) {
     if (value.is_string()) {
-        text = value.get<std::string>();
-    } else if (value.is_array()) {
-        for (const Json& block : value) {
-            if (require_block_type(block, param) != "text") {
-                bad_request("only text system blocks are supported", param);
-            }
-            append_text(text, require_string_field(block, "text", "system text block"));
-        }
-    } else {
+        turn.content.push_back(ContentPart{ContentKind::Text, value.get<std::string>(), "text"});
+        return;
+    }
+    if (!value.is_array()) {
         bad_request("system content must be a string or an array of text blocks", param);
     }
-    return text;
+    std::vector<std::pair<std::string, std::optional<CacheBoundary>>> blocks;
+    bool any_boundary = false;
+    for (const Json& block : value) {
+        if (require_block_type(block, param) != "text") {
+            bad_request("only text system blocks are supported", param);
+        }
+        std::optional<CacheBoundary> boundary;
+        if (const std::optional<CacheBoundary::Ttl> ttl = cache_boundary(block, param)) {
+            boundary     = explicit_cache_boundary(*ttl);
+            any_boundary = true;
+        }
+        blocks.emplace_back(require_string_field(block, "text", "system text block"),
+                            std::move(boundary));
+    }
+    if (!any_boundary) {
+        std::string text;
+        for (const auto& block : blocks) { append_text(text, block.first); }
+        turn.content.push_back(ContentPart{ContentKind::Text, std::move(text), "text"});
+        return;
+    }
+    for (auto& block : blocks) {
+        ContentPart part{ContentKind::Text, std::move(block.first), "text"};
+        part.cache_boundary_after = std::move(block.second);
+        turn.content.push_back(std::move(part));
+    }
 }
 
 void parse_system(const Json& body, GenerationRequest& out) {
     if (!body.contains("system") || body.at("system").is_null()) { return; }
     ChatTurn turn;
     turn.role = ChatRole::System;
-    turn.content.push_back(
-        ContentPart{ContentKind::Text, flatten_system_value(body.at("system"), "system"), "text"});
+    append_system_content(body.at("system"), "system", turn);
     out.messages.push_back(std::move(turn));
 }
 
@@ -280,24 +337,47 @@ void parse_assistant_content(const Json& content, GenerationRequest& out) {
     ChatTurn turn;
     turn.role = ChatRole::Assistant;
     std::string text;
-    for (const Json& block : content) {
+    std::optional<CacheBoundary> text_boundary;
+    for (std::size_t index = 0; index < content.size(); ++index) {
+        const Json& block      = content.at(index);
         const std::string type = require_block_type(block, "messages");
         if (type == "text") {
             append_text(text, require_string_field(block, "text", "text block"));
+            if (const std::optional<CacheBoundary::Ttl> ttl = cache_boundary(block, "messages")) {
+                text_boundary = explicit_cache_boundary(*ttl);
+            }
         } else if (type == "thinking") {
+            if (cache_boundary(block, "messages")) {
+                bad_request("cache_control is not supported on thinking blocks", "messages",
+                            "invalid_cache_control");
+            }
             if (block.contains("thinking") && block.at("thinking").is_string()) {
                 append_text(turn.reasoning_content, block.at("thinking").get<std::string>());
             }
         } else if (type == "redacted_thinking") {
+            if (cache_boundary(block, "messages")) {
+                bad_request("cache_control is not supported on redacted_thinking blocks",
+                            "messages", "invalid_cache_control");
+            }
             // Opaque redacted reasoning: nothing usable for the text frontend.
         } else if (type == "tool_use") {
             turn.tool_calls.push_back(parse_tool_use(block));
+            // A cache boundary on a tool_use names the whole assistant turn only when that tool_use
+            // is the turn's final block; otherwise it is advisory and dropped.
+            if (index + 1 == content.size()) {
+                if (const std::optional<CacheBoundary::Ttl> ttl =
+                        cache_boundary(block, "messages")) {
+                    turn.cache_boundary_after = explicit_cache_boundary(*ttl);
+                }
+            }
         } else {
             bad_request("unsupported assistant content block: " + type, "messages");
         }
     }
     if (!text.empty()) {
-        turn.content.push_back(ContentPart{ContentKind::Text, std::move(text), "text"});
+        ContentPart part{ContentKind::Text, std::move(text), "text"};
+        part.cache_boundary_after = std::move(text_boundary);
+        turn.content.push_back(std::move(part));
     }
     if (turn.content.empty() && turn.tool_calls.empty() && turn.reasoning_content.empty()) {
         bad_request("assistant message must have text, thinking, or tool_use content", "messages");
@@ -321,7 +401,11 @@ void parse_user_content(const Json& content, GenerationRequest& out) {
         const std::string type = require_block_type(block, "messages");
         if (type == "text") {
             std::string text = require_string_field(block, "text", "text block");
-            user_turn.content.push_back(ContentPart{ContentKind::Text, std::move(text), "text"});
+            ContentPart part{ContentKind::Text, std::move(text), "text"};
+            if (const std::optional<CacheBoundary::Ttl> ttl = cache_boundary(block, "messages")) {
+                part.cache_boundary_after = explicit_cache_boundary(*ttl);
+            }
+            user_turn.content.push_back(std::move(part));
         } else if (type == "tool_result") {
             if (!block.contains("tool_use_id") || !block.at("tool_use_id").is_string() ||
                 block.at("tool_use_id").get<std::string>().empty()) {
@@ -332,12 +416,18 @@ void parse_user_content(const Json& content, GenerationRequest& out) {
             tool_turn.role         = ChatRole::Tool;
             tool_turn.tool_call_id = block.at("tool_use_id").get<std::string>();
             tool_turn.content      = parse_tool_result_content(block);
+            if (const std::optional<CacheBoundary::Ttl> ttl = cache_boundary(block, "messages")) {
+                tool_turn.cache_boundary_after = explicit_cache_boundary(*ttl);
+            }
             out.messages.push_back(std::move(tool_turn));
         } else if (type == "image") {
             ContentPart part;
             part.kind     = ContentKind::Image;
             part.type_raw = "image";
             part.source   = parse_image_source(block);
+            if (const std::optional<CacheBoundary::Ttl> ttl = cache_boundary(block, "messages")) {
+                part.cache_boundary_after = explicit_cache_boundary(*ttl);
+            }
             user_turn.content.push_back(std::move(part));
         } else {
             bad_request("unsupported user content block: " + type, "messages");
@@ -402,8 +492,7 @@ void parse_messages(const Json& body, GenerationRequest& out) {
         if (role == ChatRole::System) {
             ChatTurn turn;
             turn.role = ChatRole::System;
-            turn.content.push_back(
-                ContentPart{ContentKind::Text, flatten_system_value(content, "messages"), "text"});
+            append_system_content(content, "messages", turn);
             out.messages.push_back(std::move(turn));
             continue;
         }
@@ -510,6 +599,66 @@ std::string sse(const char* type, const Json& payload) {
     return std::string("event: ") + type + "\ndata: " + payload.dump() + "\n\n";
 }
 
+void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& request) {
+    std::vector<std::optional<CacheBoundary>*> explicit_boundaries;
+    for (ToolDefinition& tool : request.tools) {
+        if (tool.cache_boundary_after) { explicit_boundaries.push_back(&tool.cache_boundary_after); }
+    }
+    for (ChatTurn& turn : request.messages) {
+        for (ContentPart& part : turn.content) {
+            if (part.cache_boundary_after) {
+                explicit_boundaries.push_back(&part.cache_boundary_after);
+            }
+        }
+        if (turn.cache_boundary_after) {
+            explicit_boundaries.push_back(&turn.cache_boundary_after);
+        }
+    }
+    if (explicit_boundaries.size() > ninfer::kMaximumExplicitPromptCacheMarkers) {
+        bad_request("at most four block-level cache_control breakpoints are supported per request",
+                    "cache_control", "too_many_cache_breakpoints");
+    }
+
+    const std::optional<CacheBoundary::Ttl> automatic_ttl = cache_boundary(body, "cache_control");
+    if (!automatic_ttl) { return; }
+    request.allow_engine_automatic_shared_prefixes = false;
+
+    std::optional<CacheBoundary>* automatic_target = nullptr;
+    for (auto turn = request.messages.rbegin(); turn != request.messages.rend(); ++turn) {
+        if (!turn->tool_calls.empty()) {
+            automatic_target = &turn->cache_boundary_after;
+            break;
+        }
+        if (!turn->content.empty()) {
+            automatic_target = &turn->content.back().cache_boundary_after;
+            break;
+        }
+    }
+    if (automatic_target == nullptr && !request.tools.empty()) {
+        automatic_target = &request.tools.back().cache_boundary_after;
+    }
+    if (automatic_target == nullptr) { return; }
+
+    if (*automatic_target) {
+        if (automatic_target->value().ttl != *automatic_ttl) {
+            bad_request("request-level cache_control and the final block-level cache_control "
+                        "target the same boundary with different ttl values",
+                        "cache_control", "conflicting_cache_ttl");
+        }
+        automatic_target->value().evidence |= ninfer::SharedCandidateEvidence::RequestedAutomatic;
+        return;
+    }
+    if (explicit_boundaries.size() == ninfer::kMaximumExplicitPromptCacheMarkers) {
+        bad_request("request-level cache_control needs a fifth distinct cache write after four "
+                    "block-level breakpoints",
+                    "cache_control", "too_many_cache_breakpoints");
+    }
+    *automatic_target =
+        CacheBoundary{.kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                      .evidence = ninfer::SharedCandidateEvidence::RequestedAutomatic,
+                      .ttl      = *automatic_ttl};
+}
+
 } // namespace
 
 GenerationRequest parse_messages_request(const Json& body, const RequestLimits& limits) {
@@ -539,6 +688,8 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
     }
 
     out.stream = get_bool(body, "stream", false);
+
+    apply_anthropic_prompt_cache_policy(body, out);
 
     const std::optional<int> max_tokens = get_int(body, "max_tokens");
     if (max_tokens) {

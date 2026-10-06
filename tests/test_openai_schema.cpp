@@ -723,12 +723,131 @@ int test_finish_reason_wire() {
     return failures;
 }
 
+int test_prompt_cache_policy() {
+    int failures    = 0;
+    const Json base = {
+        {"model", "m"},
+        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}},
+                                  Json{{"role", "assistant"}, {"content", "hi"}}})},
+    };
+
+    // An unmarked request gets the default automatic target after the last content part, and the
+    // protocol owns the write policy from here on.
+    {
+        const GenerationRequest req = parse_chat_completion_request(base, default_limits());
+        failures += check(!req.allow_engine_automatic_shared_prefixes,
+                          "openai disables engine structural candidates");
+        const ninfer::PromptInput input = translate(req);
+        failures +=
+            check(input.context_cache.markers.size() == 1, "one default automatic marker");
+        const ninfer::PromptCacheMarker& marker = input.context_cache.markers.at(0);
+        failures += check(marker.location == ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
+                          "automatic marker is a message-part boundary");
+        failures += check(marker.after_message_count == 2, "automatic marker after second message");
+        failures += check(marker.evidence == ninfer::SharedCandidateEvidence::DefaultAutomatic,
+                          "automatic marker carries default evidence");
+    }
+
+    // An assistant turn that produced tool calls makes the whole turn the automatic target.
+    {
+        Json body        = base;
+        body["messages"] = Json::array(
+            {Json{{"role", "user"}, {"content", "hello"}},
+             Json{{"role", "assistant"},
+                  {"tool_calls",
+                   Json::array({Json{{"id", "c1"},
+                                     {"type", "function"},
+                                     {"function", Json{{"name", "f"}, {"arguments", "{}"}}}}})}}});
+        const GenerationRequest req     = parse_chat_completion_request(body, default_limits());
+        const ninfer::PromptInput input = translate(req);
+        failures += check(input.context_cache.markers.size() == 1,
+                          "tool-call turn yields one automatic marker");
+        failures +=
+            check(input.context_cache.markers.at(0).location ==
+                      ninfer::PromptCacheMarkerLocation::MessageBoundary,
+                  "tool-call automatic marker is a message boundary");
+    }
+
+    // An explicit breakpoint is retained, and with mode explicit there is no automatic target.
+    {
+        Json body        = base;
+        body["messages"] = Json::array(
+            {Json{{"role", "user"},
+                  {"content", Json::array({Json{{"type", "text"},
+                                                {"text", "hello"},
+                                                {"prompt_cache_breakpoint",
+                                                 Json{{"mode", "explicit"}}}}})}}});
+        body["prompt_cache_options"] = Json{{"mode", "explicit"}};
+        const GenerationRequest req     = parse_chat_completion_request(body, default_limits());
+        const ninfer::PromptInput input = translate(req);
+        failures += check(input.context_cache.markers.size() == 1, "explicit-only marker count");
+        failures += check(input.context_cache.markers.at(0).evidence ==
+                              ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                          "explicit breakpoint evidence");
+    }
+
+    // Five explicit breakpoints keep the newest four.
+    {
+        Json messages = Json::array();
+        for (int index = 0; index < 5; ++index) {
+            messages.push_back(Json{
+                {"role", "user"},
+                {"content", Json::array({Json{{"type", "text"},
+                                              {"text", std::string("m") + std::to_string(index)},
+                                              {"prompt_cache_breakpoint",
+                                               Json{{"mode", "explicit"}}}}})}});
+        }
+        const Json body             = {{"model", "m"}, {"messages", messages}};
+        const GenerationRequest req = parse_chat_completion_request(body, default_limits());
+        const ninfer::PromptInput input = translate(req);
+        failures += check(input.context_cache.markers.size() == 4,
+                          "explicit marker budget keeps four boundaries");
+        failures += check(input.context_cache.markers.at(0).after_message_count == 2,
+                          "oldest explicit boundary dropped");
+    }
+
+    // Policy validation.
+    {
+        Json long_key            = base;
+        long_key["prompt_cache_key"] = std::string(65, 'x');
+        failures += check(
+            throws_api([&] { (void)parse_chat_completion_request(long_key, default_limits()); }),
+            "over-long prompt_cache_key rejected");
+
+        Json retention                     = base;
+        retention["prompt_cache_retention"] = "forever";
+        failures += check(
+            throws_api([&] { (void)parse_chat_completion_request(retention, default_limits()); }),
+            "invalid prompt_cache_retention rejected");
+
+        Json mode                    = base;
+        mode["prompt_cache_options"] = Json{{"mode", "sometimes"}};
+        failures += check(
+            throws_api([&] { (void)parse_chat_completion_request(mode, default_limits()); }),
+            "invalid prompt_cache_options.mode rejected");
+
+        Json bad_breakpoint = base;
+        bad_breakpoint["messages"] = Json::array(
+            {Json{{"role", "user"},
+                  {"content", Json::array({Json{{"type", "text"},
+                                                {"text", "x"},
+                                                {"prompt_cache_breakpoint",
+                                                 Json{{"mode", "auto"}}}}})}}});
+        failures += check(api_code([&] {
+                              (void)parse_chat_completion_request(bad_breakpoint, default_limits());
+                          }) == "invalid_cache_breakpoint",
+                          "invalid prompt_cache_breakpoint code");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
     failures += test_parse_string_content();
     failures += test_preserve_thinking_options();
+    failures += test_prompt_cache_policy();
     failures += test_reasoning_effort();
     failures += test_parse_parts_and_flatten();
     failures += test_instruction_roles_preserved();

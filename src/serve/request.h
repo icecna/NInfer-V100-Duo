@@ -61,11 +61,30 @@ enum class ContentKind {
     Unsupported,
 };
 
+// A reusable-prefix boundary requested by the caller. The protocol adapter records it on the
+// structural element it follows (a content part, a whole turn, or a tool definition); the
+// automatic-policy helpers normalize kinds/evidence before translation turns them into public
+// PromptCacheMarker values.
+struct CacheBoundary {
+    enum class Ttl : std::uint8_t {
+        Default,
+        FiveMinutes,
+        OneHour,
+    };
+
+    ninfer::PromptCacheMarkerKind kind       = ninfer::PromptCacheMarkerKind::SharedStablePrefix;
+    ninfer::SharedCandidateEvidence evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary;
+    Ttl ttl                                  = Ttl::Default;
+
+    [[nodiscard]] friend constexpr bool operator==(CacheBoundary, CacheBoundary) noexcept = default;
+};
+
 struct ContentPart {
     ContentKind kind = ContentKind::Text;
     std::string text;     // populated for Text
     std::string type_raw; // original OpenAI "type" string (diagnostics / future use)
     ninfer::product::media_acquire::Source source;
+    std::optional<CacheBoundary> cache_boundary_after;
 };
 
 struct ToolDefinition {
@@ -74,6 +93,7 @@ struct ToolDefinition {
     std::string parameters_json;
     std::string definition_json; // normalized OpenAI function-tool object for Qwen prompt rendering
     bool strict = false;
+    std::optional<CacheBoundary> cache_boundary_after;
 };
 
 struct ToolCall {
@@ -102,6 +122,7 @@ struct ChatTurn {
     std::string tool_call_id;      // populated for role=tool
     std::string reasoning_content; // assistant thinking carried across turns (round-tripped to the
                                    // template)
+    std::optional<CacheBoundary> cache_boundary_after;
 };
 
 // OpenAI sampling fields carried by the protocol adapter. `logit_bias` remains
@@ -180,6 +201,12 @@ struct GenerationRequest {
     std::string reasoning_effort_param = "reasoning_effort";
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
+    // Context-cache hints decided by the protocol layer. The automatic-policy helpers set
+    // `allow_engine_automatic_shared_prefixes=false` once a protocol owns the write policy;
+    // `session_key`/`update_session_index` come from a stateful protocol (OpenAI Responses).
+    bool allow_engine_automatic_shared_prefixes = true;
+    std::optional<std::string> session_key;
+    bool update_session_index = false;
     SamplingParams sampling;
 
     [[nodiscard]] bool uses_tools() const noexcept {

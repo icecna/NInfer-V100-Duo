@@ -746,6 +746,121 @@ int test_count_tokens_and_error() {
     return failures;
 }
 
+int test_prompt_cache_control() {
+    int failures    = 0;
+    const Json base = {{"model", "m"},
+                       {"max_tokens", 16},
+                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
+
+    // A system block boundary is resolved against the leading instruction bytes, including the
+    // separator translation inserts between adjacent text blocks.
+    {
+        Json body      = base;
+        body["system"] = Json::array(
+            {Json{{"type", "text"}, {"text", "aaa"}},
+             Json{{"type", "text"},
+                  {"text", "bb"},
+                  {"cache_control", Json{{"type", "ephemeral"}}}}});
+        const GenerationRequest req     = parse_messages_request(body, default_limits());
+        const ninfer::PromptInput input = translate(req);
+        bool found                      = false;
+        for (const ninfer::PromptCacheMarker& marker : input.context_cache.markers) {
+            if (marker.location == ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary) {
+                found = true;
+                failures += check(marker.leading_instruction_bytes == 6,
+                                  "leading instruction offset includes separator");
+            }
+        }
+        failures += check(found, "system cache_control produced a leading instruction boundary");
+    }
+
+    // A user text part is a message-part boundary; a final tool_use is a turn boundary.
+    {
+        Json body        = base;
+        body["messages"] = Json::array(
+            {Json{{"role", "user"},
+                  {"content", Json::array({Json{{"type", "text"},
+                                                {"text", "x"},
+                                                {"cache_control",
+                                                 Json{{"type", "ephemeral"}}}}})}}});
+        const GenerationRequest req     = parse_messages_request(body, default_limits());
+        const ninfer::PromptInput input = translate(req);
+        failures += check(input.context_cache.markers.size() == 1 &&
+                              input.context_cache.markers.at(0).location ==
+                                  ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
+                          "user text boundary is a message-part boundary");
+
+        Json tool_body        = base;
+        tool_body["messages"] = Json::array(
+            {Json{{"role", "user"}, {"content", "hi"}},
+             Json{{"role", "assistant"},
+                  {"content",
+                   Json::array({Json{{"type", "tool_use"},
+                                     {"id", "t1"},
+                                     {"name", "f"},
+                                     {"input", Json::object()},
+                                     {"cache_control", Json{{"type", "ephemeral"}}}}})}}});
+        const GenerationRequest tool_req = parse_messages_request(tool_body, default_limits());
+        const ninfer::PromptInput tool_input = translate(tool_req);
+        failures += check(tool_input.context_cache.markers.size() == 1 &&
+                              tool_input.context_cache.markers.at(0).location ==
+                                  ninfer::PromptCacheMarkerLocation::MessageBoundary,
+                          "final tool_use boundary is a message boundary");
+    }
+
+    // A request-level cache_control targets the last content turn.
+    {
+        Json body              = base;
+        body["cache_control"] = Json{{"type", "ephemeral"}};
+        const GenerationRequest req     = parse_messages_request(body, default_limits());
+        const ninfer::PromptInput input = translate(req);
+        failures += check(input.context_cache.markers.size() == 1,
+                          "request-level cache_control yields one automatic marker");
+        failures += check(input.context_cache.markers.at(0).evidence ==
+                              ninfer::SharedCandidateEvidence::RequestedAutomatic,
+                          "request-level automatic evidence");
+    }
+
+    // Invalid and conflicting control values.
+    {
+        Json bad        = base;
+        bad["messages"] = Json::array(
+            {Json{{"role", "user"},
+                  {"content", Json::array({Json{{"type", "text"},
+                                                {"text", "x"},
+                                                {"cache_control",
+                                                 Json{{"type", "persistent"}}}}})}}});
+        failures += check(api_code([&] { (void)parse_messages_request(bad, default_limits()); }) ==
+                              "invalid_cache_control",
+                          "invalid cache_control type code");
+
+        Json thinking        = base;
+        thinking["messages"] = Json::array(
+            {Json{{"role", "user"}, {"content", "hi"}},
+             Json{{"role", "assistant"},
+                  {"content", Json::array({Json{{"type", "thinking"},
+                                                {"thinking", "hmm"},
+                                                {"cache_control",
+                                                 Json{{"type", "ephemeral"}}}}})}}});
+        failures += check(api_code([&] { (void)parse_messages_request(thinking, default_limits()); }) ==
+                              "invalid_cache_control",
+                          "cache_control on thinking rejected");
+
+        Json conflict              = base;
+        conflict["cache_control"] = Json{{"type", "ephemeral"}, {"ttl", "1h"}};
+        conflict["messages"]      = Json::array(
+            {Json{{"role", "user"},
+                  {"content", Json::array({Json{{"type", "text"},
+                                                {"text", "x"},
+                                                {"cache_control", Json{{"type", "ephemeral"},
+                                                                        {"ttl", "5m"}}}}})}}});
+        failures += check(api_code([&] { (void)parse_messages_request(conflict, default_limits()); }) ==
+                              "conflicting_cache_ttl",
+                          "conflicting cache ttl rejected");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -759,6 +874,7 @@ int main() {
     failures += test_tools_and_choice();
     failures += test_tool_use_result_roundtrip();
     failures += test_thinking_and_sampling();
+    failures += test_prompt_cache_control();
     failures += test_reasoning_effort();
     failures += test_stop_reason_mapping();
     failures += test_response_serialization();

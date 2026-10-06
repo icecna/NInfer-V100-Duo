@@ -218,7 +218,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 throw ApiException(response_not_found(*request.previous_response_id));
             }
             inherit_responses_preserve_thinking(request, previous->preserve_thinking);
-            previous_context = previous->context;
+            previous_context               = previous->context;
+            request.generation.session_key = previous->session_key;
         }
         compose_responses_generation_messages(request, flatten_response_context(previous_context));
     } catch (const ApiException& exception) {
@@ -228,6 +229,16 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         write_error(res, internal_error(exception));
         return;
     }
+
+    // One conversation keeps one context-cache lineage: the first stored response names the
+    // lineage after its own id, and every continuation reuses the parent's key. A non-storing
+    // request neither starts nor advances a lineage.
+    const std::string id       = new_response_id();
+    const std::int64_t created = unix_time_now();
+    if (!request.previous_response_id && request.store) {
+        request.generation.session_key = id;
+    }
+    request.generation.update_session_index = request.store;
 
     const std::uint64_t req_id = ++request_seq_;
     PreparedRequest prepared;
@@ -247,8 +258,6 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         return;
     }
 
-    const std::string id       = new_response_id();
-    const std::int64_t created = unix_time_now();
     const RequestLogContext log_context =
         make_request_log_context(req_id, "openai_responses", request.generation, prepared);
     log_request_start(log_context);
@@ -266,6 +275,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 stored.input_items       = request.input_items;
                 stored.context           = terminal_context(previous_context, request, response);
                 stored.preserve_thinking = prepared.preserve_thinking;
+                stored.session_key =
+                    request.generation.session_key.value_or(std::string{});
                 response_store_.put(std::move(stored));
             }
             log_request_done(log_context, outcome);
@@ -323,6 +334,8 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                     stored.context     = terminal_context(stream->previous_context, stream->request,
                                                           finished.response);
                     stored.preserve_thinking = stream->prepared.preserve_thinking;
+                    stored.session_key =
+                        stream->request.generation.session_key.value_or(std::string{});
                     response_store_.put(std::move(stored));
                 }
                 write_stream_items(sink, *stream, std::move(finished.events_before_terminal));

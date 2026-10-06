@@ -1,4 +1,5 @@
 #include "serve/openai_schema.h"
+#include "serve/prompt_cache.h"
 
 #include <array>
 #include <cctype>
@@ -170,6 +171,9 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
             out.kind = ContentKind::InputAudio;
         } else {
             out.kind = ContentKind::Unsupported;
+        }
+        if (parse_openai_prompt_cache_breakpoint(part, "messages")) {
+            out.cache_boundary_after = CacheBoundary{};
         }
         turn.content.push_back(std::move(out));
     }
@@ -558,6 +562,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     }
     parse_openai_reasoning_effort(body, out);
     out.preserve_thinking = parse_openai_preserve_thinking(body);
+    apply_openai_prompt_cache_policy(out, parse_openai_prompt_cache_policy(body));
 
     std::optional<int> max_tokens = get_int(body, "max_completion_tokens");
     if (!max_tokens) { max_tokens = get_int(body, "max_tokens"); }
