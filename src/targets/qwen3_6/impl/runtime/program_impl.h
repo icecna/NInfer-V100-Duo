@@ -1329,6 +1329,54 @@ void ProgramImplCore::complete_host_transfer(std::uint32_t lane, bool abandoned)
         if (!sequence.retained || sequence.retained_residency != RetainedResidency::HostTransferIn) {
             throw std::logic_error("host retain transfer completed for a lane that moved on");
         }
+        // Capture the optional shorter residency's content before the lane fields are moved: its
+        // KV prefix and the identity truncated to its frontier.
+        bool prefix_ready = transfer->has_prefix;
+        std::vector<TokenId> prefix_tokens;
+        qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
+        if (prefix_ready) {
+            const std::size_t frontier = transfer->prefix_frontier;
+            prefix_tokens.assign(sequence.ledger.begin(),
+                                 sequence.ledger.begin() + static_cast<std::ptrdiff_t>(frontier));
+            prefix_identity = sequence.prefix_identity;
+            try {
+                prefix_identity.truncate(frontier);
+                prefix_identity.recompute_digests(prefix_tokens);
+            } catch (const std::exception&) { prefix_ready = false; }
+        }
+        // Publish the shorter residency FIRST so its retention age precedes the terminal's: when
+        // the arena later needs room, the optional prefix is reclaimed before any terminal.
+        if (prefix_ready) {
+            HostPrefixResidency prefix;
+            prefix.kv.text_local    = std::move(transfer->prefix_text_local);
+            prefix.kv.text_peer     = std::move(transfer->prefix_text_peer);
+            prefix.kv.backend_local = std::move(transfer->prefix_backend_local);
+            prefix.kv.backend_peer  = std::move(transfer->prefix_backend_peer);
+            prefix.gdn_local        = std::move(transfer->prefix_gdn_local);
+            prefix.gdn_peer         = std::move(transfer->prefix_gdn_peer);
+            prefix.tail_local       = std::move(transfer->prefix_tail_local);
+            prefix.tail_bytes       = sequence.tail_hidden.bytes();
+            prefix.tokens           = std::move(prefix_tokens);
+            prefix.identity         = std::move(prefix_identity);
+            prefix.origin_lane      = lane;
+            prefix.reuse_boundary   = transfer->prefix_frontier;
+            const qwen3_6::detail::PrefixShortlistKey prefix_shortlist{
+                .digest       = prefix.identity.digest_at(prefix.reuse_boundary),
+                .frontier     = static_cast<std::uint32_t>(prefix.reuse_boundary),
+                .identity_tag = prefix_identity_tag};
+            const qwen3_6::detail::HostPrefixId prefix_id =
+                host_prefixes.insert(std::move(prefix),
+                                     [this] { return ++host_prefix_id_counter; });
+            host_prefix_index.insert(prefix_id, prefix_shortlist);
+            const runtime::ContinuationOwnerToken prefix_owner = host_retention.open_owner(
+                sequence.session_key.empty() ? std::optional<std::string>{}
+                                             : std::optional<std::string>(sequence.session_key));
+            host_retention.publish(prefix_owner, prefix_id,
+                                   runtime::CheckpointRole::SharedPrefix, /*shared=*/false);
+            host_retention.finish_owner(prefix_owner);
+            host_prefixes.stamp(prefix_id, ++host_lru_counter);
+            ++host_table_version_;
+        }
         // Publish the self-contained entry and release the lane entirely: the entry owns the
         // arena extents AND the content (tokens/identity) AND the state snapshots (GDN current
         // slot per device, rank-0 tail hidden), so no lane field survives the round trip.
@@ -1498,6 +1546,21 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         return;
     }
 
+    // A second, shorter residency at the rewrite-checkpoint frontier. The lane froze the GDN
+    // state and hidden there during prefill and its KV covers the prefix, so both are still valid
+    // at the terminal; MTP keeps the backend prefix one token short of the frontier.
+    const std::uint32_t prefix_frontier =
+        sequence.rewrite_checkpoint.valid ? sequence.rewrite_checkpoint.frontier : 0;
+    const bool retain_prefix = prefix_frontier > 0 &&
+                               prefix_frontier < sequence.execution_frontier &&
+                               prefix_frontier <= sequence.ledger.size();
+    const std::uint32_t prefix_text_pages =
+        retain_prefix ? pages_for_tokens(prefix_frontier) : 0;
+    const std::uint32_t prefix_backend_pages =
+        (retain_prefix && speculative_backend == SpeculativeBackend::Mtp)
+            ? pages_for_tokens(prefix_frontier - 1)
+            : 0;
+
     // Sequential feasibility per arena: text (always), the backend when present, the GDN
     // current-slot snapshot (always; it is what makes the entry claimable on ANY lane once the
     // origin lane is released), and the rank-0 tail hidden (always; MTP bridge and zero-suffix
@@ -1591,6 +1654,66 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         transfer.gdn_peer = host_kv_arena_peer->allocate_raw(gdn_peer_bytes);
         if (!transfer.gdn_peer) { fail_allocate(); }
     }
+    if (retain_prefix) {
+        // Opportunity-only: the prefix residency is published from spare capacity and never
+        // evicts a terminal residency. When the arena cannot fit it right now, skip it.
+        std::array<HostKVAllocationPlan, 4> prefix_local{{text_layout, prefix_text_pages}};
+        std::size_t prefix_local_regions = 1;
+        if (prefix_backend_pages != 0) {
+            prefix_local[prefix_local_regions++] = {backend_layout, prefix_backend_pages};
+        }
+        prefix_local[prefix_local_regions++] = {nullptr, 0, gdn_local_bytes};
+        prefix_local[prefix_local_regions++] = {nullptr, 0, tail_bytes};
+        bool prefix_fits =
+            host_kv_arena->can_allocate_all({prefix_local.data(), prefix_local_regions});
+        if (prefix_fits && have_peer) {
+            std::array<HostKVAllocationPlan, 3> prefix_peer{{peer_text_layout, prefix_text_pages}};
+            std::size_t prefix_peer_regions = 1;
+            if (prefix_backend_pages != 0) {
+                prefix_peer[prefix_peer_regions++] = {peer_backend_layout, prefix_backend_pages};
+            }
+            prefix_peer[prefix_peer_regions++] = {nullptr, 0, gdn_peer_bytes};
+            prefix_fits = host_kv_arena_peer->can_allocate_all(
+                {prefix_peer.data(), prefix_peer_regions});
+        }
+        if (prefix_fits) {
+            transfer.prefix_text_local = host_kv_arena->allocate(*text_layout, prefix_text_pages);
+            if (prefix_backend_pages != 0) {
+                transfer.prefix_backend_local =
+                    host_kv_arena->allocate(*backend_layout, prefix_backend_pages);
+            }
+            transfer.prefix_gdn_local  = host_kv_arena->allocate_raw(gdn_local_bytes);
+            transfer.prefix_tail_local = host_kv_arena->allocate_raw(tail_bytes);
+            if (have_peer) {
+                const ScopedDevice scope(peer->device.device);
+                transfer.prefix_text_peer =
+                    host_kv_arena_peer->allocate(*peer_text_layout, prefix_text_pages);
+                if (prefix_backend_pages != 0) {
+                    transfer.prefix_backend_peer =
+                        host_kv_arena_peer->allocate(*peer_backend_layout, prefix_backend_pages);
+                }
+                transfer.prefix_gdn_peer = host_kv_arena_peer->allocate_raw(gdn_peer_bytes);
+            }
+            const bool complete =
+                transfer.prefix_text_local && transfer.prefix_gdn_local &&
+                transfer.prefix_tail_local &&
+                (prefix_backend_pages == 0 || transfer.prefix_backend_local) &&
+                (!have_peer || (transfer.prefix_text_peer && transfer.prefix_gdn_peer &&
+                                (prefix_backend_pages == 0 || transfer.prefix_backend_peer)));
+            if (complete) {
+                transfer.prefix_frontier = prefix_frontier;
+                transfer.has_prefix      = true;
+            } else {
+                transfer.prefix_text_local.reset();
+                transfer.prefix_text_peer.reset();
+                transfer.prefix_backend_local.reset();
+                transfer.prefix_backend_peer.reset();
+                transfer.prefix_gdn_local.reset();
+                transfer.prefix_gdn_peer.reset();
+                transfer.prefix_tail_local.reset();
+            }
+        }
+    }
 
     // The copies run on the dedicated pinned-transfer streams behind a gate on the compute
     // stream, so they cannot stall the other lanes' rounds; the events arm on the copy
@@ -1627,6 +1750,41 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         snapshot_linear_state_slot_to_host(peer->decoder->linear_attention, state_slot,
                                            host_kv_arena_peer->raw_view(*transfer.gdn_peer).data(),
                                            host_copy_stream_peer);
+    }
+    if (transfer.has_prefix) {
+        const std::int32_t rewrite_slot =
+            LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency);
+        copy_kv_pages_to_host(decoder->text_kv.pool(), sequence.kv->text, prefix_text_pages,
+                              host_kv_arena->view(*transfer.prefix_text_local), host_copy_stream);
+        if (prefix_backend_pages != 0) {
+            copy_kv_pages_to_host(backend_kv_cache()->pool(), *sequence.kv->backend,
+                                  prefix_backend_pages,
+                                  host_kv_arena->view(*transfer.prefix_backend_local),
+                                  host_copy_stream);
+        }
+        snapshot_linear_state_slot_to_host(
+            decoder->linear_attention, rewrite_slot,
+            host_kv_arena->raw_view(*transfer.prefix_gdn_local).data(), host_copy_stream);
+        CUDA_CHECK(cudaMemcpyAsync(host_kv_arena->raw_view(*transfer.prefix_tail_local).data(),
+                                   sequence.rewrite_checkpoint_hidden.data, tail_bytes,
+                                   cudaMemcpyDeviceToHost, host_copy_stream));
+        if (have_peer) {
+            const ScopedDevice scope(peer->device.device);
+            copy_kv_pages_to_host(peer->decoder->text_kv.pool(), *sequence.kv->text_peer,
+                                  prefix_text_pages,
+                                  host_kv_arena_peer->view(*transfer.prefix_text_peer),
+                                  host_copy_stream_peer);
+            if (prefix_backend_pages != 0) {
+                copy_kv_pages_to_host(peer->decoder->mtp_cache()->pool(),
+                                      *sequence.kv->backend_peer, prefix_backend_pages,
+                                      host_kv_arena_peer->view(*transfer.prefix_backend_peer),
+                                      host_copy_stream_peer);
+            }
+            snapshot_linear_state_slot_to_host(
+                peer->decoder->linear_attention, rewrite_slot,
+                host_kv_arena_peer->raw_view(*transfer.prefix_gdn_peer).data(),
+                host_copy_stream_peer);
+        }
     }
     CUDA_CHECK(cudaEventRecord(host_retain_events[lane][0], host_copy_stream));
     if (peer) { CUDA_CHECK(cudaEventRecord(host_retain_events[lane][1], host_copy_stream_peer)); }

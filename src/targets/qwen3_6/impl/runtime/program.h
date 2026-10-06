@@ -481,6 +481,19 @@ public:
         std::optional<HostKVAllocation> gdn_local;
         std::optional<HostKVAllocation> gdn_peer;
         std::optional<HostKVAllocation> tail_local;
+        // Optional second residency at the rewrite-checkpoint frontier: the KV prefix plus the
+        // GDN state and hidden the rewrite checkpoint froze there. Publishing it lets a later
+        // request that re-renders only up to that boundary reuse the prefill state instead of
+        // recomputing the whole prompt.
+        std::optional<HostKVAllocation> prefix_text_local;
+        std::optional<HostKVAllocation> prefix_text_peer;
+        std::optional<HostKVAllocation> prefix_backend_local;
+        std::optional<HostKVAllocation> prefix_backend_peer;
+        std::optional<HostKVAllocation> prefix_gdn_local;
+        std::optional<HostKVAllocation> prefix_gdn_peer;
+        std::optional<HostKVAllocation> prefix_tail_local;
+        std::uint32_t prefix_frontier = 0;
+        bool has_prefix               = false;
         bool abandoned = false;
     };
     std::array<std::optional<HostRetainTransfer>, kMaximumConcurrency> host_retain_transfers{};

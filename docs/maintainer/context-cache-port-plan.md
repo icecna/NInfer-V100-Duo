@@ -247,22 +247,16 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     cache authority`. Hosted residencies register with `ContextRetentionPolicy` (owner/session
     lineage, demand recorded on reuse, victims order), which is now the single retention authority;
     the table's session/demand writes are gone. Real-artifact gate re-run passes both phases.
-  - L5g cost-model ranking and marker-driven multi-checkpoint capture — pending (design below).
-    The superseded table members (`find_best`, `oldest_evictable`, session/demand) were removed
-    with their tests; the table is now a pure storage container.
-
-    L5g capture design (the last execution change), revised after reading upstream: upstream splits
-    the prefill unit at each planned capture frontier (`prefill.cpp`'s `split_frontier`), so the
-    device state lands exactly on the frontier, then creates the checkpoint with a **shared** KV
-    prefix view (reference-counted whole pages plus a copy of the sub-page tail) and a frozen state
-    image. This branch should follow the same shape rather than the earlier "second D2H of the
-    whole prefix" idea: (1) plan capture groups (InputReplay at the rewrite frontier, LongAnchor /
-    SharedPrefix from `context_cache.boundaries`); (2) split `advance_prefill` at the next frontier;
-    (3) route the checkpoint's KV through `KvPageRegistry` + `HostKvExtentStore` for prefix sharing,
-    copying only the partial tail page; (4) freeze the state image through `StateImageStore`. MTP
-    uses `frontier - 1` for the backend prefix. TP2 has no upstream reference: the state image is
-    per rank and the peer side must be mirrored explicitly. `context_cache.boundaries` from the
-    frontend generalizes capture beyond the single rewrite frontier.
+  - L5g multi-checkpoint capture — first step done: `feat(runtime): publish a residency at the
+    rewrite-checkpoint frontier`. The terminal retain also snapshots the prefix at
+    `rewrite_checkpoint.frontier` (KV prefix + the rewrite GDN slot + the rewrite hidden) and
+    publishes it as a second residency, from spare capacity only and ordered to be reclaimed first.
+    The real-artifact gate passes, including a new exact-prompt reuse case, with the strict-prefix
+    guard preserved. KV prefix pages are duplicated, not shared, and prompt-internal
+    `context_cache.boundaries` are not captured yet; both are recorded as deviations. Next: split
+    the prefill at capture frontiers and share the prefix via `KvPageRegistry` + `HostKvExtentStore`
+    so a prefix residency costs no extra host memory.
+  - L5h cost-model ranking — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
 L1/L2 are observable only through the parsed markers and resolved frontiers; Engine reuse
