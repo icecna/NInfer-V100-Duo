@@ -1310,15 +1310,20 @@ void ProgramImplCore::complete_host_transfer(std::uint32_t lane, bool abandoned)
         if (!sequence.retained || sequence.retained_residency != RetainedResidency::HostTransferIn) {
             throw std::logic_error("host retain transfer completed for a lane that moved on");
         }
-        sequence.host_kv.text_local    = std::move(transfer->text_local);
-        sequence.host_kv.text_peer     = std::move(transfer->text_peer);
-        sequence.host_kv.backend_local = std::move(transfer->backend_local);
-        sequence.host_kv.backend_peer  = std::move(transfer->backend_peer);
-        // The device pages are no longer needed; their block-table row was unbound at the
-        // terminal, so releasing the bundle just returns the physical pages to the pool.
         sequence.kv.reset();
+        HostPrefixResidency residency;
+        residency.kv.text_local    = std::move(transfer->text_local);
+        residency.kv.text_peer     = std::move(transfer->text_peer);
+        residency.kv.backend_local = std::move(transfer->backend_local);
+        residency.kv.backend_peer  = std::move(transfer->backend_peer);
+        residency.origin_lane      = lane;
+        residency.reuse_boundary   = sequence.execution_frontier;
+        const qwen3_6::detail::HostPrefixId id =
+            host_prefixes.insert(std::move(residency),
+                                 [this] { return ++host_prefix_id_counter; });
+        host_prefixes.stamp(id, ++host_lru_counter);
+        sequence.host_entry         = id;
         sequence.retained_residency = RetainedResidency::Host;
-        sequence.host_lru_stamp     = ++host_lru_counter;
     }
     // Abandoned or not, the in-flight record is retired: the host extents release back to the
     // arena NOW that both device events report completion, so no reader or writer of those
@@ -1329,10 +1334,12 @@ void ProgramImplCore::complete_host_transfer(std::uint32_t lane, bool abandoned)
 }
 
 void ProgramImplCore::release_host_residency(SequenceState& sequence) noexcept {
-    sequence.host_kv.text_local.reset();
-    sequence.host_kv.text_peer.reset();
-    sequence.host_kv.backend_local.reset();
-    sequence.host_kv.backend_peer.reset();
+    // The table entry, not the lane, owns the arena extents; evicting it returns them to the
+    // arenas. Detaching the id alone would leak the resident prefix.
+    if (sequence.host_entry) {
+        host_prefixes.evict(*sequence.host_entry);
+        sequence.host_entry.reset();
+    }
 }
 
 void ProgramImplCore::evict_host_retained_lane(std::uint32_t lane) noexcept {
@@ -1457,28 +1464,15 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
     };
     std::vector<std::uint32_t> evicted;
     while (!fits()) {
-        // Evict the oldest host-resident retained lane (this lane excluded; in-flight lanes have
-        // no stamp and cannot be victims). Single-threaded executor: release-then-allocate can
-        // never observe a torn arena state.
-        std::uint32_t victim = 0;
-        bool have_victim     = false;
-        std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
-        for (std::uint32_t other = 0; other < max_concurrency; ++other) {
-            if (other == lane) { continue; }
-            const SequenceState& candidate = sequences[other];
-            if (!candidate.retained ||
-                candidate.retained_residency != RetainedResidency::Host) {
-                continue;
-            }
-            if (candidate.host_lru_stamp < oldest) {
-                oldest      = candidate.host_lru_stamp;
-                victim      = other;
-                have_victim = true;
-            }
-        }
-        if (!have_victim) { break; }
-        evict_host_retained_lane(victim);
-        evicted.push_back(victim);
+        // Evict the oldest stamped table entry; its origin lane's control state is released
+        // with it. In-flight lanes have no entry and cannot be victims. The current lane has no
+        // entry yet (its own retain inserts one at transfer completion), so no exclusion is
+        // needed. Single-threaded executor: release-then-allocate can never observe a torn
+        // arena state.
+        const auto* victim = host_prefixes.oldest_evictable();
+        if (victim == nullptr) { break; }
+        evict_host_retained_lane(victim->payload.origin_lane);
+        evicted.push_back(victim->payload.origin_lane);
     }
     if (!fits()) {
         host_kv_debugf("retain-skip lane=%u reason=capacity", lane);
@@ -1573,6 +1567,13 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
     // the reuse path consumes: the first `base` text tokens, and (MTP) the first `base - 1`
     // backend tokens, which is the most any reuse path may read (the plan guarantees
     // mtp_kv_valid >= base - 1).
+    const qwen3_6::detail::HostPrefixId entry_id = *sequence.host_entry;
+    qwen3_6::detail::HostPrefixEntry<HostPrefixResidency>* entry = host_prefixes.find(entry_id);
+    if (entry == nullptr) {
+        throw std::logic_error("host prefix entry missing at claim");
+    }
+    host_prefixes.begin_claim(entry_id);
+    const HostKVResidency& host = entry->payload.kv;
     const std::uint32_t text_pages    = pages_for_tokens(base);
     const std::uint32_t backend_pages =
         (speculative_backend == SpeculativeBackend::Mtp && base > 0) ? pages_for_tokens(base - 1)
@@ -1583,7 +1584,7 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
         if (text_pages > 0) {
             const HostKVPageLayout* lt = host_kv_arena->layout_for(decoder->text_kv.pool().spec());
             if (lt) { bytes += static_cast<std::size_t>(text_pages) * lt->page_stride; }
-            if (sequence.host_kv.text_peer) {
+            if (host.text_peer) {
                 const HostKVPageLayout* lpt =
                     host_kv_arena_peer->layout_for(peer->decoder->text_kv.pool().spec());
                 if (lpt) { bytes += static_cast<std::size_t>(text_pages) * lpt->page_stride; }
@@ -1593,7 +1594,7 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
             const HostKVPageLayout* lb =
                 host_kv_arena->layout_for(backend_kv_cache()->pool().spec());
             if (lb) { bytes += static_cast<std::size_t>(backend_pages) * lb->page_stride; }
-            if (sequence.host_kv.backend_peer) {
+            if (host.backend_peer) {
                 const HostKVPageLayout* lbp =
                     host_kv_arena_peer->layout_for(peer->decoder->mtp_cache()->pool().spec());
                 if (lbp) { bytes += static_cast<std::size_t>(backend_pages) * lbp->page_stride; }
@@ -1617,28 +1618,28 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
                 sequence.kv->backend_peer->materialize_pages(backend_pages, peer->device.stream);
             }
         }
-        if (text_pages > 0 && sequence.host_kv.text_local) {
+        if (text_pages > 0 && host.text_local) {
             copy_kv_pages_from_host(decoder->text_kv.pool(), sequence.kv->text, text_pages,
-                                    host_kv_arena->view(*sequence.host_kv.text_local),
+                                    host_kv_arena->view(*host.text_local),
                                     device.stream);
-            if (sequence.kv->text_peer && sequence.host_kv.text_peer) {
+            if (sequence.kv->text_peer && host.text_peer) {
                 const ScopedDevice scope(peer->device.device);
                 copy_kv_pages_from_host(peer->decoder->text_kv.pool(), *sequence.kv->text_peer,
                                         text_pages,
-                                        host_kv_arena_peer->view(*sequence.host_kv.text_peer),
+                                        host_kv_arena_peer->view(*host.text_peer),
                                         peer->device.stream);
             }
         }
-        if (backend_pages > 0 && sequence.host_kv.backend_local) {
+        if (backend_pages > 0 && host.backend_local) {
             copy_kv_pages_from_host(backend_kv_cache()->pool(), *sequence.kv->backend,
                                     backend_pages,
-                                    host_kv_arena->view(*sequence.host_kv.backend_local),
+                                    host_kv_arena->view(*host.backend_local),
                                     device.stream);
-            if (sequence.kv->backend_peer && sequence.host_kv.backend_peer) {
+            if (sequence.kv->backend_peer && host.backend_peer) {
                 const ScopedDevice scope(peer->device.device);
                 copy_kv_pages_from_host(peer->decoder->mtp_cache()->pool(),
                                         *sequence.kv->backend_peer, backend_pages,
-                                        host_kv_arena_peer->view(*sequence.host_kv.backend_peer),
+                                        host_kv_arena_peer->view(*host.backend_peer),
                                         peer->device.stream);
             }
         }
@@ -1647,17 +1648,21 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
         if (peer) { CUDA_CHECK(cudaStreamSynchronize(peer->device.stream)); }
         CUDA_CHECK(cudaStreamSynchronize(device.stream));
     } catch (...) {
+        host_prefixes.end_claim(entry_id);
         unbind_sequence_kv(sequence);
         sequence.kv.reset();
         throw;
     }
     const double h2d_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - claim_start).count();
+    host_prefixes.end_claim(entry_id);
+    // Lane semantics destroy the prefix once claimed (the lane goes active); evict the entry
+    // so its extents return to the arenas exactly as the lane-owned copies used to.
     release_host_residency(sequence);
     sequence.retained_residency = RetainedResidency::None;
-    host_kv_debugf("claim lane=%u text_pages=%u backend_pages=%u bytes=%zu h2d_ms=%.3f occupied=%zu",
-                   sequence.lane, text_pages, backend_pages, claim_bytes, h2d_ms,
-                   host_kv_cache_used_bytes());
+    host_kv_debugf("claim lane=%u entry=%llu text_pages=%u backend_pages=%u bytes=%zu h2d_ms=%.3f occupied=%zu",
+                   sequence.lane, static_cast<unsigned long long>(entry_id), text_pages, backend_pages,
+                   claim_bytes, h2d_ms, host_kv_cache_used_bytes());
 }
 
 
@@ -1699,8 +1704,7 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
     sequence.retained_residency      = RetainedResidency::None;
-    sequence.host_kv                 = {};
-    sequence.host_lru_stamp          = 0;
+    sequence.host_entry              = std::nullopt;
     sequence.rewrite_checkpoint      = {};
     request.pending                  = {};
 }

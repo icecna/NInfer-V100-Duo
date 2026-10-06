@@ -10,6 +10,7 @@
 #include "core/decode_graph.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
+#include "targets/qwen3_6/impl/runtime/host_prefix_table.h"
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
@@ -161,6 +162,18 @@ struct HostKVResidency {
     std::optional<HostKVAllocation> backend_peer;
 };
 
+// Production payload of the content-addressed host prefix table (P1): the completed D2H copies
+// owned by one retained prefix. P1 keeps lane affinity -- the planner still matches the lane's
+// own ledger/identity and claims only from that lane's entry; the entry records its origin lane
+// so an LRU eviction can release the lane's control state. P2 replaces by-lane lookup with
+// content matching and frees the lane from the entry entirely.
+struct HostPrefixResidency {
+    using Prompt = PreparedPromptData;
+    HostKVResidency kv;
+    std::uint32_t origin_lane  = 0;
+    std::size_t reuse_boundary = 0;
+};
+
 struct DecodeGraphProfile {
     std::uint32_t batch_size             = 1;
     std::uint32_t min_execution_frontier = 0;
@@ -202,11 +215,10 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     RetainedResidency retained_residency = RetainedResidency::None;
-    HostKVResidency host_kv;
-    // Monotonic order among host-resident retained lanes; smallest is the LRU victim. Assigned
-    // when a D2H transfer completes (or a host lane is re-retained), so an in-flight lane has no
-    // stamp yet and cannot be evicted.
-    std::uint64_t host_lru_stamp = 0;
+    // Table entry holding this lane's retained prefix in the host arenas (residency Host). The
+    // entry, not the lane, owns the arena extents; the lane keeps the ledger/identity/checkpoint
+    // the planner matches. Unset unless `retained_residency == Host`.
+    std::optional<qwen3_6::detail::HostPrefixId> host_entry = std::nullopt;
     RewriteCheckpoint rewrite_checkpoint;
 };
 
@@ -391,7 +403,10 @@ public:
     // arena holds its own device's share. Zero disables the whole feature and every host path
     // below is a no-op (retains stay device-resident exactly as before). The arenas are
     // declared BEFORE `sequences` and the transfer table below so that the HostKVAllocations
-    // those members hold release into still-live arenas at destruction.
+    // those members hold release into still-live arenas at destruction. The prefix table is
+    // declared first of all: its entries also hold HostKVAllocations.
+    qwen3_6::detail::HostPrefixTable<HostPrefixResidency> host_prefixes;
+    std::uint64_t host_prefix_id_counter = 0;
     std::size_t host_kv_cache_bytes = 0;
     std::optional<HostKVArena> host_kv_arena;
     std::optional<HostKVArena> host_kv_arena_peer;

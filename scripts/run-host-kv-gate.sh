@@ -6,8 +6,8 @@ set -u
 
 ROOT=/mnt/models/NInfer-V100-Duo
 ARTIFACT=/mnt/models/ninfer-models/Qwen3.8-27B-QUASAR-NVFP4-NInfer.ninfer
-TEST_BIN=$ROOT/build-host-retained/tests/ninfer_qwen3_8_27b_v100-duo_host_kv_real_test
-LOG=$ROOT/build-host-retained/host-kv-gate.log
+TEST_BIN=$ROOT/build-host-prefixes/tests/ninfer_qwen3_8_27b_v100-duo_host_kv_real_test
+LOG=$ROOT/build-host-prefixes/host-kv-gate.log
 SERVE_LOG=/mnt/models/ai-launchers/serve-restart.log
 HEALTH_URL=http://192.168.1.12:8080/health
 
@@ -63,7 +63,7 @@ trap 'if [[ "${STOPPED:-0}" == "1" ]]; then restart_serve || true; fi' EXIT
 stop_serve || { log "ERROR: service stop failed; NOT restarting (GPUs still owned by something)"; exit 1; }
 STOPPED=1
 
-cmake --build "$ROOT/build-host-retained" -j 32 --target ninfer_qwen3_8_27b_v100-duo_host_kv_real_test > "$LOG" 2>&1
+cmake --build "$ROOT/build-host-prefixes" -j 32 --target ninfer_qwen3_8_27b_v100-duo_host_kv_real_test > "$LOG" 2>&1
 build_rc=$?
 if [[ $build_rc -ne 0 ]]; then
   log "ERROR: test build failed (rc=$build_rc); see $LOG"

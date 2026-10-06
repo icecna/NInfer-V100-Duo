@@ -15,9 +15,9 @@
 - nvfp4 支持:quasar-nvfp4 trial artifact、qwen3.8 nvfp4 inventory/binding 派生修复、
   volta nvfp4 swiglu epilogue 融合
 
-## 开发中(已 staged,未提交,约 2800 行)
+## 开发中:host KV cache 系列
 
-**Host 后备的 retained prefix(host KV cache)** —— **P0 已完成**:
+**Host 后备的 retained prefix(host KV cache)** —— **P0 已完成**(2026-07-18):
 
 - 验收结果(2026-07-18,`scripts/run-host-kv-gate.sh`):
   - arena 单测修复 2 个测试 bug(exact-fit 临时 allocation 立即析构、main 双重计数),全绿
@@ -44,6 +44,20 @@
   - `tests/targets/qwen3_6_27b/test_engine_v100-duo_host_kv_real.cpp`(真实 artifact)
   - `scripts/run-host-kv-gate.sh` + `scripts/verify_host_kv_serve.py`
 - **状态:实现完成,待跑验收脚本验证后提交。**
+
+## P1(表核心,已完成 2026-07-18,待提交)
+
+- `HostPrefixTable<Payload>`(纯 CPU):insert/find/find_best(内容匹配 + 最深边界
+  平局裁决 + LRU 盖戳)/oldest_evictable(最小非零戳,在途 claim 不可驱逐)/
+  evict(回调)/begin-end_claim(防下溢);单测 `test_host_prefix_table.cpp` 6 组全绿
+- **接线(行为等价改道)**:arena 分配的所有权从 lane(`host_kv` 4 个 HostKVAllocation)
+  移到表 entry(`HostPrefixResidency` payload:kv + origin_lane + reuse_boundary);
+  lane 保留控制面(ledger/identity/checkpoint/retained)不变,planner/executor 接口零改动;
+  claim 经表查找 + begin/end_claim 守卫,完成后按 lane 语义驱逐 entry 归还 arena;
+  LRU 容量驱逐改走 `oldest_evictable()`
+- live gate(build-host-prefixes 目录,不影响线上服务二进制)与改道前基线逐字节一致:
+  cold 3.06s / append 0.074s / host_append 0.090s / occupied=121786368,exact PASS
+- gate 脚本已指向 `build-host-prefixes`
 
 ## 规划(草案,未开工)
 
