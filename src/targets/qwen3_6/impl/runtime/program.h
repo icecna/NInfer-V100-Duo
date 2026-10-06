@@ -16,6 +16,7 @@
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "runtime/engine/context_cache/prefix_index.h"
+#include "runtime/engine/context_cache/retention.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -451,6 +452,9 @@ public:
     // host_prefixes on insert, evict, and clear.
     runtime::PrefixIndex<qwen3_6::detail::HostPrefixId, qwen3_6::detail::PrefixShortlistKey>
         host_prefix_index;
+    // Retention authority for the hosted residencies: owner/session lineage, demand, and the
+    // eviction order. The table owns storage; this owns policy.
+    runtime::ContextRetentionPolicy host_retention;
     std::uint64_t host_prefix_id_counter = 0;
 
     std::array<SequenceState, kMaximumConcurrency> sequences;

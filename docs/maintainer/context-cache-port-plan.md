@@ -238,7 +238,13 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     generated-region frontiers stay matchable; the base plan shortlists candidates before the
     authoritative token/media match, preserving the session filter and preference. Real-artifact
     gate re-run passes both phases.
-  - L5f cost-model ranking and full multi-checkpoint / retention-policy integration — pending.
+  - L5f retention-policy integration — done: `feat(runtime): make the retention policy the host
+    cache authority`. Hosted residencies register with `ContextRetentionPolicy` (owner/session
+    lineage, demand recorded on reuse, victims order), which is now the single retention authority;
+    the table's session/demand writes are gone. Real-artifact gate re-run passes both phases.
+  - L5g cost-model ranking and marker-driven multi-checkpoint capture — pending. The table's
+    `find_best`/`oldest_evictable`/session/demand members are now unused by production and should
+    be removed with their tests once L5g lands.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
 L1/L2 are observable only through the parsed markers and resolved frontiers; Engine reuse

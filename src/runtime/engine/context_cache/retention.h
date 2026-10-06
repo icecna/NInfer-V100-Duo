@@ -98,6 +98,28 @@ public:
                                      : std::nullopt;
     }
 
+    [[nodiscard]] std::optional<std::string> checkpoint_session(CheckpointId id) const {
+        const auto checkpoint = checkpoints_.find(id);
+        if (checkpoint == checkpoints_.end()) { return std::nullopt; }
+        const auto owner = owners_.find(checkpoint->second.owner);
+        return owner != owners_.end() ? owner->second.session : std::nullopt;
+    }
+
+    // Whether `id` may be offered to a request: shared prefixes are always visible, anonymous
+    // prefixes are visible to anyone, and a named prefix is visible only to the requesting owner
+    // itself or to a finished owner of the same session.
+    [[nodiscard]] bool visible(CheckpointId id, ContinuationOwnerToken own_owner,
+                               std::optional<std::string_view> session) const {
+        const auto checkpoint = checkpoints_.find(id);
+        if (checkpoint == checkpoints_.end()) { return false; }
+        if (checkpoint->second.shared || checkpoint->second.owner == own_owner) { return true; }
+        const auto owner = owners_.find(checkpoint->second.owner);
+        if (owner == owners_.end()) { return false; }
+        if (!owner->second.session) { return true; }
+        if (owner->second.active || !session) { return false; }
+        return *owner->second.session == *session;
+    }
+
     // --- checkpoints ---
 
     void publish(ContinuationOwnerToken owner, CheckpointId id, CheckpointRole role, bool shared) {

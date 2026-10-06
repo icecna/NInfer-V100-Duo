@@ -184,9 +184,10 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
                        ? boundary
                        : 0;
         };
-        const std::string_view session_key =
-            prompt.context_cache.session_key ? std::string_view(*prompt.context_cache.session_key)
-                                             : std::string_view{};
+        const std::optional<std::string_view> session =
+            prompt.context_cache.session_key
+                ? std::optional<std::string_view>(*prompt.context_cache.session_key)
+                : std::nullopt;
         const std::vector<qwen3_6::detail::HostPrefixId> candidates = host_prefix_index.matches(
             static_cast<std::uint32_t>(prompt.token_ids.size()),
             [&](std::uint32_t frontier) {
@@ -201,10 +202,11 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         for (const qwen3_6::detail::HostPrefixId handle : candidates) {
             const auto* entry = host_prefixes.find(handle);
             if (entry == nullptr) { continue; }
-            const bool session_match = !session_key.empty() && entry->session_key == session_key;
-            if (!session_key.empty() && !entry->session_key.empty() && !session_match) {
-                continue;
-            }
+            if (!host_retention.visible(handle, 0, session)) { continue; }
+            const std::optional<std::string> checkpoint_session =
+                host_retention.checkpoint_session(handle);
+            const bool session_match =
+                session && checkpoint_session && *checkpoint_session == *session;
             const std::size_t depth = match_entry(entry->payload);
             if (depth == 0) { continue; }
             if (best == nullptr || depth > best_depth || (depth == best_depth && session_match)) {

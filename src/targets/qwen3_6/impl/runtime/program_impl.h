@@ -1355,9 +1355,14 @@ void ProgramImplCore::complete_host_transfer(std::uint32_t lane, bool abandoned)
             .identity_tag = prefix_identity_tag};
         const qwen3_6::detail::HostPrefixId id =
             host_prefixes.insert(std::move(residency),
-                                 [this] { return ++host_prefix_id_counter; },
-                                 sequence.session_key);
+                                 [this] { return ++host_prefix_id_counter; });
         host_prefix_index.insert(id, shortlist);
+        const runtime::ContinuationOwnerToken owner_token = host_retention.open_owner(
+            sequence.session_key.empty() ? std::optional<std::string>{}
+                                         : std::optional<std::string>(sequence.session_key));
+        host_retention.publish(owner_token, id, runtime::CheckpointRole::SharedPrefix,
+                               /*shared=*/false);
+        host_retention.finish_owner(owner_token);
         host_prefixes.stamp(id, ++host_lru_counter);
         ++host_table_version_;        sequence.ledger.clear();
         sequence.prefix_identity.clear();
@@ -1391,6 +1396,7 @@ void ProgramImplCore::evict_host_entry(qwen3_6::detail::HostPrefixId id) noexcep
     const std::size_t boundary = entry->payload.reuse_boundary;
     host_prefixes.evict(id);
     host_prefix_index.erase(id);
+    host_retention.erase(id);
     ++host_table_version_;
     host_kv_debugf("evict entry=%llu boundary=%zu occupied=%zu",
                    static_cast<unsigned long long>(id), boundary, host_kv_cache_used_bytes());
@@ -1530,16 +1536,19 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
     };
     std::vector<std::uint32_t> evicted;
     while (!fits()) {
-        // Evict the oldest stamped table entry. Entries are lane-free (their origin lane was
-        // released when the entry was published), so eviction never touches a lane; queued
-        // plans referencing the entry are invalidated through the table version. In-flight
-        // entries are unevictable; the current lane has no entry yet (its own retain inserts
-        // one at transfer completion), so no exclusion is needed. Single-threaded executor:
-        // release-then-allocate can never observe a torn arena state.
-        const auto* victim = host_prefixes.oldest_evictable();
-        if (victim == nullptr) { break; }
-        const std::uint32_t victim_lane = victim->payload.origin_lane;
-        evict_host_entry(victim->id);
+        // Evict the least valuable residency first: never-reused by age, then reused by last
+        // demand. In-flight entries are unevictable, so scan the order for the first free one.
+        qwen3_6::detail::HostPrefixId victim_id = qwen3_6::detail::kInvalidHostPrefixId;
+        for (const qwen3_6::detail::HostPrefixId candidate : host_retention.victims()) {
+            const auto* entry = host_prefixes.find(candidate);
+            if (entry != nullptr && entry->in_flight_claims == 0) {
+                victim_id = candidate;
+                break;
+            }
+        }
+        if (victim_id == qwen3_6::detail::kInvalidHostPrefixId) { break; }
+        const std::uint32_t victim_lane = host_prefixes.find(victim_id)->payload.origin_lane;
+        evict_host_entry(victim_id);
         evicted.push_back(victim_lane);
     }
     if (!fits()) {
@@ -1663,7 +1672,7 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
     }
     host_prefixes.begin_claim(entry_id);
     host_prefixes.stamp(entry_id, ++host_lru_counter);
-    host_prefixes.mark_demand(entry_id, ++host_demand_counter);
+    host_retention.remember_demand(entry_id, ++host_demand_counter);
     if (sequence.session_key.empty()) { sequence.session_key = entry->session_key; }
     const HostKVResidency& host = payload.kv;
     const std::uint32_t text_pages    = pages_for_tokens(base);
