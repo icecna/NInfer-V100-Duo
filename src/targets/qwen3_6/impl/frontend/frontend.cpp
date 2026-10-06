@@ -277,13 +277,61 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
     return result;
 }
 
-fi::ChatRenderOptions render_options(const PromptOptions& options) {
-    return fi::ChatRenderOptions{.add_generation_prompt = options.add_generation_prompt,
+fi::ChatRenderOptions render_options(const PromptOptions& options,
+                                     const ninfer::ContextCacheHints& cache) {
+    fi::ChatRenderOptions result{.add_generation_prompt = options.add_generation_prompt,
                                  .enable_thinking       = options.enable_thinking,
                                  .reasoning_effort      = options.reasoning_effort,
                                  .preserve_thinking     = options.preserve_thinking,
                                  .add_vision_id         = options.add_vision_id,
                                  .tool_jsons            = options.tool_jsons};
+    result.cache_markers                        = cache.markers;
+    result.add_engine_automatic_shared_prefixes = cache.allow_engine_automatic_shared_prefixes;
+    return result;
+}
+
+void validate_context_cache_hints(const ninfer::ContextCacheHints& cache) {
+    if (cache.session_key) {
+        if (cache.session_key->empty()) {
+            throw std::invalid_argument("context cache session key must not be empty");
+        }
+        if (cache.session_key->size() > ninfer::kMaximumContextCacheSessionKeyBytes) {
+            throw std::invalid_argument(
+                "context cache session key exceeds kMaximumContextCacheSessionKeyBytes");
+        }
+    }
+    if (cache.markers.size() > ninfer::kMaximumExplicitPromptCacheMarkers) {
+        throw std::invalid_argument("too many prompt cache markers");
+    }
+    for (const ninfer::PromptCacheMarker& marker : cache.markers) {
+        if (marker.kind == ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
+            marker.evidence == ninfer::SharedCandidateEvidence::None) {
+            throw std::invalid_argument("shared prompt cache marker needs evidence");
+        }
+        switch (marker.location) {
+        case ninfer::PromptCacheMarkerLocation::MessageBoundary:
+            if (marker.after_message_count == 0) {
+                throw std::invalid_argument("message boundary needs after_message_count");
+            }
+            break;
+        case ninfer::PromptCacheMarkerLocation::MessagePartBoundary:
+            if (marker.after_message_count == 0 || marker.after_message_part_count == 0) {
+                throw std::invalid_argument("message-part boundary needs message and part counts");
+            }
+            break;
+        case ninfer::PromptCacheMarkerLocation::ToolBoundary:
+            if (marker.after_tool_count == 0) {
+                throw std::invalid_argument("tool boundary needs after_tool_count");
+            }
+            break;
+        case ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary:
+            if (marker.leading_instruction_bytes == 0) {
+                throw std::invalid_argument(
+                    "leading instruction boundary needs leading_instruction_bytes");
+            }
+            break;
+        }
+    }
 }
 
 std::uint32_t checked_token_count(std::size_t count) {
@@ -913,8 +961,10 @@ const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prom
 
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
-    const auto start                      = Clock::now();
-    const PromptOptions options           = input.options;
+    const auto start                            = Clock::now();
+    const PromptOptions options                 = input.options;
+    const ninfer::ContextCacheHints cache_hints = input.context_cache;
+    validate_context_cache_hints(cache_hints);
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
@@ -930,7 +980,8 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                                 impl_->media_cache);
         fi::ProcessedInput processed;
         try {
-            processed = processor.process(std::move(messages), render_options(options), control);
+            processed = processor.process(std::move(messages), render_options(options, cache_hints),
+                                          control);
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
         result.token_types    = std::move(processed.token_types);
@@ -957,9 +1008,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             processed.stats.media_preprocess_work_seconds;
         result.prepare.tokenize_seconds    = processed.stats.tokenize_seconds;
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
+        result.context_cache.boundaries    = std::move(processed.cache_boundaries);
     } else {
         const fi::RenderedChat rendered =
-            impl_->chat_template.render(messages, render_options(options));
+            impl_->chat_template.render(messages, render_options(options, cache_hints));
         const auto tokenize_started = Clock::now();
         fi::EncodedChat encoded     = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
         result.prepare.tokenize_seconds =
@@ -967,8 +1019,11 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         fi::check_preparation_control(control, "tokenization");
         result.token_ids                   = std::move(encoded.input_ids);
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
+        result.context_cache.boundaries    = std::move(encoded.cache_boundaries);
         assign_text_positions(result);
     }
+    result.context_cache.session_key          = cache_hints.session_key;
+    result.context_cache.update_session_index = cache_hints.update_session_index;
     (void)checked_token_count(result.token_ids.size());
     result.identity.reusable   = true;
     result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
@@ -978,7 +1033,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
 
 std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl& control) const {
     fi::check_preparation_control(control);
-    const PromptOptions options           = input.options;
+    const PromptOptions options                 = input.options;
+    const ninfer::ContextCacheHints cache_hints = input.context_cache;
+    validate_context_cache_hints(cache_hints);
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
@@ -988,7 +1045,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
     }
     if (!has_media) {
         const fi::RenderedChat rendered =
-            impl_->chat_template.render(messages, render_options(options));
+            impl_->chat_template.render(messages, render_options(options, cache_hints));
         const std::uint32_t count =
             checked_token_count(impl_->tokenizer->encode(rendered.text).size());
         fi::check_preparation_control(control, "tokenization");
@@ -999,7 +1056,7 @@ std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl
                             impl_->media_cache);
     try {
         return checked_token_count(
-            processor.process(std::move(messages), render_options(options), control)
+            processor.process(std::move(messages), render_options(options, cache_hints), control)
                 .input_ids.size());
     } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
 }

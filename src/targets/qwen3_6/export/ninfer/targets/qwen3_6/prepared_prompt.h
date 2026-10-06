@@ -75,6 +75,25 @@ struct PromptIdentity {
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
 };
 
+// One prompt-cache boundary resolved to an exact token frontier. The Engine uses the kind/evidence
+// to decide what to publish (private long anchor vs shared prefix) and how strong the evidence is.
+struct PreparedCacheBoundary {
+    ninfer::PromptCacheMarkerLocation location =
+        ninfer::PromptCacheMarkerLocation::MessageBoundary;
+    ninfer::PromptCacheMarkerKind kind = ninfer::PromptCacheMarkerKind::SharedStablePrefix;
+    ninfer::SharedCandidateEvidence evidence =
+        ninfer::SharedCandidateEvidence::ExplicitBoundary;
+    std::uint32_t frontier = 0;
+};
+
+// Request-level context-cache state forwarded from the protocol layer, plus the boundaries the
+// frontend could resolve to exact token frontiers.
+struct PreparedContextCache {
+    std::optional<std::string> session_key;
+    bool update_session_index = false;
+    std::vector<PreparedCacheBoundary> boundaries;
+};
+
 struct PrepareStats {
     double seconds                       = 0.0;
     double media_preprocess_seconds      = 0.0;
@@ -102,6 +121,7 @@ struct PreparedPromptData {
     std::vector<std::shared_ptr<const PreparedMediaPayload>> media_payloads;
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
+    PreparedContextCache context_cache;
     bool starts_in_reasoning = false;
     PrepareStats prepare;
 

@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cctype>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -58,6 +59,23 @@ std::string trim_ascii_whitespace(const std::string& text) {
     std::size_t end = text.size();
     while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) { --end; }
     return text.substr(begin, end - begin);
+}
+
+struct TrimBounds {
+    std::size_t begin = 0;
+    std::size_t end   = 0;
+};
+
+// Byte range of the message content that survives trim_ascii_whitespace. A cache boundary outside
+// [begin, end] falls inside trimmed whitespace and therefore has no output position.
+TrimBounds ascii_trim_bounds(const std::string& text) {
+    std::size_t begin = 0;
+    while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
+        ++begin;
+    }
+    std::size_t end = text.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) { --end; }
+    return TrimBounds{begin, end};
 }
 
 bool starts_with(const std::string& text, std::string_view prefix) {
@@ -202,28 +220,40 @@ std::string render_tool_call(const ToolCall& call, bool allow_empty_arguments) {
     return rendered;
 }
 
-std::string render_tools_system_block(const std::vector<std::string>& tool_jsons,
-                                      const std::string& leading_instruction,
-                                      std::string_view reasoning_instructions) {
-    std::string rendered;
+struct ToolsSystemBlock {
+    std::string text;
+    std::vector<std::size_t> tool_ends; // end offset of each tool definition within text
+    std::size_t instruction_start = 0;
+    bool has_instruction          = false;
+};
+
+ToolsSystemBlock render_tools_system_block(const std::vector<std::string>& tool_jsons,
+                                           const std::string& leading_instruction,
+                                           std::string_view reasoning_instructions) {
+    ToolsSystemBlock block;
+    std::string& rendered = block.text;
     rendered += "<|im_start|>system\n";
     if (!reasoning_instructions.empty()) {
         rendered += reasoning_instructions;
         rendered += "\n\n";
     }
     rendered += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+    block.tool_ends.reserve(tool_jsons.size());
     for (const std::string& tool : tool_jsons) {
         rendered += "\n";
         rendered += tojson_text(OrderedJson::parse(tool));
+        block.tool_ends.push_back(rendered.size());
     }
     rendered += "\n</tools>";
     rendered += std::string(kToolInstructions);
     if (!leading_instruction.empty()) {
         rendered += "\n\n";
+        block.instruction_start = rendered.size();
+        block.has_instruction   = true;
         rendered += leading_instruction;
     }
     rendered += "<|im_end|>\n";
-    return rendered;
+    return block;
 }
 
 std::string_view resolve_reasoning_instructions(ChatTemplateSemantics semantics,
@@ -262,31 +292,39 @@ bool ChatMessage::has_media() const noexcept {
     return false;
 }
 
-std::string ChatMessage::rendered_content(bool add_vision_id, int* image_count,
-                                          int* video_count) const {
+ChatMessage::RenderedContentParts ChatMessage::rendered_content_parts(bool add_vision_id,
+                                                                      int* image_count,
+                                                                      int* video_count) const {
     int local_images = 0;
     int local_videos = 0;
     int& images      = image_count == nullptr ? local_images : *image_count;
     int& videos      = video_count == nullptr ? local_videos : *video_count;
-    std::string out;
+    RenderedContentParts out;
+    out.part_ends.reserve(parts.size());
     for (const ChatPart& part : parts) {
         switch (part.kind) {
         case ChatPartKind::Text:
-            out += part.text;
+            out.text += part.text;
             break;
         case ChatPartKind::Image:
             ++images;
-            if (add_vision_id) { out += "Picture " + std::to_string(images) + ": "; }
-            out += "<|vision_start|><|image_pad|><|vision_end|>";
+            if (add_vision_id) { out.text += "Picture " + std::to_string(images) + ": "; }
+            out.text += "<|vision_start|><|image_pad|><|vision_end|>";
             break;
         case ChatPartKind::Video:
             ++videos;
-            if (add_vision_id) { out += "Video " + std::to_string(videos) + ": "; }
-            out += "<|vision_start|><|video_pad|><|vision_end|>";
+            if (add_vision_id) { out.text += "Video " + std::to_string(videos) + ": "; }
+            out.text += "<|vision_start|><|video_pad|><|vision_end|>";
             break;
         }
+        out.part_ends.push_back(out.text.size());
     }
     return out;
+}
+
+std::string ChatMessage::rendered_content(bool add_vision_id, int* image_count,
+                                          int* video_count) const {
+    return rendered_content_parts(add_vision_id, image_count, video_count).text;
 }
 
 CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
@@ -321,19 +359,52 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     const std::string_view reasoning_instructions =
         resolve_reasoning_instructions(semantics_, options);
 
+    constexpr std::size_t kNoOffset = std::numeric_limits<std::size_t>::max();
+
     std::size_t message_begin = 0;
     std::string leading_instruction;
+    TrimBounds leading_trim;
+    ChatMessage::RenderedContentParts leading_parts;
+    std::size_t instruction_start = kNoOffset;
     if (is_instruction_role(messages[0].role)) {
         validate_instruction_message(messages[0]);
-        leading_instruction = trim_ascii_whitespace(messages[0].rendered_content());
-        message_begin       = 1;
+        leading_parts = messages[0].rendered_content_parts(options.add_vision_id);
+        leading_trim  = ascii_trim_bounds(leading_parts.text);
+        leading_instruction =
+            leading_parts.text.substr(leading_trim.begin, leading_trim.end - leading_trim.begin);
+        message_begin = 1;
     }
 
     std::string rendered;
+    std::vector<std::size_t> message_end_offset(messages.size(), kNoOffset);
+    std::vector<std::vector<std::size_t>> part_end_offset(messages.size());
+    std::vector<std::size_t> tool_ends;
+
+    const auto map_part_offsets = [&](std::size_t message_index,
+                                      const ChatMessage::RenderedContentParts& content_parts,
+                                      const TrimBounds& trim, std::size_t content_start,
+                                      bool enabled) {
+        part_end_offset[message_index].assign(content_parts.part_ends.size(), kNoOffset);
+        if (!enabled || content_start == kNoOffset) { return; }
+        for (std::size_t index = 0; index < content_parts.part_ends.size(); ++index) {
+            const std::size_t cumulative = content_parts.part_ends[index];
+            if (cumulative < trim.begin || cumulative > trim.end) { continue; }
+            part_end_offset[message_index][index] = content_start + (cumulative - trim.begin);
+        }
+    };
+
     const bool has_tools = !options.tool_jsons.empty();
     if (has_tools) {
-        rendered += render_tools_system_block(options.tool_jsons, leading_instruction,
-                                              reasoning_instructions);
+        const ToolsSystemBlock block =
+            render_tools_system_block(options.tool_jsons, leading_instruction,
+                                      reasoning_instructions);
+        rendered = block.text;
+        tool_ends = block.tool_ends;
+        if (block.has_instruction) {
+            instruction_start = block.instruction_start;
+            map_part_offsets(0, leading_parts, leading_trim, instruction_start, true);
+        }
+        if (message_begin == 1) { message_end_offset[0] = rendered.size(); }
     } else if (message_begin == 1) {
         if (!effort_template || !leading_instruction.empty() || !reasoning_instructions.empty()) {
             rendered += "<|im_start|>system\n";
@@ -341,9 +412,12 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                 rendered += reasoning_instructions;
                 if (!leading_instruction.empty()) { rendered += "\n\n"; }
             }
+            instruction_start = rendered.size();
             rendered += leading_instruction;
             rendered += "<|im_end|>\n";
+            map_part_offsets(0, leading_parts, leading_trim, instruction_start, true);
         }
+        message_end_offset[0] = rendered.size();
     } else if (!reasoning_instructions.empty()) {
         rendered += "<|im_start|>system\n";
         rendered += reasoning_instructions;
@@ -360,18 +434,27 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         const ChatMessage& message = messages[i];
         if (i < message_begin) { continue; }
         if (is_instruction_role(message.role)) { validate_instruction_message(message); }
-        const std::string content = trim_ascii_whitespace(
-            message.rendered_content(options.add_vision_id, &image_count, &video_count));
+        const ChatMessage::RenderedContentParts content_parts =
+            message.rendered_content_parts(options.add_vision_id, &image_count, &video_count);
+        const TrimBounds trim = ascii_trim_bounds(content_parts.text);
+        const std::string content =
+            content_parts.text.substr(trim.begin, trim.end - trim.begin);
         if (is_instruction_role(message.role)) {
             rendered += "<|im_start|>system\n";
+            const std::size_t content_start = rendered.size();
             rendered += content;
+            map_part_offsets(i, content_parts, trim, content_start, true);
             rendered += "<|im_end|>\n";
+            message_end_offset[i] = rendered.size();
             continue;
         }
         if (message.role == ChatRole::User) {
             rendered += "<|im_start|>user\n";
+            const std::size_t content_start = rendered.size();
             rendered += content;
+            map_part_offsets(i, content_parts, trim, content_start, true);
             rendered += "<|im_end|>\n";
+            message_end_offset[i] = rendered.size();
             continue;
         }
         if (message.role == ChatRole::Tool) {
@@ -380,9 +463,12 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                 i + 1 == messages.size() || messages[i + 1].role != ChatRole::Tool;
             if (opens_group) { rendered += "<|im_start|>user"; }
             rendered += "\n<tool_response>\n";
+            const std::size_t content_start = rendered.size();
             rendered += content;
+            map_part_offsets(i, content_parts, trim, content_start, true);
             rendered += "\n</tool_response>";
             if (closes_group) { rendered += "<|im_end|>\n"; }
+            message_end_offset[i] = rendered.size();
             continue;
         }
 
@@ -413,7 +499,12 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             rendered += reasoning;
             rendered += "\n</think>\n\n";
         }
+        const std::size_t content_start = rendered.size();
         rendered += body;
+        // Only an assistant turn whose body is emitted verbatim at a known offset has a resolvable
+        // message-part boundary; a derived think split or an inserted prologue is dropped.
+        map_part_offsets(i, content_parts, trim, content_start,
+                         body == content && !keep_thinking);
         if (!message.tool_calls.empty()) {
             const bool body_has_text = !trim_ascii_whitespace(body).empty();
             for (std::size_t call_index = 0; call_index < message.tool_calls.size(); ++call_index) {
@@ -426,6 +517,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             }
         }
         rendered += "<|im_end|>\n";
+        message_end_offset[i] = rendered.size();
     }
 
     if (options.add_generation_prompt) {
@@ -447,7 +539,71 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                 .kind = RewriteCheckpointKind::ResponseReplay, .offset = rendered.size()};
         }
     }
-    return RenderedChat{.text = std::move(rendered), .rewrite_checkpoint = rewrite_checkpoint};
+    RenderedChat result;
+    result.text               = std::move(rendered);
+    result.rewrite_checkpoint = rewrite_checkpoint;
+
+    std::vector<ninfer::PromptCacheMarker> markers = options.cache_markers;
+    if (options.add_engine_automatic_shared_prefixes) {
+        // Structural candidates: the end of the tool definitions and the end of the leading
+        // instruction, both of which a caller reproducing the conversation can resend verbatim.
+        if (!tool_ends.empty()) {
+            markers.push_back(ninfer::PromptCacheMarker{
+                .kind             = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                .evidence         = ninfer::SharedCandidateEvidence::EngineStructural,
+                .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
+                .after_tool_count = static_cast<std::uint32_t>(tool_ends.size()),
+            });
+        }
+        if (message_begin == 1 && instruction_start != kNoOffset) {
+            markers.push_back(ninfer::PromptCacheMarker{
+                .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                .evidence = ninfer::SharedCandidateEvidence::EngineStructural,
+                .location = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
+                .leading_instruction_bytes = static_cast<std::uint32_t>(leading_trim.end),
+            });
+        }
+    }
+
+    result.cache_markers = markers;
+    result.cache_boundary_offsets.reserve(markers.size());
+    for (const ninfer::PromptCacheMarker& marker : markers) {
+        std::optional<std::size_t> offset;
+        switch (marker.location) {
+        case ninfer::PromptCacheMarkerLocation::MessageBoundary:
+            if (marker.after_message_count >= 1 && marker.after_message_count <= messages.size()) {
+                const std::size_t value = message_end_offset[marker.after_message_count - 1];
+                if (value != kNoOffset) { offset = value; }
+            }
+            break;
+        case ninfer::PromptCacheMarkerLocation::MessagePartBoundary:
+            if (marker.after_message_count >= 1 && marker.after_message_count <= messages.size() &&
+                marker.after_message_part_count >= 1) {
+                const std::vector<std::size_t>& ends =
+                    part_end_offset[marker.after_message_count - 1];
+                if (marker.after_message_part_count <= ends.size()) {
+                    const std::size_t value = ends[marker.after_message_part_count - 1];
+                    if (value != kNoOffset) { offset = value; }
+                }
+            }
+            break;
+        case ninfer::PromptCacheMarkerLocation::ToolBoundary:
+            if (marker.after_tool_count >= 1 && marker.after_tool_count <= tool_ends.size()) {
+                offset = tool_ends[marker.after_tool_count - 1];
+            }
+            break;
+        case ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary:
+            if (instruction_start != kNoOffset &&
+                marker.leading_instruction_bytes >= leading_trim.begin &&
+                marker.leading_instruction_bytes <= leading_trim.end) {
+                offset =
+                    instruction_start + (marker.leading_instruction_bytes - leading_trim.begin);
+            }
+            break;
+        }
+        result.cache_boundary_offsets.push_back(offset);
+    }
+    return result;
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

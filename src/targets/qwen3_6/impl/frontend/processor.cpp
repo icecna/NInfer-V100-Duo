@@ -436,14 +436,25 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
             throw std::invalid_argument("chat media order does not match rendered placeholders");
         }
         const std::string replacement = placeholder(item);
+        const std::size_t end         = position + needle.size();
         if (rendered.rewrite_checkpoint) {
             const std::size_t boundary = rendered.rewrite_checkpoint->offset;
-            const std::size_t end      = position + needle.size();
             if (position < boundary && boundary < end) {
                 throw std::logic_error("rewrite checkpoint intersects a media placeholder");
             }
             if (end <= boundary) {
                 rendered.rewrite_checkpoint->offset = boundary - needle.size() + replacement.size();
+            }
+        }
+        // A cache boundary inside an expanded media placeholder has no exact output position and
+        // is dropped; a boundary after it shifts by the expansion delta.
+        for (std::optional<std::size_t>& offset : rendered.cache_boundary_offsets) {
+            if (!offset) { continue; }
+            const std::size_t boundary = *offset;
+            if (position < boundary && boundary < end) {
+                offset.reset();
+            } else if (end <= boundary) {
+                offset = boundary - needle.size() + replacement.size();
             }
         }
         rendered.text.replace(position, needle.size(), replacement);
@@ -590,6 +601,31 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered) {
     EncodedChat encoded;
     encoded.input_ids = tokenizer.encode(rendered.text);
+
+    const std::size_t marker_count =
+        std::min(rendered.cache_markers.size(), rendered.cache_boundary_offsets.size());
+    for (std::size_t index = 0; index < marker_count; ++index) {
+        const std::optional<std::size_t> offset = rendered.cache_boundary_offsets[index];
+        if (!offset || *offset > rendered.text.size()) { continue; }
+        const std::vector<int> prefix = tokenizer.encode(
+            std::string_view(rendered.text).substr(0, *offset));
+        // A byte offset that is not an exact token boundary cannot name a reusable frontier.
+        if (prefix.empty() || prefix.size() > encoded.input_ids.size() ||
+            !std::equal(prefix.begin(), prefix.end(), encoded.input_ids.begin())) {
+            continue;
+        }
+        if (prefix.size() > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("cache boundary token frontier exceeds uint32");
+        }
+        const ninfer::PromptCacheMarker& marker = rendered.cache_markers[index];
+        encoded.cache_boundaries.push_back(qwen3_6::PreparedCacheBoundary{
+            .location = marker.location,
+            .kind     = marker.kind,
+            .evidence = marker.evidence,
+            .frontier = static_cast<std::uint32_t>(prefix.size()),
+        });
+    }
+
     if (!rendered.rewrite_checkpoint) { return encoded; }
     if (rendered.rewrite_checkpoint->offset > rendered.text.size()) {
         throw std::logic_error("rewrite checkpoint byte offset exceeds rendered chat");
@@ -772,6 +808,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     check_preparation_control(control, "tokenization");
     output.input_ids          = std::move(encoded.input_ids);
     output.rewrite_checkpoint = encoded.rewrite_checkpoint;
+    output.cache_boundaries   = std::move(encoded.cache_boundaries);
     output.token_types.resize(output.input_ids.size(), 0);
     for (std::size_t i = 0; i < output.input_ids.size(); ++i) {
         if (output.input_ids[i] == kImageToken) {

@@ -67,6 +67,16 @@ struct ChatMessage {
     [[nodiscard]] std::string rendered_content(bool add_vision_id = false,
                                                int* image_count   = nullptr,
                                                int* video_count   = nullptr) const;
+
+    // Untrimmed concatenation of the parts plus the cumulative byte length after each part, used to
+    // locate a message-part cache boundary inside the trimmed message content.
+    struct RenderedContentParts {
+        std::string text;
+        std::vector<std::size_t> part_ends;
+    };
+    [[nodiscard]] RenderedContentParts rendered_content_parts(bool add_vision_id = false,
+                                                             int* image_count   = nullptr,
+                                                             int* video_count   = nullptr) const;
 };
 
 struct ChatRenderOptions {
@@ -76,6 +86,12 @@ struct ChatRenderOptions {
     std::optional<bool> preserve_thinking;
     bool add_vision_id = false;
     std::vector<std::string> tool_jsons;
+    // Boundaries whose byte offset the renderer must resolve. An entry that has no unique output
+    // position is reported as nullopt in RenderedChat::cache_boundary_offsets.
+    std::vector<ninfer::PromptCacheMarker> cache_markers;
+    // When true the renderer appends its own structural candidates (last tool boundary and the
+    // leading instruction boundary) after the declared markers.
+    bool add_engine_automatic_shared_prefixes = false;
 };
 
 struct RewriteCheckpointByteSpec {
@@ -86,6 +102,12 @@ struct RewriteCheckpointByteSpec {
 struct RenderedChat {
     std::string text;
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
+    // Input markers, echoed so the encoding step can attach their kind/evidence to each resolved
+    // frontier.
+    std::vector<ninfer::PromptCacheMarker> cache_markers;
+    // Byte offset of each marker in cache_markers, or nullopt when the renderer found no unique
+    // output position for it.
+    std::vector<std::optional<std::size_t>> cache_boundary_offsets;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {
