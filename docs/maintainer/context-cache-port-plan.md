@@ -210,8 +210,10 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     references, active references, source pins, writer, protected columns, committed columns, host
     replica, plus `KvAddressSpace` frontier/checkpoint-protection/inactive-truncate and page
     sharing.
-  - L4b `HostKvExtentStore` over `HostKVArena`: ordered logical-page membership, source pin on
-    reserve, publish a host replica, and split/release zero-reference runs; bound to L4a.
+  - L4b `HostKvExtentStore` over `HostKVArena` — done: `feat(runtime): add the host KV extent
+    store`. Ordered page membership, source pin on reserve, host-replica publish with pin release,
+    abort, and whole-extent release of unreferenced runs. Partial-run splitting is deferred until a
+    checkpoint can truncate the suffix of a shared extent.
   - L4c state image: role/reference/pin metadata over the linear-attention pool plus a host pool,
     including the continuation hidden and the DFlash local state (currently excluded from host
     snapshots).
