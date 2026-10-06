@@ -15,12 +15,32 @@ does. No claim is made that this branch can merge upstream changes.
 
 ## Route
 
-This branch implements the upstream context-cache **functionality** locally, not its code
-structure (see the port plan's route decision). Upstream's storage/engine layers are single-GPU and
-built around a reference-counted KV address space and an execution-transaction model that this
-branch does not have; this branch's TP2 V100 target has no upstream counterpart. Porting the code
-would still leave the TP2 boundary self-designed and would replace the local, real-artifact-verified
-execution path with an unverifiable one.
+Route B (chosen): align the local storage with upstream rather than patching the page-granular
+local KV. The local branch's `PagedKVPool` is page-granular with no reference counts and no
+column-level coverage; upstream's context cache rests on a reference-counted KV address space with
+per-page coverage, prefix views, and a state-image store. Every attempt to capture a frontier
+inside a page on the local KV failed for that reason, so the fix is the storage model, not another
+capture path.
+
+Staged plan (each stage keeps the build green and lands with tests):
+
+- **B1 logical pages and address spaces.** Logical page metadata (references, active references,
+  source pins, writer, protected/committed columns, device/host replica) and an ordered address
+  space with a committed frontier, a checkpoint frontier, whole-page prefix views/fork, and
+  inactive-prefix truncate. Host-only tests. Builds on `KvPageRegistry` as the starting point.
+- **B2 host extents with sharing.** Host extents whose membership can be referenced by more than
+  one residency, plus an owned sub-page tail for a frontier inside a page; the release/partition
+  rules that let a checkpoint drop without freeing the terminal's pages. Host-only tests.
+- **B3 program adoption.** `SequenceKVBundle` becomes an address-space handle; retain builds a
+  checkpoint as a prefix view (share whole pages, own the sub-page tail) and the claim restores
+  through the address space. Real-artifact gate must pass.
+- **B4 state image.** Route the checkpoint GDN snapshot and hidden through `StateImageStore`,
+  mirroring both ranks, with the retention policy already in place.
+- **B5 capture re-enable.** Re-enable the frontier/marker capture on the new storage; acceptance is
+  the real gate plus the schedule-matched output comparison that caught the earlier failure.
+
+Until B5 lands, multi-checkpoint capture stays reverted and the parity table keeps its current
+status. B1/B2 are pure host modules and do not touch the verified execution path.
 
 ## Alignment by feature
 

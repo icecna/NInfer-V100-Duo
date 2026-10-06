@@ -118,6 +118,40 @@ int test_checkpoint_protection_and_truncate() {
     return failures;
 }
 
+int test_prefix_view() {
+    int failures = 0;
+    KvPageRegistry registry(8);
+    KvAddressSpace source = KvAddressSpace::create(registry, 4, /*tokens_per_page=*/64);
+    source.commit_frontier(256);
+
+    // A frontier inside a page: the fully covered pages are shared and the partial tail is owned.
+    KvAddressSpace view = KvAddressSpace::fork_prefix(registry, source, 200);
+    failures += check(view.pages().size() == 4, "prefix view page count");
+    for (std::size_t index = 0; index < 3; ++index) {
+        failures +=
+            check(view.pages()[index] == source.pages()[index], "whole page shared by identity");
+        failures += check(registry.references(view.pages()[index]) == 2,
+                          "shared page gained a reference");
+    }
+    failures += check(view.pages()[3] != source.pages()[3], "tail page is owned, not shared");
+    failures += check(registry.committed_columns(view.pages()[3]) == 200 % 64,
+                      "tail page commits only the frontier remainder");
+    failures += check(view.committed_frontier() == 200, "prefix view frontier");
+
+    // A page-aligned frontier needs no tail page.
+    KvAddressSpace aligned = KvAddressSpace::fork_prefix(registry, source, 192);
+    failures += check(aligned.pages().size() == 3, "aligned prefix view owns no tail");
+    aligned.release();
+
+    // Releasing the source must not free pages the view still references.
+    source.release();
+    for (std::size_t index = 0; index < 3; ++index) {
+        failures += check(registry.references(view.pages()[index]) == 1,
+                          "shared page survives the source release");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -125,6 +159,7 @@ int main() {
     failures += test_page_lifetime();
     failures += test_shared_pages();
     failures += test_checkpoint_protection_and_truncate();
+    failures += test_prefix_view();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

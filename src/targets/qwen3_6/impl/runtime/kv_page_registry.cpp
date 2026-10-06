@@ -205,6 +205,34 @@ KvAddressSpace KvAddressSpace::fork(KvPageRegistry& registry, const KvAddressSpa
     return forked;
 }
 
+KvAddressSpace KvAddressSpace::fork_prefix(KvPageRegistry& registry, const KvAddressSpace& source,
+                                           std::uint32_t frontier) {
+    if (frontier == 0 || frontier > source.committed_frontier_) {
+        throw std::invalid_argument("prefix frontier is outside the source address space");
+    }
+    const std::uint32_t pages   = source.pages_for_tokens(frontier);
+    const std::uint32_t covered = frontier / source.tokens_per_page_;
+    std::vector<std::uint32_t> pages_out;
+    pages_out.reserve(pages);
+    for (std::uint32_t index = 0; index < covered; ++index) {
+        registry.retain_reference(source.pages_[index]);
+        pages_out.push_back(source.pages_[index]);
+    }
+    if (covered < pages) {
+        const std::optional<std::uint32_t> tail = registry.materialize();
+        if (!tail) {
+            for (const std::uint32_t page : pages_out) { registry.release_reference(page); }
+            throw std::length_error("KV page registry capacity exhausted for a prefix tail");
+        }
+        registry.commit_columns(*tail, frontier % source.tokens_per_page_);
+        pages_out.push_back(*tail);
+    }
+    KvAddressSpace view(registry, std::move(pages_out), source.tokens_per_page_);
+    view.committed_frontier_  = frontier;
+    view.checkpoint_frontier_ = frontier;
+    return view;
+}
+
 KvAddressSpace::~KvAddressSpace() {
     if (registry_ != nullptr && !released_) {
         for (const std::uint32_t page : pages_) { registry_->release_reference(page); }

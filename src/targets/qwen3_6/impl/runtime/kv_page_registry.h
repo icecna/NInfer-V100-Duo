@@ -97,6 +97,13 @@ public:
     // Share every page of `source`, adding one reference per page.
     [[nodiscard]] static KvAddressSpace fork(KvPageRegistry& registry,
                                              const KvAddressSpace& source);
+    // Share `source`'s pages that `frontier` fully covers and own a fresh copy of the partial
+    // tail page, whose committed columns start at the frontier's remainder. This is the checkpoint
+    // prefix view: the tail page is the only one a checkpoint must own, and the shared whole pages
+    // stay valid while this address space references them.
+    [[nodiscard]] static KvAddressSpace fork_prefix(KvPageRegistry& registry,
+                                                    const KvAddressSpace& source,
+                                                    std::uint32_t frontier);
 
     ~KvAddressSpace();
     KvAddressSpace(KvAddressSpace&&) noexcept;
