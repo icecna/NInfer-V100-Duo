@@ -8,6 +8,7 @@ target_sources(ninfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/tokenizer.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/host_kv_extent_store.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/kv_page_registry.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/state_image_store.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/prefix_identity.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/yarn_rope.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/state/decoder_state.cpp

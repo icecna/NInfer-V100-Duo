@@ -214,9 +214,11 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     store`. Ordered page membership, source pin on reserve, host-replica publish with pin release,
     abort, and whole-extent release of unreferenced runs. Partial-run splitting is deferred until a
     checkpoint can truncate the suffix of a shared extent.
-  - L4c state image: role/reference/pin metadata over the linear-attention pool plus a host pool,
-    including the continuation hidden and the DFlash local state (currently excluded from host
-    snapshots).
+  - L4c state image — done: `feat(runtime): add the checkpoint state image store`. A role,
+    checkpoint-reference, and transfer-pin registry over logical state slots plus a pinned raw
+    host-image pool sized for the GDN conv/recurrent state, the continuation hidden, and an
+    optional DFlash local region. Wiring the D2H/H2D transfer of the hidden and DFlash region into
+    the program belongs to L5, where the program owns the device slots.
 - L5 engine integration (PrefixIndex, resource policy, cost model, executor) — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 

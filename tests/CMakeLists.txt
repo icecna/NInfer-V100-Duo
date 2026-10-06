@@ -145,6 +145,13 @@ ninfer_add_test(ninfer_kv_extent_store_test
 target_include_directories(ninfer_kv_extent_store_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+# Host-only checkpoint state-image roles/references/pins and its pinned host pool.
+ninfer_add_test(ninfer_state_image_store_test
+  SOURCES targets/qwen3_6/test_state_image_store.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_state_image_store_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)
