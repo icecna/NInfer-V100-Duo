@@ -63,9 +63,20 @@ different; **not implemented**.
    frontier was implemented (its KV pages shared with the terminal, owning only the GDN snapshot
    and hidden) and then reverted: the real-artifact gate gained a schedule-matched output
    comparison for a replay of the same rendered prompt, and the restored state produced a
-   different decode than the control's cold prefill. The snapshot source (the rewrite GDN slot
-   and hidden, in particular whether the TP2 peer rank writes its rewrite slot) is therefore not
-   a verified restore source, and the feature must not ship until it is.
+   different decode than the control's cold prefill.
+
+   The snapshot source was checked and is correct: both ranks write their rewrite GDN slot
+   (`text_context_impl.h` copies `current -> rewrite` per rank when the chunk ends at the
+   checkpoint frontier) and rank 0 writes the frontier hidden there. The cause is KV coverage:
+   this branch's paged KV is page-granular (`PagedKVAllocation` exposes only page-count
+   materialize/publish, no per-column coverage). A terminal claim restores a frontier equal to the
+   last written token, so its tail page's spare columns were never written; a shorter frontier
+   claim reuses a tail page whose spare columns hold tokens generated after the frontier, and the
+   engine reads them as valid. The fix follows upstream's prefix view: share the pages fully
+   covered by the frontier and give the prefix its own copy of the tail page with the columns
+   beyond the frontier zeroed. That needs the checkpoint KV to be a list of shared page runs plus
+   an owned tail (`KvPageRegistry` + `HostKvExtentStore`), not the single-allocation
+   `HostKVResidency` used today.
 7. Prefill is not split at capture frontiers, and the prefill schedule only materializes the
    continuation hidden at the rewrite frontier (`rewrite_checkpoint_hidden`), not at an arbitrary
    frontier. Capturing a prompt-internal boundary therefore first needs a schedule output for the
