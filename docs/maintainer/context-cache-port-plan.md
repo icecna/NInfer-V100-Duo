@@ -247,15 +247,14 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     cache authority`. Hosted residencies register with `ContextRetentionPolicy` (owner/session
     lineage, demand recorded on reuse, victims order), which is now the single retention authority;
     the table's session/demand writes are gone. Real-artifact gate re-run passes both phases.
-  - L5g multi-checkpoint capture — first step done: `feat(runtime): publish a residency at the
-    rewrite-checkpoint frontier`. The terminal retain also snapshots the prefix at
-    `rewrite_checkpoint.frontier` (KV prefix + the rewrite GDN slot + the rewrite hidden) and
-    publishes it as a second residency, from spare capacity only and ordered to be reclaimed first.
-    The real-artifact gate passes, including a new exact-prompt reuse case, with the strict-prefix
-    guard preserved. KV prefix pages are duplicated, not shared, and prompt-internal
-    `context_cache.boundaries` are not captured yet; both are recorded as deviations. Next: split
-    the prefill at capture frontiers and share the prefix via `KvPageRegistry` + `HostKvExtentStore`
-    so a prefix residency costs no extra host memory.
+  - L5g multi-checkpoint capture — attempted and reverted. A second residency at the
+    rewrite-checkpoint frontier (KV shared with its terminal, owning only the GDN snapshot and
+    hidden) reused correctly but failed a new schedule-matched output comparison in the real gate:
+    the restored state decoded differently from a cold prefill, so the rewrite-slot snapshot is not
+    a verified restore source on TP2. The feature was removed and the gate returned to its
+    verified terminal-only behaviour. Reinstating it requires establishing where the frontier GDN
+    and hidden can be read for both ranks, and a schedule output for the hidden at an arbitrary
+    frontier.
   - L5h cost-model ranking — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 

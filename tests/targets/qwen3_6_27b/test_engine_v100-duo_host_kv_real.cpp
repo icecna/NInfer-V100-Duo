@@ -311,21 +311,15 @@ CrossLane cross_lane_session(const char* artifact, bool host_cache) {
         r.rounds["B"] = std::move(rb);
         r.rounds["C"] = std::move(rc);
 
-        // Exact-frontier regression, updated for the prefix residency. A's rendered prompt captured
-        // a rewrite checkpoint at its own prompt frontier, so a shorter residency now exists at
-        // exactly that frontier: replaying A's base prompt reuses it (host cache only). A prompt
-        // that is a STRICT PREFIX of every retained frontier must still not claim a longer entry,
-        // because an entry's GDN snapshot and rank-0 tail hidden are the state AT its frontier.
+        // Exact-frontier regression: a prompt that is a STRICT PREFIX of a retained session must
+        // NOT claim that session's entry. The entry's GDN snapshot and rank-0 tail hidden are the
+        // state at its frontier, so a shorter boundary is not restorable from it; a content match
+        // that accepted the shared prefix would replay GDN from the wrong position. Replaying A's
+        // base prompt (strictly shorter than A's prompt+output frontier) must fall back to a cold
+        // recompute: same output as the control and zero reused tokens. (Pre-fix, the partial
+        // content match claimed base_a tokens here.)
         {
-            auto hexact = engine.submit(engine.prepare_tokens(ids_a), request_options(true));
-            r.rounds["prefix_exact"] = run_wait(hexact, tag + "prefix_exact");
-            require(r.rounds["prefix_exact"].reused == (host_cache ? r.base_a : 0U),
-                    "A's exact prompt did not reuse its prefix residency");
-
-            Tokens strict = ids_a;
-            strict.pop_back();
-            auto hprefix = engine.submit(engine.prepare_tokens(std::move(strict)),
-                                         request_options(true));
+            auto hprefix = engine.submit(engine.prepare_tokens(ids_a), request_options(true));
             r.rounds["prefix_only"] = run_wait(hprefix, tag + "prefix_only");
             require(r.rounds["prefix_only"].reused == 0,
                     "strict-prefix replay claimed a longer retained entry");

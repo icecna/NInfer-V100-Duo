@@ -49,7 +49,7 @@ different; **not implemented**.
 | Shortlist lookup on the real path | aligned | host residency matching via `PrefixIndex` + authoritative exact match; real-artifact gate |
 | Session lineage + demand retention | approximate | policy is authoritative, but the ordering/weights differ from upstream's `ResourceManager` |
 | Cost model | deviates | priced, but no calibrated presets; not used for ranking yet |
-| Multi-checkpoint capture at declared boundaries | partial | one extra residency at the rewrite-checkpoint frontier (the assistant opener / prompt frontier); it shares the terminal's KV pages and owns only its GDN snapshot and hidden, and is published opportunistically from spare capacity (skipped when the arena is full, so it never evicts a terminal) |
+| Multi-checkpoint capture at declared boundaries | not implemented | only the terminal residency is published; a frontier residency was implemented and reverted (see deviation 6) |
 | Serving surface (`prompt_cache_retention` semantics, `cached_input_tokens` alignment, docs) | not implemented | pending |
 
 ## Deviation register (must stay explicit)
@@ -59,10 +59,13 @@ different; **not implemented**.
 3. Retention is a simplified owner/session/demand policy, not `ResourceManager`.
 4. Cost model is uncalibrated and unused for ranking.
 5. TP2, MTP, and DFlash handling is local; upstream has no TP counterpart.
-6. Multi-checkpoint capture is partial: only the rewrite-checkpoint frontier is captured, and
-   prompt-internal boundaries resolved by the frontend (`context_cache.boundaries`) are not. The
-   captured prefix shares the terminal's KV pages; it owns its own GDN snapshot and hidden, which
-   is the state image upstream also stores per checkpoint.
+6. Multi-checkpoint capture is not implemented. A second residency at the rewrite-checkpoint
+   frontier was implemented (its KV pages shared with the terminal, owning only the GDN snapshot
+   and hidden) and then reverted: the real-artifact gate gained a schedule-matched output
+   comparison for a replay of the same rendered prompt, and the restored state produced a
+   different decode than the control's cold prefill. The snapshot source (the rewrite GDN slot
+   and hidden, in particular whether the TP2 peer rank writes its rewrite slot) is therefore not
+   a verified restore source, and the feature must not ship until it is.
 7. Prefill is not split at capture frontiers, and the prefill schedule only materializes the
    continuation hidden at the rewrite frontier (`rewrite_checkpoint_hidden`), not at an arbitrary
    frontier. Capturing a prompt-internal boundary therefore first needs a schedule output for the
