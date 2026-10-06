@@ -77,6 +77,15 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::optional<qwen3_6::detail::HostPrefixId> host_entry = std::nullopt;
     std::uint32_t host_reuse_base = 0;
     std::uint64_t host_table_version = 0;
+    // Rolling per-frontier content digest and the program-fixed identity tag; together they form
+    // the shortlist key an engine-level prefix index compares before the exact match runs.
+    std::vector<PrefixDigest> prefix_digests;
+    std::uint32_t prefix_identity_tag = 0;
+
+    [[nodiscard]] PrefixShortlistKey prefix_shortlist_key(std::uint32_t frontier) const {
+        if (frontier == 0 || frontier >= prefix_digests.size()) { return {}; }
+        return PrefixShortlistKey{prefix_digests[frontier], frontier, prefix_identity_tag};
+    }
 };
 
 template <>
@@ -370,6 +379,8 @@ public:
     const std::int32_t kv_quant_group;
     const ProposalHead proposal_head;
     const bool vision_enabled;
+    // Program-fixed identity tag mixed into every shortlist key this program publishes.
+    const std::uint32_t prefix_identity_tag;
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;
     const std::size_t gdn_state_bytes;

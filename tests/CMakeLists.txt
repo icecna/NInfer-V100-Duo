@@ -124,6 +124,13 @@ ninfer_add_test(ninfer_qwen3_6_cache_boundary_test
 target_include_directories(ninfer_qwen3_6_cache_boundary_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+# Host-only prefix-shortlist digests and identity tag.
+ninfer_add_test(ninfer_prefix_identity_test
+  SOURCES targets/qwen3_6/test_prefix_identity.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_prefix_identity_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)

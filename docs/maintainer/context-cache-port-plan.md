@@ -203,7 +203,8 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
 - L1 protocol and hints — done: `feat(serve): accept protocol prompt-cache hints`.
 - L2 frontend boundaries — done: `feat(frontend): resolve prompt cache markers to token
   frontiers`.
-- L3 identity shortlist digests — pending.
+- L3 identity shortlist digests — done: `feat(runtime): add prefix shortlist digests and identity
+  tag`.
 - L4 checkpoint storage (KV refcounts, host extent store, state image) — pending.
 - L5 engine integration (PrefixIndex, resource policy, cost model, executor) — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
