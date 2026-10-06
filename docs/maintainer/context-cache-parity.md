@@ -63,8 +63,12 @@ different; **not implemented**.
    prompt-internal boundaries resolved by the frontend (`context_cache.boundaries`) are not. The
    captured prefix shares the terminal's KV pages; it owns its own GDN snapshot and hidden, which
    is the state image upstream also stores per checkpoint.
-7. Prefill is not split at capture frontiers; only the rewrite-checkpoint frontier is materialized
-   exactly, so the frontend's prompt-internal boundaries are not captured yet.
+7. Prefill is not split at capture frontiers, and the prefill schedule only materializes the
+   continuation hidden at the rewrite frontier (`rewrite_checkpoint_hidden`), not at an arbitrary
+   frontier. Capturing a prompt-internal boundary therefore first needs a schedule output for the
+   hidden at that frontier: the GDN snapshot alone is insufficient because the MTP bridge and
+   zero-suffix sampling need the continuation hidden. Until then, only the rewrite-checkpoint
+   frontier (which equals the prompt frontier for the default render) is captured.
 
 ## Conformance evidence
 

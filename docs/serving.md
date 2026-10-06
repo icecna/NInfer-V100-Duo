@@ -178,7 +178,8 @@ strings of at most 64 characters. Without a declared boundary the server targets
 last assistant turn that produced tool calls, else the last turn carrying content, else the tool
 definitions. At most four explicit boundaries are retained; older ones are dropped. The cache
 stays content-addressed by the Engine, so a hint bounds where a prefix may be retained rather than
-naming a cache entry.
+naming a cache entry. `prompt_cache_retention` is accepted as a hint only: the cache is
+process-local and in memory, so `in_memory` and `24h` behave the same and a restart clears it.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
