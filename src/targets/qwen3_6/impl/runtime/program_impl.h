@@ -1364,7 +1364,8 @@ void ProgramImplCore::complete_host_transfer(std::uint32_t lane, bool abandoned)
                                /*shared=*/false);
         host_retention.finish_owner(owner_token);
         host_prefixes.stamp(id, ++host_lru_counter);
-        ++host_table_version_;        sequence.ledger.clear();
+        ++host_table_version_;
+        sequence.ledger.clear();
         sequence.prefix_identity.clear();
         sequence.execution_frontier  = 0;
         sequence.ledger_frontier     = 0;
