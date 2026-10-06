@@ -1673,7 +1673,11 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
     host_prefixes.begin_claim(entry_id);
     host_prefixes.stamp(entry_id, ++host_lru_counter);
     host_retention.remember_demand(entry_id, ++host_demand_counter);
-    if (sequence.session_key.empty()) { sequence.session_key = entry->session_key; }
+    if (sequence.session_key.empty()) {
+        if (const std::optional<std::string> session = host_retention.checkpoint_session(entry_id)) {
+            sequence.session_key = *session;
+        }
+    }
     const HostKVResidency& host = payload.kv;
     const std::uint32_t text_pages    = pages_for_tokens(base);
     const std::uint32_t backend_pages =

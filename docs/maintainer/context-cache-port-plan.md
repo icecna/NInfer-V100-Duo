@@ -242,9 +242,21 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     cache authority`. Hosted residencies register with `ContextRetentionPolicy` (owner/session
     lineage, demand recorded on reuse, victims order), which is now the single retention authority;
     the table's session/demand writes are gone. Real-artifact gate re-run passes both phases.
-  - L5g cost-model ranking and marker-driven multi-checkpoint capture — pending. The table's
-    `find_best`/`oldest_evictable`/session/demand members are now unused by production and should
-    be removed with their tests once L5g lands.
+  - L5g cost-model ranking and marker-driven multi-checkpoint capture — pending (design below).
+    The superseded table members (`find_best`, `oldest_evictable`, session/demand) were removed
+    with their tests; the table is now a pure storage container.
+
+    L5g capture design (the last execution change): publish a residency at the prefill-end
+    (rewrite-checkpoint) frontier in addition to the terminal one. At terminal the lane already
+    holds the rewrite checkpoint's GDN slot and hidden at `rewrite_checkpoint.frontier`, and its KV
+    covers `[0, frontier)`; a second D2H of the prefix pages plus the rewrite GDN slot and hidden
+    yields a residency with `reuse_boundary = frontier`, `tokens = ledger[0, frontier)`, and a
+    frontier-truncated identity. That is the boundary a later request re-renders (the assistant
+    opener, before the thinking prologue), so it fixes multi-turn reuse in both thinking modes.
+    This touches the TP2 (both ranks' rewrite slots), MTP (backend KV prefix to frontier-1), and
+    DFlash (local state at frontier) paths, so it needs its own real-artifact regression per
+    backend. `context_cache.boundaries` from the frontend generalizes this beyond the rewrite
+    frontier once the mid-prefill snapshot exists.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
 L1/L2 are observable only through the parsed markers and resolved frontiers; Engine reuse
