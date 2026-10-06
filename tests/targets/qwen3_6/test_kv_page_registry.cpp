@@ -152,6 +152,34 @@ int test_prefix_view() {
     return failures;
 }
 
+int test_adopted_pages() {
+    int failures = 0;
+    KvPageRegistry registry(8);
+    // Simulate a device pool that allocated physical pages 3 and 5.
+    registry.adopt(3);
+    registry.adopt(5);
+    KvAddressSpace space = KvAddressSpace::adopt(registry, {3, 5}, 64);
+    failures += check(space.pages().size() == 2, "adopted address space page count");
+    failures += check(registry.references(3) == 1 && registry.references(5) == 1,
+                      "adopted pages carry one reference");
+    space.commit_frontier(100);
+
+    KvAddressSpace view = KvAddressSpace::fork_prefix(registry, space, 70);
+    failures += check(view.pages().size() == 2 && view.pages()[0] == 3,
+                      "prefix view shares the adopted whole page");
+    failures += check(registry.references(3) == 2, "sharing the adopted page adds a reference");
+    failures += check(view.pages()[1] != 5, "the prefix view owns its own tail page");
+    failures += check(registry.committed_columns(view.pages()[1]) == 70 % 64,
+                      "the tail commits only the frontier remainder");
+
+    bool threw = false;
+    try {
+        registry.adopt(3);
+    } catch (const std::logic_error&) { threw = true; }
+    failures += check(threw, "adopting an already registered page is rejected");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -160,6 +188,7 @@ int main() {
     failures += test_shared_pages();
     failures += test_checkpoint_protection_and_truncate();
     failures += test_prefix_view();
+    failures += test_adopted_pages();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

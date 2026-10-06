@@ -32,6 +32,10 @@ public:
     // Take a free page owned by one address space: references=1. The owner sets a writer while it
     // appends to the page.
     [[nodiscard]] std::optional<std::uint32_t> materialize() noexcept;
+    // Register a page a device pool already allocated as owned by one address space (references=1).
+    // The registry then tracks it exactly like a materialized page; the pool keeps the physical
+    // storage. Throws when the page is already registered.
+    void adopt(std::uint32_t page);
     [[nodiscard]] bool occupied(std::uint32_t page) const;
 
     void retain_reference(std::uint32_t page);
@@ -94,6 +98,11 @@ public:
     // Materialize `page_count` fresh pages owned by this address space.
     [[nodiscard]] static KvAddressSpace create(KvPageRegistry& registry, std::uint32_t page_count,
                                                std::uint32_t tokens_per_page = 64);
+    // Wrap pages a device pool already allocated and the registry already tracks (see
+    // KvPageRegistry::adopt). This address space owns their references; the pool owns the memory.
+    [[nodiscard]] static KvAddressSpace adopt(KvPageRegistry& registry,
+                                              std::vector<std::uint32_t> pages,
+                                              std::uint32_t tokens_per_page = 64);
     // Share every page of `source`, adding one reference per page.
     [[nodiscard]] static KvAddressSpace fork(KvPageRegistry& registry,
                                              const KvAddressSpace& source);

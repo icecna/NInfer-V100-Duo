@@ -36,6 +36,14 @@ std::optional<std::uint32_t> KvPageRegistry::materialize() noexcept {
 
 bool KvPageRegistry::occupied(std::uint32_t page) const { return at(page).occupied; }
 
+void KvPageRegistry::adopt(std::uint32_t page) {
+    Page& entry = at(page);
+    if (entry.occupied) { throw std::logic_error("KV page is already registered"); }
+    entry.occupied   = true;
+    entry.references = 1;
+    free_.erase(std::remove(free_.begin(), free_.end(), page), free_.end());
+}
+
 void KvPageRegistry::retain_reference(std::uint32_t page) {
     Page& entry = at(page);
     if (!entry.occupied) { throw std::logic_error("cannot reference an unmaterialized KV page"); }
@@ -192,6 +200,16 @@ KvAddressSpace KvAddressSpace::create(KvPageRegistry& registry, std::uint32_t pa
             throw std::length_error("KV page registry capacity exhausted");
         }
         pages.push_back(*page);
+    }
+    return KvAddressSpace(registry, std::move(pages), tokens_per_page);
+}
+
+KvAddressSpace KvAddressSpace::adopt(KvPageRegistry& registry, std::vector<std::uint32_t> pages,
+                                     std::uint32_t tokens_per_page) {
+    for (const std::uint32_t page : pages) {
+        if (!registry.occupied(page)) {
+            throw std::invalid_argument("adopted address space references an unregistered page");
+        }
     }
     return KvAddressSpace(registry, std::move(pages), tokens_per_page);
 }
