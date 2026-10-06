@@ -3,6 +3,11 @@
 状态：active port plan。实现完成后并入 `concurrent-inference-architecture.md` 与
 `paged-kv-cache.md`，本文件随后删除。
 
+Route decision: implement the upstream context-cache **functionality** locally rather than porting
+upstream's code structure. The pinned upstream revision, the feature-by-feature alignment, and the
+deviation register live in [`context-cache-parity.md`](context-cache-parity.md); that file is the
+acceptance basis and must be updated with any new deviation.
+
 ## 0. Deliverable, scope, completion
 
 Deliverable: reproduce the observable behaviour of upstream `Neroued/ninfer` context cache on the
@@ -246,17 +251,18 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     The superseded table members (`find_best`, `oldest_evictable`, session/demand) were removed
     with their tests; the table is now a pure storage container.
 
-    L5g capture design (the last execution change): publish a residency at the prefill-end
-    (rewrite-checkpoint) frontier in addition to the terminal one. At terminal the lane already
-    holds the rewrite checkpoint's GDN slot and hidden at `rewrite_checkpoint.frontier`, and its KV
-    covers `[0, frontier)`; a second D2H of the prefix pages plus the rewrite GDN slot and hidden
-    yields a residency with `reuse_boundary = frontier`, `tokens = ledger[0, frontier)`, and a
-    frontier-truncated identity. That is the boundary a later request re-renders (the assistant
-    opener, before the thinking prologue), so it fixes multi-turn reuse in both thinking modes.
-    This touches the TP2 (both ranks' rewrite slots), MTP (backend KV prefix to frontier-1), and
-    DFlash (local state at frontier) paths, so it needs its own real-artifact regression per
-    backend. `context_cache.boundaries` from the frontend generalizes this beyond the rewrite
-    frontier once the mid-prefill snapshot exists.
+    L5g capture design (the last execution change), revised after reading upstream: upstream splits
+    the prefill unit at each planned capture frontier (`prefill.cpp`'s `split_frontier`), so the
+    device state lands exactly on the frontier, then creates the checkpoint with a **shared** KV
+    prefix view (reference-counted whole pages plus a copy of the sub-page tail) and a frozen state
+    image. This branch should follow the same shape rather than the earlier "second D2H of the
+    whole prefix" idea: (1) plan capture groups (InputReplay at the rewrite frontier, LongAnchor /
+    SharedPrefix from `context_cache.boundaries`); (2) split `advance_prefill` at the next frontier;
+    (3) route the checkpoint's KV through `KvPageRegistry` + `HostKvExtentStore` for prefix sharing,
+    copying only the partial tail page; (4) freeze the state image through `StateImageStore`. MTP
+    uses `frontier - 1` for the backend prefix. TP2 has no upstream reference: the state image is
+    per rank and the peer side must be mirrored explicitly. `context_cache.boundaries` from the
+    frontend generalizes capture beyond the single rewrite frontier.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
 L1/L2 are observable only through the parsed markers and resolved frontiers; Engine reuse
