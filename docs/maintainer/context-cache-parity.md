@@ -67,16 +67,16 @@ different; **not implemented**.
 
    The snapshot source was checked and is correct: both ranks write their rewrite GDN slot
    (`text_context_impl.h` copies `current -> rewrite` per rank when the chunk ends at the
-   checkpoint frontier) and rank 0 writes the frontier hidden there. The cause is KV coverage:
-   this branch's paged KV is page-granular (`PagedKVAllocation` exposes only page-count
-   materialize/publish, no per-column coverage). A terminal claim restores a frontier equal to the
-   last written token, so its tail page's spare columns were never written; a shorter frontier
-   claim reuses a tail page whose spare columns hold tokens generated after the frontier, and the
-   engine reads them as valid. The fix follows upstream's prefix view: share the pages fully
-   covered by the frontier and give the prefix its own copy of the tail page with the columns
-   beyond the frontier zeroed. That needs the checkpoint KV to be a list of shared page runs plus
-   an owned tail (`KvPageRegistry` + `HostKvExtentStore`), not the single-allocation
-   `HostKVResidency` used today.
+   checkpoint frontier) and rank 0 writes the frontier hidden there. The cause is not yet
+   established. Two candidates remain, and the evidence narrows rather than settles them:
+   the KV tail page (the paged KV is page-granular, and a shorter frontier reuses a tail page
+   whose spare columns hold later tokens) versus the GDN/hidden state read from the rewrite slot.
+   The tail-page candidate is weakened because the text ops take a per-rank `valid_columns` tensor
+   (`text_context.h`), so attention should mask those columns; the terminal claim is equally
+   page-granular and passes. A focused experiment is required before the feature can return: for
+   example, restore the same frontier from a page-aligned checkpoint (isolates the tail page) or
+   compare the decoded first token after restoring the rewrite slot directly versus through the
+   host claim (isolates the state). Until then the feature stays reverted.
 7. Prefill is not split at capture frontiers, and the prefill schedule only materializes the
    continuation hidden at the rewrite frontier (`rewrite_checkpoint_hidden`), not at an arbitrary
    frontier. Capturing a prompt-internal boundary therefore first needs a schedule output for the
