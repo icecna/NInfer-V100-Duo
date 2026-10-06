@@ -81,6 +81,9 @@ public:
                                                      std::span<const std::uint32_t> pages);
     // Attach the host replica to every page and release the source pins.
     [[nodiscard]] std::optional<Capability> publish(Reservation&& reservation);
+    // Add a second owner of a published extent. The extent (and its host replicas) stays alive
+    // until every owner releases it.
+    [[nodiscard]] Capability retain(const Capability& capability);
     void abort(Reservation&& reservation) noexcept;
     void release(Capability&& capability) noexcept;
 
@@ -97,6 +100,8 @@ private:
         std::vector<std::uint32_t> pages;
         std::uint32_t generation = 1;
         std::size_t bytes        = 0;
+        // Owners sharing this extent; it is returned to the arena when the last one releases.
+        std::uint32_t references = 0;
         State state              = State::Free;
     };
 

@@ -110,9 +110,16 @@ HostKvExtentStore::publish(Reservation&& reservation) {
         registry_->unpin_source(page);
     }
     extent.state = State::Published;
+    extent.references = 1;
     ++occupied_;
     occupied_bytes_ += extent.bytes;
     return Capability(*this, reservation.index_, reservation.generation_);
+}
+
+HostKvExtentStore::Capability HostKvExtentStore::retain(const Capability& capability) {
+    Extent& extent = require(capability.index_, capability.generation_);
+    ++extent.references;
+    return Capability(*this, capability.index_, capability.generation_);
 }
 
 void HostKvExtentStore::abort(Reservation&& reservation) noexcept {
@@ -147,9 +154,13 @@ void HostKvExtentStore::release(std::uint32_t index, std::uint32_t generation) n
     if (index >= extents_.size()) { return; }
     Extent& extent = extents_[index];
     if (extent.state != State::Published || extent.generation != generation) { return; }
+    if (extent.references == 0) { return; }
+    --extent.references;
+    if (extent.references != 0) { return; }
     for (const std::uint32_t page : extent.pages) { registry_->detach_host_replica(page); }
     occupied_bytes_ -= extent.bytes;
     --occupied_;
+    extent.references = 0;
     extent.allocation = HostKVAllocation{};
     extent.pages.clear();
     extent.bytes = 0;

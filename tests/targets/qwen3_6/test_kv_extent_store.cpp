@@ -114,12 +114,35 @@ int test_abort_restores_arena() {
     return failures;
 }
 
+int test_shared_extent() {
+    int failures = 0;
+    const HostKVPageLayout layout = make_layout();
+    HostKVArena arena(layout.page_stride * 8, std::span<const HostKVPageLayout>(&layout, 1));
+    KvPageRegistry registry(8);
+    HostKvExtentStore store(arena, registry, 4);
+    KvAddressSpace space = KvAddressSpace::create(registry, 2, 64);
+
+    auto reservation = store.reserve(layout, space.pages());
+    auto capability  = store.publish(std::move(*reservation));
+    failures += check(store.occupied() == 1, "one published extent");
+    auto shared = store.retain(*capability);
+    failures += check(store.occupied() == 1, "retain shares the existing extent");
+    store.release(std::move(*capability));
+    failures += check(store.occupied() == 1 && arena.occupied_bytes() > 0,
+                      "a shared extent outlives its first owner");
+    store.release(std::move(shared));
+    failures += check(store.occupied() == 0 && arena.occupied_bytes() == 0,
+                      "the last owner frees the extent");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
     failures += test_publish_and_release();
     failures += test_abort_restores_arena();
+    failures += test_shared_extent();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
