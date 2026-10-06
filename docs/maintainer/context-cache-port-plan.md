@@ -197,6 +197,20 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
 - **L6 — serving surface.** Retention/session fields end to end, `cached_input_tokens` reporting,
   docs and capability tests. Acceptance: `docs/serving.md` + schema tests + a live HTTP check.
 
+## 4.1 Progress
+
+- L0 baseline — done (plan committed, dead leftovers removed).
+- L1 protocol and hints — done: `feat(serve): accept protocol prompt-cache hints`.
+- L2 frontend boundaries — done: `feat(frontend): resolve prompt cache markers to token
+  frontiers`.
+- L3 identity shortlist digests — pending.
+- L4 checkpoint storage (KV refcounts, host extent store, state image) — pending.
+- L5 engine integration (PrefixIndex, resource policy, cost model, executor) — pending.
+- L6 serving surface (retention/session end to end, live verification) — pending.
+
+L1/L2 are observable only through the parsed markers and resolved frontiers; Engine reuse
+behaviour, and therefore `docs/serving.md`'s cache description, is unchanged until L5.
+
 ## 5. Budgets and risks
 
 - Host bytes: checkpoint KV extent + (GDN conv/recurrent + hidden + DFlash) per checkpoint; count
