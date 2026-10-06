@@ -153,6 +153,46 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         base->vision_control         = std::move(control);
     }
 
+    // Content-addressed host table lookup (P2): the entry is lane-free, so the match computed
+    // here is valid for whichever idle lane the executor admits. Only an exact match at the
+    // entry's frontier is usable (see match_entry); the per-lane planner binds it and
+    // re-derives the reuse path. The table version is stamped always so a later table mutation
+    // re-plans this base even when the lookup found nothing (a new entry may now match).
+    base->host_table_version = host_table_version_;
+    if (host_kv_cache_bytes != 0 && host_prefixes.size() != 0 &&
+        options.allow_prefix_reuse) {
+        // An entry is claimable only at its EXACT frontier. Its paged KV is per-token, but the
+        // GDN linear-state snapshot and the rank-0 tail hidden are the state AT the frontier,
+        // so a prompt sharing only a shorter prefix (or diverging before the frontier) cannot
+        // be served from this entry: the replay would start from `base` against state already
+        // advanced to `reuse_boundary`. Requiring the full frontier also keeps the vision-item
+        // consumer split moot (prefix_matches validates the identity at the boundary).
+        const auto match_entry = [&](const HostPrefixResidency& e) -> std::size_t {
+            const std::size_t boundary = e.reuse_boundary;
+            if (boundary == 0 || boundary > e.tokens.size() ||
+                boundary > prompt.token_ids.size()) {
+                return 0;
+            }
+            if (!std::equal(prompt.token_ids.begin(),
+                            prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(boundary),
+                            e.tokens.begin())) {
+                return 0;
+            }
+            return qwen3_6::detail::prefix_matches(prompt, e.tokens, e.identity, boundary)
+                       ? boundary
+                       : 0;
+        };
+        const auto* best = host_prefixes.find_best(
+            prompt,
+            [&match_entry](const HostPrefixPrompt<HostPrefixResidency>&,
+                          const HostPrefixResidency& e) { return match_entry(e); },
+            [this] { return ++host_lru_counter; });
+        if (best != nullptr) {
+            base->host_entry      = best->id;
+            base->host_reuse_base = static_cast<std::uint32_t>(match_entry(best->payload));
+        }
+    }
+
     if (prompt.identity.rewrite_checkpoint) {
         const RewriteCheckpointSpec candidate = *prompt.identity.rewrite_checkpoint;
         if (candidate.frontier == 0 || candidate.frontier > base->summary.prompt_tokens) {
@@ -210,11 +250,24 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
+    // Cross-lane host table hit: the base plan found the deepest content match and this lane
+    // has no better device-resident state. Bind the entry to this plan; the claim restores
+    // KV + GDN + tail into the (empty) lane. The entry always carries a full tail and backend
+    // coverage at its boundary (terminal retain only), which satisfies the MTP gates below
+    // that the empty lane's state cannot.
+    if (plan->reuse == ReusePath::FullReset && plan->reuse_base == 0U && base.host_entry &&
+        base.allow_prefix_reuse && prompt.identity.reusable) {
+        plan->host_entry   = base.host_entry;
+        plan->reuse        = ReusePath::AppendAtFrontier;
+        plan->reuse_base   = base.host_reuse_base;
+    }
+
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const bool append_ready =
-            plan->reuse == ReusePath::AppendAtFrontier && sequence.tail_hidden_valid &&
-            decoder->mtp_cache() != nullptr &&
-            (plan->reuse_base == 0 || sequence.mtp_kv_valid >= plan->reuse_base - 1);
+            plan->reuse == ReusePath::AppendAtFrontier &&
+            (plan->host_entry || sequence.tail_hidden_valid) && decoder->mtp_cache() != nullptr &&
+            (plan->host_entry || plan->reuse_base == 0 ||
+             sequence.mtp_kv_valid >= plan->reuse_base - 1);
         const bool checkpoint_ready = is_rewrite_checkpoint_restore(plan->reuse) &&
                                       decoder->mtp_cache() != nullptr && plan->reuse_base != 0 &&
                                       sequence.mtp_kv_valid >= plan->reuse_base - 1;

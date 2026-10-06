@@ -24,6 +24,7 @@ add_library(ninfer_core STATIC
   core/cyclic_kv_cache.cpp
   core/paged_kv_cache.cpp
   core/linear_attention_state.cpp
+  core/linear_state_transfer.cu
   core/layout.cpp
   core/tensor.cpp
   core/decode_graph.cpp

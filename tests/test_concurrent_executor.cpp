@@ -162,6 +162,8 @@ struct ScriptedPlan {
     rt::RequestPlanSummary value;
 
     [[nodiscard]] const rt::RequestPlanSummary& summary() const noexcept { return value; }
+    [[nodiscard]] bool uses_host_entry() const noexcept { return false; }
+    [[nodiscard]] std::uint64_t host_table_version() const noexcept { return 0; }
 };
 
 struct GenerationScript {
@@ -219,8 +221,8 @@ public:
         return lane < max_concurrency_ && lanes_[lane].lifecycle == Lifecycle::Empty;
     }
 
-    [[nodiscard]] bool can_admit_lane_after_retained_eviction(std::uint32_t lane,
-                                                              const ScriptedPlan& plan) const noexcept {
+    [[nodiscard]] bool can_admit_lane_after_retained_eviction(
+        std::uint32_t lane, const ScriptedPlan& plan, bool = false) const noexcept {
         // Evicting the lane's own retained prefix always frees enough room for the plan.
         return can_admit_lane(lane, plan) || (lane < max_concurrency_ && has_retained_lane(lane));
     }
@@ -315,8 +317,13 @@ public:
         return retained_lanes_.count(lane) != 0;
     }
     void evict_retained_lane(std::uint32_t lane) noexcept { retained_lanes_.erase(lane); }
-    [[nodiscard]] std::span<const std::uint32_t> harvest_host_retains() { return {}; }
+    void harvest_host_retains() {}
     void wait_host_retain(std::uint32_t) {}
+    void wait_all_host_retains() {}
+    [[nodiscard]] std::uint64_t host_table_version() const noexcept { return 0; }
+    [[nodiscard]] std::uint64_t lane_release_generation(std::uint32_t) const noexcept {
+        return 0;
+    }
     [[nodiscard]] bool has_host_retain_in_flight() const noexcept { return false; }
     [[nodiscard]] ninfer::GenerationTimings generation_timings_lane(std::uint32_t) const noexcept {
         return {};

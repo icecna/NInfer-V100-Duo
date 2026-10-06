@@ -522,8 +522,11 @@ device_block_tables[s][slot][logical_block] -> pool-local page-group ID
 行数固定为 `max_concurrency`。矩阵是 execution metadata，不是 KV capacity，也不拥有 physical pages。
 
 `PoolAllocation` 持有 authoritative ordered mapping；lane admission 时把 mapping 安装到对应 row。
-Retained state 不占用已绑定的 table row；当前 runtime 的完整 SequenceState 物理上 lane-affine，因此 reuse
-时重新绑定同一 lane row，而不是搬迁 fixed continuation state。KV allocator 本身仍不从 row 推导 ownership。
+Retained state 不占用已绑定的 table row；device-resident 的完整 SequenceState 物理上 lane-affine，因此
+reuse 时重新绑定同一 lane row，而不是搬迁 fixed continuation state。启用 host 前缀表时，前缀在终态把
+KV（连同 GDN linear-state 快照与 tail hidden）D2H 成内容寻址 entry 并释放 lane；claim 时在目标空闲 lane
+重新分配并 H2D 恢复（仅匹配 entry 的精确 frontier）。物理页仍不跨 lane 共享，只是由 entry 重建。
+KV allocator 本身仍不从 row 推导 ownership。
 未映射的 tail entries 不具有 consumer-visible 含义，可以在 debug/test 中使用 invalid sentinel，但
 production kernel 不为每次读取增加 page-ID bounds branch。
 

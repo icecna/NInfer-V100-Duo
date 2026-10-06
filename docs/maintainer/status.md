@@ -45,11 +45,11 @@
   - `scripts/run-host-kv-gate.sh` + `scripts/verify_host_kv_serve.py`
 - **状态:实现完成,待跑验收脚本验证后提交。**
 
-## P1(表核心,已完成 2026-07-18,待提交)
+## P1(表核心,已提交 6a044bc5)
 
-- `HostPrefixTable<Payload>`(纯 CPU):insert/find/find_best(内容匹配 + 最深边界
-  平局裁决 + LRU 盖戳)/oldest_evictable(最小非零戳,在途 claim 不可驱逐)/
-  evict(回调)/begin-end_claim(防下溢);单测 `test_host_prefix_table.cpp` 6 组全绿
+- `HostPrefixTable<Payload>`(纯 CPU):insert/find/find_best(内容匹配 + 最深匹配 depth
+  裁决 + LRU 盖戳)/oldest_evictable(最小非零戳,在途 claim 不可驱逐)/
+  evict(回调)/begin-end_claim(防下溢);单测 `test_host_prefix_table.cpp` 全绿
 - **接线(行为等价改道)**:arena 分配的所有权从 lane(`host_kv` 4 个 HostKVAllocation)
   移到表 entry(`HostPrefixResidency` payload:kv + origin_lane + reuse_boundary);
   lane 保留控制面(ledger/identity/checkpoint/retained)不变,planner/executor 接口零改动;
@@ -59,13 +59,20 @@
   cold 3.06s / append 0.074s / host_append 0.090s / occupied=121786368,exact PASS
 - gate 脚本已指向 `build-host-prefixes`
 
-## 规划(草案,未开工)
+## P2(内容寻址跨 lane 前缀表,实现完成,待最终 gate 验收)
 
-- **内容寻址的跨 lane host 前缀表**(`docs/maintainer/plan-content-addressed-host-prefixes.md`):
-  host 前缀不再绑定 lane,2 lane 服务可驻留 3+ 个长前缀(受 arena 预算约束),
-  消除多会话乒乓;device-resident 前缀保持 lane 绑定不变。GDN 线性注意力状态随 entry
-  持久化(D2H 快照 + claim 时 H2D 到目标 lane 槽),设计已补入该文档。
-  目标已定案:多对话(> lane 数)排队时上下文完整保留、回来免 prefill;预算手工配
-  (`--context-host-cache-mib`,默认关闭),会话识别靠 prompt 内容匹配(无会话 ID、无 TTL,
-  纯容量 LRU 驱逐),miss/驱逐一律降级为冷算不报错。
-  依赖上述 host KV cache 功能落地并验证完成后开工;两份 plan 文档完成后一并删除。
+- entry 自包含化:`HostPrefixResidency` = paged KV(text/backend)+ GDN linear-state 快照
+  (`src/core/linear_state_transfer.cu`,逐字节 identity transfer)+ rank-0 tail hidden +
+  ledger tokens + resident identity + reuse_boundary;lane 在 entry 发布后完全释放
+- claim 可落到任意**空** lane:`claim_host_sequence` 要求 lane 为空,把 KV/GDN/tail 恢复到
+  目标 lane 的 current slot;admission 驱逐 pass 对 `uses_host_entry()` 的 plan 会先释放
+  被选中 lane 自身的 retained state
+- 只允许**精确 frontier** 匹配:GDN/tail 快照是 frontier 处的状态,共享更短前缀的 prompt
+  不能从该 entry 恢复,匹配不到即降级冷算
+- 失效模型:`lane_release_generation`(lane 清除、host-retain 落定、请求终态完成)
+  取代 executor 侧的 lane-plan 版本
+- 测试:phase 1 同 lane 往返回归;phase 2 跨 lane 三 entry 共存 + 每轮 filler 抢占原 lane
+  的 GDN 槽,必须由 entry 快照恢复
+- 状态:实现完成(未提交),待 `scripts/run-host-kv-gate.sh` 全量验收通过后提交;
+  提交后删除本文档与两份 plan 文档(`plan-host-retained-prefix.md`、
+  `plan-content-addressed-host-prefixes.md`)

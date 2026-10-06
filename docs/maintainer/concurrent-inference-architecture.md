@@ -271,10 +271,12 @@ lane 的 backing 中，但不再存在 active request control，也不计入 act
 - prefix identity 和 target-defined reusable checkpoints。
 
 `SequenceState` 不包含 stop/output/transport state，不拥有 batch row、round activations、logits、shared
-workspace 或 graph。当前 fixed-state backing 是 lane-affine 的：retained state 不搬到另一 lane，planner 在
-所有 free lanes 中寻找可复用 continuation，选中后在同一 lane 建立新的 request control；需要 active
-capacity 时可以先驱逐其他 free lanes 上的 retained state。新 request 的 sampling、RNG、stop 和 output
-state 始终重新创建。
+workspace 或 graph。device-resident 的 retained prefix 仍是 lane-affine 的：planner 在所有 free lanes 中
+寻找可复用 continuation，选中后在同一 lane 建立新的 request control；需要 active capacity 时可以驱逐
+其他 free lanes 上的 retained state。启用 host 前缀表时，终态前缀按内容 D2H 成自包含 entry（paged KV +
+GDN linear-state 快照 + rank-0 tail hidden），lane 随即完全释放；任何空闲 lane 都能按内容**精确匹配**
+entry 的 frontier 再 H2D 恢复本 lane 继续执行（只有 frontier 处的一份 GDN 快照，故不共享更短前缀）。
+新 request 的 sampling、RNG、stop 和 output state 始终重新创建。
 
 Qwen3.6 的 lane 是 Linear Attention state 的唯一 locator。`C=max_concurrency` 时，shared pool 固定使用
 `[0,C)` 作为各 lane 的 current committed state，使用 `[C,2C)` 作为各 lane 的 rewrite-checkpoint

@@ -65,4 +65,19 @@ struct LinearAttentionStatePool {
     void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
 };
 
+// Bit-exact transfer of one pool slot to/from a pinned host block. The host block is
+// `linear_state_slot_bytes(spec)` bytes, laid out layer-major:
+//
+//   [conv:      layers x (conv_channels x conv_width)                       conv_dtype]
+//   [recurrent: layers x (key_head_dim x value_head_dim x value_heads)      FP32]
+[[nodiscard]] std::size_t linear_state_slot_bytes(const LinearAttentionStatePoolSpec& spec);
+
+// Conv component's share of the slot block (the recurrent component follows it).
+[[nodiscard]] std::size_t linear_state_conv_bytes(const LinearAttentionStatePoolSpec& spec);
+
+void snapshot_linear_state_slot_to_host(const LinearAttentionStatePool& pool, std::int32_t slot,
+                                        void* host, cudaStream_t stream);
+void restore_linear_state_slot_from_host(const LinearAttentionStatePool& pool, std::int32_t slot,
+                                         const void* host, cudaStream_t stream);
+
 } // namespace ninfer

@@ -71,7 +71,7 @@ if [[ $build_rc -ne 0 ]]; then
   exit "$build_rc"
 fi
 
-log "running host KV round-trip gate (artifact: $ARTIFACT)"
+log "running host prefix gate (artifact: $ARTIFACT)"
 NINFER_V100_DUO_ARTIFACT="$ARTIFACT" "$TEST_BIN" 2>&1 | tee -a "$LOG"
 test_rc=${PIPESTATUS[0]}
 exit "$test_rc"

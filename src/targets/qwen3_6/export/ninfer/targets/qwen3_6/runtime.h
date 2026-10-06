@@ -107,6 +107,9 @@ public:
     RequestBasePlan& operator=(const RequestBasePlan&) = delete;
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
+    // Content-addressed host table stamp: the table version this plan was computed against.
+    // A differing current version means the referenced entry may have changed; re-plan.
+    [[nodiscard]] std::uint64_t host_table_version() const noexcept;
 
 public:
     explicit RequestBasePlan(std::unique_ptr<detail::RequestBasePlanImpl<Variant>> impl) noexcept;
@@ -124,6 +127,9 @@ public:
     RequestPlan& operator=(const RequestPlan&) = delete;
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
+    // True when this plan's reuse comes from a content-addressed host table entry (the claim
+    // materializes a fresh device bundle and therefore requires an EMPTY lane).
+    [[nodiscard]] bool uses_host_entry() const noexcept;
 
 public:
     // Family-private construction/storage seam. This header is repository-internal; exact
@@ -154,7 +160,8 @@ public:
                                       const RequestPlan<Variant>& plan) const noexcept;
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,
-                                           const RequestPlan<Variant>& plan) const noexcept;
+                                           const RequestPlan<Variant>& plan,
+                                           bool evict_self = false) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPrompt&& prompt,
@@ -172,17 +179,25 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
-    // Polls in-flight retain D2H transfers at an executor boundary: a completed transfer parks
-    // its copies in the host arena and returns the device pages to the pool (or, when the lane
-    // moved on first, just drops the host extent). Returns the lanes whose host-retained state
-    // was discarded by an LRU host eviction since the last call, so the executor can invalidate
-    // their lane plans. No-op while the host cache is disabled.
-    [[nodiscard]] std::span<const std::uint32_t> harvest_host_retains();
-    // Blocks until any in-flight retain D2H on `lane` is finalized (the prefix becomes
-    // host-resident and its device pages are released); no-op when no transfer is in flight.
-    // Admission planning calls it before reading the lane's retained state so a just-finished
-    // conversation is visible to the reuse pass instead of being destroyed by a FullReset.
+    // Polls in-flight retain D2H transfers at an executor boundary: a completed transfer
+    // publishes its self-contained entry into the content-addressed host table (releasing the
+    // lane entirely and returning the device pages to the pool), or, when the lane moved on
+    // first, just drops the host extents. No-op while the host cache is disabled. Callers
+    // re-plan queued requests against the new host_table_version().
+    void harvest_host_retains();
+    // Blocks until the given lane's in-flight retain D2H (if any) is finalized.
     void wait_host_retain(std::uint32_t lane);
+    // Blocks until every in-flight retain D2H is finalized. Admission planning calls it before
+    // reading the table so a just-finished conversation is visible to the content pass instead
+    // of being destroyed mid-transfer.
+    void wait_all_host_retains();
+    // Monotonic host-prefix-table mutation counter; a change invalidates plans stamped with an
+    // older version (their referenced entry may have been inserted or evicted).
+    [[nodiscard]] std::uint64_t host_table_version() const noexcept;
+    // Monotonic per-lane generation, bumped when the lane's device state changes in a way that
+    // invalidates cached lane plans (lane cleared, or a host-retain transfer retiring with the
+    // lane going device-retained -> empty).
+    [[nodiscard]] std::uint64_t lane_release_generation(std::uint32_t lane) const noexcept;
     [[nodiscard]] bool has_host_retain_in_flight() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;

@@ -384,6 +384,88 @@ int test_sequential_feasibility() {
     return 0;
 }
 
+int test_raw_extents() {
+    const PagedKVPoolSpec spec = quantized_text_spec();
+    const HostKVPageLayout layout = plan_host_kv_page_layout(spec);
+    const std::size_t page_bytes = layout.page_stride;
+    std::vector<HostKVPageLayout> layouts{layout};
+    HostKVArena arena(1ULL << 20, layouts);
+
+    // A raw extent of an unaligned request size lands on 256-aligned backing and reports the
+    // 256-rounded-up byte count.
+    auto raw = arena.allocate_raw(1000);
+    if (!raw) { failures += fail("raw allocation failed"); return failures; }
+    if (expect_eq(raw->raw_bytes(), 1024, "raw byte count rounded to 256")) { return failures; }
+    if (expect_eq(raw->page_count(), 0, "raw page count")) { return failures; }
+    if (expect_eq(arena.occupied_bytes(), 1024, "occupied is exact bytes")) { return failures; }
+    const HostKVAllocationView rv = arena.raw_view(*raw);
+    if (!rv.valid() || rv.data() == nullptr) { failures += fail("raw view invalid"); return failures; }
+    if (expect_eq(rv.raw_bytes(), 1024, "raw view byte count")) { return failures; }
+    if (reinterpret_cast<std::uintptr_t>(rv.data()) % 256 != 0) {
+        failures += fail("raw extent not 256-aligned");
+        return failures;
+    }
+
+    // Raw and page runs share one budget and free-extent pool: the page run lands first-fit
+    // after the raw extent, and the combined feasibility simulation agrees.
+    auto page = arena.allocate(layout, 4);
+    if (!page) { failures += fail("page allocation beside raw failed"); return failures; }
+    if (expect_eq(arena.occupied_bytes(), 1024 + 4 * page_bytes, "combined occupied")) {
+        return failures;
+    }
+    page.reset();
+    if (!raw || !raw->raw_bytes()) { failures += fail("raw survived page release"); return failures; }
+    if (!arena.raw_view(*raw).valid()) { failures += fail("raw view after page release"); return failures; }
+
+    // Exhaustion: a raw request larger than the whole free span fails and leaves the arena
+    // unchanged.
+    const std::size_t free_now = arena.free_bytes();
+    const std::size_t before = arena.occupied_bytes();
+    if (arena.allocate_raw(free_now + 1)) {
+        failures += fail("raw over capacity succeeded");
+        return failures;
+    }
+    if (expect_eq(arena.occupied_bytes(), before, "failed raw leaves arena unchanged")) {
+        return failures;
+    }
+
+    // raw_view on a page-run allocation throws; subview on a raw extent throws.
+    auto page2 = arena.allocate(layout, 2);
+    if (!page2) { failures += fail("page allocation for view checks"); return failures; }
+    if (expect_throws([&] { (void)arena.raw_view(*page2); }, "raw_view of page run") != 0) {
+        return failures;
+    }
+    if (expect_throws([&] { (void)rv.subview(0, 1); }, "subview of raw extent") != 0) {
+        return failures;
+    }
+
+    // can_allocate_all with a mixed page/raw plan must match a same-order allocation run.
+    raw.reset();
+    page2.reset();
+    const HostKVAllocationPlan over_page{&layout, 8};
+    const HostKVAllocationPlan over_raw{nullptr, 0, 500000};
+    const std::array<HostKVAllocationPlan, 2> mixed_over{over_page, over_raw};
+    // 8 * 135168 + 500000 > 1 MiB -> must be refused.
+    if (arena.can_allocate_all(mixed_over)) {
+        failures += fail("mixed feasibility over capacity");
+        return failures;
+    }
+    const HostKVAllocationPlan ok_page{&layout, 2};
+    const HostKVAllocationPlan ok_raw{nullptr, 0, 200000};
+    const std::array<HostKVAllocationPlan, 2> mixed_ok{ok_page, ok_raw};
+    if (!arena.can_allocate_all(mixed_ok)) {
+        failures += fail("mixed feasibility under capacity");
+        return failures;
+    }
+    auto pa = arena.allocate(layout, 2);
+    auto pb = arena.allocate_raw(200000);
+    if (!pa || !pb) { failures += fail("mixed allocation run"); return failures; }
+    pa.reset();
+    pb.reset();
+    if (expect_eq(arena.occupied_bytes(), 0, "all raw/page extents returned")) { return failures; }
+    return 0;
+}
+
 int main() {
     // Each test function accumulates into the global `failures` and returns the running total;
     // calling them here without += avoids double-counting that total.
@@ -392,6 +474,7 @@ int main() {
     (void)test_closed_layout_set();
     (void)test_fragmentation();
     (void)test_sequential_feasibility();
+    (void)test_raw_extents();
     if (failures == 0) { std::cout << "ok\n"; return 0; }
     std::cerr << failures << " host KV arena check(s) failed\n";
     return 1;

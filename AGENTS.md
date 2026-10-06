@@ -135,6 +135,14 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 
 ## Local operations
 
+The running service (`ai-server` systemd unit, `build-host-retained/apps/ninfer-serve`) serves
+real conversations on both GPUs. Any test that needs the GPUs exclusively must be a single
+self-contained script that does the full `service ai-server stop → test → service ai-server
+start` sequence with the restart in an EXIT trap, so the service comes back even when the
+test fails, times out, or the script is killed mid-run. Never stop the service across separate
+commands or leave it stopped while waiting for user input; if a stop is observed without a
+matching restart step, restart it immediately. Pattern: `scripts/run-host-kv-gate.sh`.
+
 Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual resource pressure
 causes failures or interferes with the task, and briefly explain why.
 

@@ -117,6 +117,14 @@ std::uint32_t HostKVAllocation::page_count() const noexcept {
     return descriptor.active && descriptor.generation == generation_ ? descriptor.pages : 0;
 }
 
+std::size_t HostKVAllocation::raw_bytes() const noexcept {
+    if (!arena_ || descriptor_ >= arena_->descriptors_.size()) { return 0; }
+    const HostKVArena::Descriptor& descriptor = arena_->descriptors_[descriptor_];
+    return descriptor.active && descriptor.raw && descriptor.generation == generation_
+               ? descriptor.bytes
+               : 0;
+}
+
 bool HostKVAllocation::release() noexcept {
     if (!arena_) { return false; }
     const bool released = arena_->release_descriptor(descriptor_, generation_);
@@ -208,13 +216,8 @@ bool HostKVArena::can_allocate_all(std::span<const HostKVAllocationPlan> plan) c
     // takes the first extent large enough and consumes its front, exactly as allocate() does.
     auto extents = free_extents_;
     for (const HostKVAllocationPlan& entry : plan) {
-        if (entry.layout == nullptr || entry.pages == 0 || !find_layout(*entry.layout) ||
-            entry.layout->page_stride >
-                std::numeric_limits<std::size_t>::max() / entry.pages) {
-            return false;
-        }
-        const std::size_t bytes =
-            entry.layout->page_stride * static_cast<std::size_t>(entry.pages);
+        const std::size_t bytes = plan_bytes(entry);
+        if (bytes == 0) { return false; }
         bool placed = false;
         for (std::size_t index = 0; index < extents.size(); ++index) {
             if (extents[index].bytes < bytes) { continue; }
@@ -227,6 +230,21 @@ bool HostKVArena::can_allocate_all(std::span<const HostKVAllocationPlan> plan) c
         if (!placed) { return false; }
     }
     return true;
+}
+
+std::size_t HostKVArena::plan_bytes(const HostKVAllocationPlan& entry) const noexcept {
+    if (entry.raw_bytes != 0) {
+        if (entry.layout != nullptr || entry.pages != 0) { return 0; }
+        const std::size_t mask = kHostKVAlignment - 1;
+        if (entry.raw_bytes > std::numeric_limits<std::size_t>::max() - mask) { return 0; }
+        return (entry.raw_bytes + mask) & ~mask;
+    }
+    if (entry.layout == nullptr || entry.pages == 0 || !find_layout(*entry.layout) ||
+        entry.layout->page_stride >
+            std::numeric_limits<std::size_t>::max() / entry.pages) {
+        return 0;
+    }
+    return entry.layout->page_stride * static_cast<std::size_t>(entry.pages);
 }
 
 std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& layout,
@@ -256,7 +274,38 @@ std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& la
     descriptor.layout      = *layout_index;
     descriptor.pages       = pages;
     descriptor.active      = true;
+    descriptor.raw         = false;
     occupied_bytes_ += bytes;
+    bump_revision();
+    return HostKVAllocation(*this, descriptor_index, descriptor.generation);
+}
+
+std::optional<HostKVAllocation> HostKVArena::allocate_raw(std::size_t bytes) noexcept {
+    if (bytes == 0 || free_descriptors_.empty()) { return std::nullopt; }
+    const std::size_t mask = kHostKVAlignment - 1;
+    if (bytes > std::numeric_limits<std::size_t>::max() - mask) { return std::nullopt; }
+    const std::size_t extent_bytes = (bytes + mask) & ~mask;
+    const std::optional<std::size_t> free_index = find_free_extent(extent_bytes);
+    if (!free_index) { return std::nullopt; }
+
+    const std::uint32_t descriptor_index = take_descriptor();
+    if (descriptor_index == std::numeric_limits<std::uint32_t>::max()) { return std::nullopt; }
+    FreeExtent& free         = free_extents_[*free_index];
+    const std::size_t offset = free.offset;
+    free.offset += extent_bytes;
+    free.bytes -= extent_bytes;
+    if (free.bytes == 0) {
+        free_extents_.erase(free_extents_.begin() + static_cast<std::ptrdiff_t>(*free_index));
+    }
+
+    Descriptor& descriptor = descriptors_[descriptor_index];
+    descriptor.offset      = offset;
+    descriptor.bytes       = extent_bytes;
+    descriptor.layout      = 0;
+    descriptor.pages       = 0;
+    descriptor.active      = true;
+    descriptor.raw         = true;
+    occupied_bytes_ += extent_bytes;
     bump_revision();
     return HostKVAllocation(*this, descriptor_index, descriptor.generation);
 }
@@ -268,6 +317,15 @@ HostKVAllocationView HostKVArena::view(const HostKVAllocation& allocation) const
     const Descriptor& descriptor = descriptors_[allocation.descriptor_];
     return HostKVAllocationView(this, revision_, allocation_data(descriptor),
                                 &layouts_[descriptor.layout], descriptor.pages);
+}
+
+HostKVAllocationView HostKVArena::raw_view(const HostKVAllocation& allocation) const {
+    if (!allocation.valid() || allocation.raw_bytes() == 0) {
+        throw std::invalid_argument("Cannot raw-view a non-raw Host KV allocation");
+    }
+    const Descriptor& descriptor = descriptors_[allocation.descriptor_];
+    return HostKVAllocationView(this, revision_, allocation_data(descriptor),
+                                descriptor.bytes);
 }
 
 bool HostKVArena::view_matches(const HostKVAllocationView& view) const noexcept {
@@ -300,6 +358,7 @@ bool HostKVArena::release_descriptor(std::uint32_t descriptor_index,
     descriptor.offset = 0;
     descriptor.bytes  = 0;
     descriptor.pages  = 0;
+    descriptor.raw    = false;
     increment_generation(descriptor.generation);
     free_descriptors_.push_back(descriptor_index);
     insert_free_extent(released);

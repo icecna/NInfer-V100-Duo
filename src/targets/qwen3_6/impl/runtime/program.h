@@ -71,6 +71,12 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
+    // Lane-independent content match against the host prefix table, found at base-plan time and
+    // bound to the chosen lane by plan_request_for_lane. Versioned against the table so the
+    // executor can re-plan after the entry was inserted or evicted in the meantime.
+    std::optional<qwen3_6::detail::HostPrefixId> host_entry = std::nullopt;
+    std::uint32_t host_reuse_base = 0;
+    std::uint64_t host_table_version = 0;
 };
 
 template <>
@@ -78,6 +84,10 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
     NINFER_QWEN36_RUNTIME_NS::ReusePath reuse = NINFER_QWEN36_RUNTIME_NS::ReusePath::FullReset;
     std::uint32_t reuse_base                  = 0;
+    // Host table entry this plan claims (set when the reuse comes from the content-addressed
+    // table instead of the lane's own device-resident prefix). start_prefill_lane restores it
+    // into the lane before the reuse path runs.
+    std::optional<qwen3_6::detail::HostPrefixId> host_entry = std::nullopt;
     NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
         NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;
@@ -139,21 +149,20 @@ struct SequenceKVBundle {
     std::optional<PagedKVAllocation> backend_peer;
 };
 
-// Physical home of a retained lane's paged KV. `Device` is the historical behavior (pages stay in
-// the pool until the lane is evicted); `Host` means the pages were copied to the per-device host
-// arena at the terminal boundary and released back to the pool; `HostTransferIn` is the in-flight
-// window between the D2H enqueue and its completion, during which the device pages are still held
-// and the lane behaves exactly like `Device`. GDN linear state is NOT part of this residency: it
-// lives in the lane's own per-lane device slot forever, which is what keeps lane-affine reuse valid
-// across a host round trip.
+// Physical home of a retained lane's paged KV. `Device` is the retain-skip case (the prefix did
+// not fit the host arena, or host backing is disabled): pages stay in the pool until the lane
+// is evicted, and reuse is lane-affine. `HostTransferIn` is the in-flight window between the D2H
+// enqueue and its completion, during which the device pages are still held and the lane behaves
+// exactly like `Device`. When the transfer completes the entry is inserted into the content-
+// addressed table and the lane is released entirely (no `Host` residency state exists).
 enum class RetainedResidency : std::uint8_t {
     None,
     Device,
-    Host,
     HostTransferIn,
 };
 
-// The completed host copies of a `RetainedResidency::Host` lane, one arena allocation per device
+// The completed host copies of a retained prefix (a content-addressed table entry), one arena
+// allocation per device
 // pool. Page counts live in the allocations themselves. Empty unless `Host`.
 struct HostKVResidency {
     std::optional<HostKVAllocation> text_local;
@@ -162,15 +171,26 @@ struct HostKVResidency {
     std::optional<HostKVAllocation> backend_peer;
 };
 
-// Production payload of the content-addressed host prefix table (P1): the completed D2H copies
-// owned by one retained prefix. P1 keeps lane affinity -- the planner still matches the lane's
-// own ledger/identity and claims only from that lane's entry; the entry records its origin lane
-// so an LRU eviction can release the lane's control state. P2 replaces by-lane lookup with
-// content matching and frees the lane from the entry entirely.
+// Production payload of the content-addressed host prefix table (P2): a self-contained snapshot
+// of one completed prefix. The entry owns every arena extent and no lane state references it,
+// so ANY idle lane can claim it (cross-lane reuse). Content is the identity: the full frontier
+// tokens plus the resident prefix identity the planner matches, and the bit-exact state copies
+// the claim path restores:
+//   - paged KV (text pool + MTP backend pool, per device);
+//   - the GDN linear-attention CURRENT slot (per device, linear_state_slot_bytes layout);
+//   - the rank-0 tail hidden vector (MTP bridge / zero-suffix sampling input).
+// Rewrite-checkpoint state is NOT snapshotted: a prompt that only reaches the checkpoint
+// frontier (the history diverged after it) misses and recomputes cold.
 struct HostPrefixResidency {
     using Prompt = PreparedPromptData;
     HostKVResidency kv;
-    std::uint32_t origin_lane  = 0;
+    std::vector<TokenId> tokens;
+    qwen3_6::detail::ResidentPrefixIdentity identity;
+    std::optional<HostKVAllocation> gdn_local;
+    std::optional<HostKVAllocation> gdn_peer;
+    std::optional<HostKVAllocation> tail_local;
+    std::size_t tail_bytes     = 0;
+    std::uint32_t origin_lane  = 0; // observability only; claims are lane-free
     std::size_t reuse_boundary = 0;
 };
 
@@ -215,10 +235,6 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     RetainedResidency retained_residency = RetainedResidency::None;
-    // Table entry holding this lane's retained prefix in the host arenas (residency Host). The
-    // entry, not the lane, owns the arena extents; the lane keeps the ledger/identity/checkpoint
-    // the planner matches. Unset unless `retained_residency == Host`.
-    std::optional<qwen3_6::detail::HostPrefixId> host_entry = std::nullopt;
     RewriteCheckpoint rewrite_checkpoint;
 };
 
@@ -295,8 +311,8 @@ public:
                                                     const RequestBasePlan& base);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
     [[nodiscard]] bool
-    can_admit_lane_after_retained_eviction(std::uint32_t lane,
-                                           const RequestPlan& plan) const noexcept;
+    can_admit_lane_after_retained_eviction(std::uint32_t lane, const RequestPlan& plan,
+                                           bool evict_self = false) const noexcept;
     [[nodiscard]] runtime::AdmissionResources admission_capacity() const noexcept;
     [[nodiscard]] runtime::PrefillStepResult start_prefill_lane(std::uint32_t lane,
                                                                 PreparedPromptData&& prompt,
@@ -312,19 +328,24 @@ public:
                                std::span<const std::uint8_t> terminal,
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
+    [[nodiscard]] std::uint64_t lane_release_generation(std::uint32_t lane) const noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     // Polls in-flight retain D2H transfers; a completed transfer releases its device pages and
-    // parks the copies in the host arena (or, when the lane moved on first, just drops the host
-    // extent). Called at every executor boundary; returns the lanes whose retained state was
-    // discarded by an LRU host eviction this call, so the executor can invalidate their plans.
-    [[nodiscard]] std::span<const std::uint32_t> harvest_host_retains();
-    // Blocks until any in-flight retain D2H on `lane` is finalized: the prefix becomes
-    // host-resident and its device pages are released. No-op when the lane has no in-flight
-    // transfer. Admission planning calls this before reading the lane's retained state so a
-    // just-finished conversation is never missed by the reuse pass (an in-flight lane would
-    // otherwise read as an unreusable device retain and be destroyed by a FullReset admission).
+    // publishes the entry into the content-addressed table (releasing the lane entirely), or,
+    // when the lane moved on first, just drops the host extents. Called at every executor
+    // boundary; the executor re-plans queued requests against the new host_table_version().
+    void harvest_host_retains();
+    // Blocks until the given lane's in-flight retain D2H (if any) is finalized.
     void wait_host_retain(std::uint32_t lane);
+    // Blocks until every in-flight retain D2H is finalized. Admission planning calls this
+    // before reading the table so a just-finished conversation is never missed by the content
+    // pass and an in-flight prefix is never destroyed mid-transfer.
+    void wait_all_host_retains();
+    // Monotonic table mutation counter (see `host_table_version_`).
+    [[nodiscard]] std::uint64_t host_table_version() const noexcept {
+        return host_table_version_;
+    }
     [[nodiscard]] bool has_host_retain_in_flight() const noexcept;
     [[nodiscard]] std::size_t host_kv_cache_capacity() const noexcept;
     [[nodiscard]] std::size_t host_kv_cache_used_bytes() const noexcept;
@@ -401,15 +422,16 @@ public:
 
     // Host-backed retained prefixes. `host_kv_cache_bytes` is the TOTAL across devices; each
     // arena holds its own device's share. Zero disables the whole feature and every host path
-    // below is a no-op (retains stay device-resident exactly as before). The arenas are
-    // declared BEFORE `sequences` and the transfer table below so that the HostKVAllocations
-    // those members hold release into still-live arenas at destruction. The prefix table is
-    // declared first of all: its entries also hold HostKVAllocations.
-    qwen3_6::detail::HostPrefixTable<HostPrefixResidency> host_prefixes;
-    std::uint64_t host_prefix_id_counter = 0;
+    // below is a no-op (retains stay device-resident exactly as before). Destruction is in
+    // reverse declaration order, so every member that owns HostKVAllocations -- the prefix
+    // table, `sequences`, and the transfer table -- MUST be declared AFTER the arenas: an
+    // allocation released from a destroyed arena writes into freed free-extent/descriptor
+    // vectors and corrupts the heap.
     std::size_t host_kv_cache_bytes = 0;
     std::optional<HostKVArena> host_kv_arena;
     std::optional<HostKVArena> host_kv_arena_peer;
+    qwen3_6::detail::HostPrefixTable<HostPrefixResidency> host_prefixes;
+    std::uint64_t host_prefix_id_counter = 0;
 
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;
@@ -432,15 +454,24 @@ public:
         std::optional<HostKVAllocation> text_peer;
         std::optional<HostKVAllocation> backend_local;
         std::optional<HostKVAllocation> backend_peer;
+        std::optional<HostKVAllocation> gdn_local;
+        std::optional<HostKVAllocation> gdn_peer;
+        std::optional<HostKVAllocation> tail_local;
         bool abandoned = false;
     };
     std::array<std::optional<HostRetainTransfer>, kMaximumConcurrency> host_retain_transfers{};
+    // Per-lane monotonically increasing generation, bumped whenever a lane's device state
+    // changes in a way that invalidates cached lane plans: clearing a lane (any eviction,
+    // completion) and a host-retain transfer retiring (the lane goes device-retained ->
+    // empty). The executor stamps this generation into its cached lane plans instead of
+    // tracking the events itself.
+    std::array<std::uint64_t, kMaximumConcurrency> lane_release_generation_{};
     std::uint64_t host_lru_counter = 0;
-    // Lanes whose host-retained state was discarded by an LRU host eviction since the last
-    // harvest; harvest moves this into `host_eviction_report` and hands it to the executor for
-    // lane-plan invalidation.
-    std::vector<std::uint32_t> host_eviction_pending;
-    std::vector<std::uint32_t> host_eviction_report;
+    // Bumped on every table mutation (insert, evict, claim-consume). Plans stamp the version at
+    // computation time; a mismatch means a referenced entry may have appeared or disappeared and
+    // the request must re-plan. The version, not lane ids, is the invalidation unit: host
+    // entries no longer occupy lanes.
+    std::uint64_t host_table_version_ = 0;
 
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
@@ -571,8 +602,7 @@ private:
     void init_host_kv_cache(const SequencePlanImpl& plan);
     void retain_host_sequence(SequenceState& sequence, std::uint32_t lane);
     void claim_host_sequence(SequenceState& sequence, const RequestPlanImpl& plan, std::uint32_t base);
-    void release_host_residency(SequenceState& sequence) noexcept;
-    void evict_host_retained_lane(std::uint32_t lane) noexcept;
+    void evict_host_entry(qwen3_6::detail::HostPrefixId id) noexcept;
     void complete_host_transfer(std::uint32_t lane, bool abandoned);
     void copy_kv_pages_to_host(const PagedKVPool& pool, const PagedKVAllocation& allocation,
                                std::uint32_t pages, const HostKVAllocationView& host,

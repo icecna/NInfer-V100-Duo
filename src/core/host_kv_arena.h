@@ -60,6 +60,9 @@ public:
 
     [[nodiscard]] std::uint32_t page_count() const noexcept { return page_count_; }
 
+    // Byte count of a raw (non-page) extent; zero for page-run views.
+    [[nodiscard]] std::size_t raw_bytes() const noexcept { return raw_bytes_; }
+
     [[nodiscard]] const HostKVPageLayout& layout() const;
 
     // View over a sub-run of logical pages; the base pointer lands on the page record.
@@ -73,11 +76,16 @@ private:
         : arena_(arena), revision_(revision), data_(data), layout_(layout),
           page_count_(page_count) {}
 
+    HostKVAllocationView(const HostKVArena* arena, std::uint64_t revision, std::byte* data,
+                         std::size_t raw_bytes) noexcept
+        : arena_(arena), revision_(revision), data_(data), raw_bytes_(raw_bytes) {}
+
     const HostKVArena* arena_ = nullptr;
     std::uint64_t revision_   = 0;
     std::byte* data_        = nullptr;
     const HostKVPageLayout* layout_ = nullptr;
     std::uint32_t page_count_       = 0;
+    std::size_t raw_bytes_          = 0;
 };
 
 // Owning handle to a host allocation inside a HostKVArena. Destructor (or release) returns the
@@ -96,6 +104,9 @@ public:
 
     [[nodiscard]] std::uint32_t page_count() const noexcept;
 
+    // Byte count of a raw (non-page) extent; zero for page runs.
+    [[nodiscard]] std::size_t raw_bytes() const noexcept;
+
     bool release() noexcept;
 
 private:
@@ -112,10 +123,13 @@ private:
     std::uint32_t generation_ = 0;
 };
 
-// One region of an ordered host allocation: a closed-set page layout plus a logical page count.
+// One region of an ordered host allocation: either a closed-set page layout plus a logical page
+// count, or (raw_bytes > 0) a plain byte extent with no page structure. The two forms are
+// mutually exclusive.
 struct HostKVAllocationPlan {
     const HostKVPageLayout* layout = nullptr;
     std::uint32_t pages            = 0;
+    std::size_t raw_bytes           = 0;
 };
 
 // Fixed-capacity arena of pinned host memory handing out logical-page runs for a closed set of
@@ -157,7 +171,15 @@ public:
     [[nodiscard]] std::optional<HostKVAllocation> allocate(const HostKVPageLayout& layout,
                                                            std::uint32_t pages) noexcept;
 
+    // Raw (non-page) extent: a contiguous run of pinned bytes (256-byte aligned) sharing the
+    // same budget and free-extent pool as the page runs. Fails (nullopt) when no free extent
+    // admits the request; the arena is left unchanged.
+    [[nodiscard]] std::optional<HostKVAllocation> allocate_raw(std::size_t bytes) noexcept;
+
     [[nodiscard]] HostKVAllocationView view(const HostKVAllocation& allocation) const;
+
+    // View over a raw extent's bytes; throws for a page-run allocation.
+    [[nodiscard]] HostKVAllocationView raw_view(const HostKVAllocation& allocation) const;
 
 private:
     friend class HostKVAllocation;
@@ -170,6 +192,7 @@ private:
         std::uint32_t pages      = 0;
         std::uint32_t generation = 1;
         bool active              = false;
+        bool raw                  = false;
     };
 
     struct FreeExtent {
@@ -180,6 +203,7 @@ private:
     [[nodiscard]] std::optional<std::uint32_t> find_layout(const HostKVPageLayout& layout)
         const noexcept;
     [[nodiscard]] std::optional<std::size_t> find_free_extent(std::size_t bytes) const noexcept;
+    [[nodiscard]] std::size_t plan_bytes(const HostKVAllocationPlan& entry) const noexcept;
     [[nodiscard]] bool view_matches(const HostKVAllocationView& view) const noexcept;
     [[nodiscard]] std::uint32_t take_descriptor() noexcept;
     [[nodiscard]] bool release_descriptor(std::uint32_t descriptor, std::uint32_t generation)

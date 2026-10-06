@@ -98,6 +98,11 @@ const runtime::RequestPlanSummary& RequestBasePlan<Variant>::summary() const noe
 }
 
 template <>
+std::uint64_t RequestBasePlan<Variant>::host_table_version() const noexcept {
+    return impl_ != nullptr ? impl_->host_table_version : 0;
+}
+
+template <>
 RequestPlan<Variant>::RequestPlan(std::unique_ptr<detail::RequestPlanImpl<Variant>> impl) noexcept
     : impl_(std::move(impl)) {}
 
@@ -112,6 +117,11 @@ template <>
 const runtime::RequestPlanSummary& RequestPlan<Variant>::summary() const noexcept {
     static const runtime::RequestPlanSummary empty;
     return impl_ != nullptr ? impl_->summary : empty;
+}
+
+template <>
+bool RequestPlan<Variant>::uses_host_entry() const noexcept {
+    return impl_ != nullptr && impl_->host_entry.has_value();
 }
 
 template <>
@@ -143,8 +153,8 @@ bool Program<Variant>::can_admit_lane(std::uint32_t lane,
 
 template <>
 bool Program<Variant>::can_admit_lane_after_retained_eviction(
-    std::uint32_t lane, const RequestPlan<Variant>& plan) const noexcept {
-    return impl_->can_admit_lane_after_retained_eviction(lane, plan);
+    std::uint32_t lane, const RequestPlan<Variant>& plan, bool evict_self) const noexcept {
+    return impl_->can_admit_lane_after_retained_eviction(lane, plan, evict_self);
 }
 
 template <>
@@ -202,12 +212,25 @@ void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
-std::span<const std::uint32_t> Program<Variant>::harvest_host_retains() {
-    return impl_->harvest_host_retains();
+void Program<Variant>::harvest_host_retains() {
+    impl_->harvest_host_retains();
 }
 
 template <>
+void Program<Variant>::wait_all_host_retains() { impl_->wait_all_host_retains(); }
+
+template <>
 void Program<Variant>::wait_host_retain(std::uint32_t lane) { impl_->wait_host_retain(lane); }
+
+template <>
+std::uint64_t Program<Variant>::host_table_version() const noexcept {
+    return impl_->host_table_version();
+}
+
+template <>
+std::uint64_t Program<Variant>::lane_release_generation(std::uint32_t lane) const noexcept {
+    return impl_->lane_release_generation(lane);
+}
 
 template <>
 bool Program<Variant>::has_host_retain_in_flight() const noexcept {

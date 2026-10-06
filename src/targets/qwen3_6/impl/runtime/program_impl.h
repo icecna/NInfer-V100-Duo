@@ -528,9 +528,9 @@ ProgramImplCore::~ProgramImplCore() noexcept {
     if (host_copy_stream != nullptr) { (void)cudaStreamDestroy(host_copy_stream); }
     if (host_copy_stream_peer != nullptr) { (void)cudaStreamDestroy(host_copy_stream_peer); }
     // Release host extents only after the copy streams have drained: an in-flight D2H may still
-    // be reading its destination extent, and the arena (a later-declared member) outlives none
-    // of the allocations explicitly here.
-    for (auto& sequence : sequences) { release_host_residency(sequence); }
+    // be reading its destination extent. The prefix table holds its entries' extents until it is
+    // destroyed; it is declared after the arenas, so that release happens into live arenas (see
+    // the member declaration order in program.h).
     for (auto& transfer : host_retain_transfers) { transfer.reset(); }
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         if (host_retain_events[lane][0] != nullptr) {
@@ -567,7 +567,7 @@ bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan
 }
 
 bool ProgramImplCore::can_admit_lane_after_retained_eviction(
-    std::uint32_t lane, const RequestPlan& plan) const noexcept {
+    std::uint32_t lane, const RequestPlan& plan, bool evict_self) const noexcept {
     if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
     const RequestControl& request = requests[lane];
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
@@ -597,7 +597,18 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
     };
 
     const SequenceState& sequence = sequences[lane];
-    const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
+    std::uint32_t old_text  = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
+    std::uint32_t old_backend =
+        sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
+    if (evict_self) {
+        // A host-entry claim requires the selected lane to be EMPTY, so the lane's own retained
+        // KV is released by its eviction rather than replaced in place: count it as reclaimable
+        // and drop the old bundle from the replacement arithmetic.
+        reclaimable_text += old_text;
+        reclaimable_backend += old_backend;
+        old_text    = 0;
+        old_backend = 0;
+    }
     if (!can_replace(decoder->text_kv.pool(), old_text, reclaimable_text,
                      plan.impl_->text_kv_page_entitlement)) {
         return false;
@@ -605,8 +616,6 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
 
     const qwen3_6::PagedKVCache* backend = backend_kv_cache();
     if (backend == nullptr) { return plan.impl_->backend_kv_page_entitlement == 0; }
-    const std::uint32_t old_backend =
-        sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
     return can_replace(backend->pool(), old_backend, reclaimable_backend,
                        plan.impl_->backend_kv_page_entitlement);
 }
@@ -654,6 +663,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         (transient.data == nullptr || transient.size < request_plan.summary.transient_bytes ||
          transient.alignment < request_plan.summary.transient_alignment)) {
         throw std::invalid_argument("request transient region does not satisfy the plan");
+    }
+    // Cross-lane host claim: the plan names a content-addressed table entry. Restore it into
+    // this (empty) lane BEFORE the sequence-dependent validation below so the checks see a
+    // device-resident lane exactly as in the same-lane (P1) case. The plan guarantees the
+    // entry id is still valid (the executor replans on table-version changes) and the lane
+    // is empty (the admission pass does not book a host-entry plan onto an occupied lane).
+    if (request_plan.host_entry) {
+        claim_host_sequence(sequence, request_plan, request_plan.reuse_base);
     }
     if (request_plan.reuse != ReusePath::FullReset &&
         (!sequence.retained ||
@@ -717,23 +734,11 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             : 0U;
     request.lifecycle = Lifecycle::Empty;
     sequence.retained = false;
-    if (sequence.retained_residency == RetainedResidency::Host) {
-        // The prefix lives in the host arena: restore it to device pages before the reuse path
-        // below runs, so every downstream check sees a device-resident lane exactly as before.
-        // The synchronous H2D is the claimed cost of a host claim; the GPU holds no work for
-        // this lane, and the executor is serial by construction.
-        if (request_plan.reuse == ReusePath::FullReset) {
-            release_host_residency(sequence);
-            host_kv_debugf("reset-host lane=%u reason=full-reset occupied=%zu", sequence.lane,
-                           host_kv_cache_used_bytes());
-            sequence.retained_residency = RetainedResidency::None;
-        } else {
-            claim_host_sequence(sequence, request_plan, base);
-        }
-    } else if (sequence.retained_residency == RetainedResidency::HostTransferIn) {
+    if (sequence.retained_residency == RetainedResidency::HostTransferIn) {
         // Device pages are still in place (the transfer is conservative), so the reuse path
         // proceeds unchanged; the in-flight copy is abandoned and its host extent drops back to
-        // the arena when the D2H retires.
+        // the arena when the D2H retires. (Host claims are gone from the lane state: entries
+        // live in the table, and the claim above ran before this point.)
         sequence.retained_residency = RetainedResidency::None;
         if (auto& transfer = host_retain_transfers[sequence.lane]; transfer) {
             transfer->abandoned = true;
@@ -1125,6 +1130,10 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                 // the last tokens.
                 retain_host_sequence(sequence, lanes[row]);
                 request.lifecycle = Lifecycle::Complete;
+                // The lane becomes free again carrying a NEW retained prefix (or a cleared
+                // device state): any lane plan a pending request cached while this lane was
+                // free is now stale and must be rebuilt.
+                ++lane_release_generation_[lanes[row]];
             } else {
                 request.lifecycle = Lifecycle::Active;
             }
@@ -1146,6 +1155,10 @@ void ProgramImplCore::abort_lane(std::uint32_t lane) noexcept {
 
 bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
     return lane < max_concurrency && sequences[lane].retained;
+}
+
+std::uint64_t ProgramImplCore::lane_release_generation(std::uint32_t lane) const noexcept {
+    return lane < max_concurrency ? lane_release_generation_[lane] : 0;
 }
 
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
@@ -1310,20 +1323,42 @@ void ProgramImplCore::complete_host_transfer(std::uint32_t lane, bool abandoned)
         if (!sequence.retained || sequence.retained_residency != RetainedResidency::HostTransferIn) {
             throw std::logic_error("host retain transfer completed for a lane that moved on");
         }
+        // Publish the self-contained entry and release the lane entirely: the entry owns the
+        // arena extents AND the content (tokens/identity) AND the state snapshots (GDN current
+        // slot per device, rank-0 tail hidden), so no lane field survives the round trip.
         sequence.kv.reset();
         HostPrefixResidency residency;
         residency.kv.text_local    = std::move(transfer->text_local);
         residency.kv.text_peer     = std::move(transfer->text_peer);
         residency.kv.backend_local = std::move(transfer->backend_local);
         residency.kv.backend_peer  = std::move(transfer->backend_peer);
+        residency.gdn_local        = std::move(transfer->gdn_local);
+        residency.gdn_peer         = std::move(transfer->gdn_peer);
+        residency.tail_local       = std::move(transfer->tail_local);
+        residency.tail_bytes       = sequence.tail_hidden.bytes();
+        residency.tokens           = std::move(sequence.ledger);
+        residency.identity         = std::move(sequence.prefix_identity);
         residency.origin_lane      = lane;
         residency.reuse_boundary   = sequence.execution_frontier;
         const qwen3_6::detail::HostPrefixId id =
             host_prefixes.insert(std::move(residency),
                                  [this] { return ++host_prefix_id_counter; });
         host_prefixes.stamp(id, ++host_lru_counter);
-        sequence.host_entry         = id;
-        sequence.retained_residency = RetainedResidency::Host;
+        ++host_table_version_;
+        sequence.ledger.clear();
+        sequence.prefix_identity.clear();
+        sequence.execution_frontier  = 0;
+        sequence.ledger_frontier     = 0;
+        sequence.text_kv_valid       = 0;
+        sequence.mtp_kv_valid        = 0;
+        sequence.dflash_context_frontier = 0;
+        sequence.tail_hidden_valid   = false;
+        sequence.retained            = false;
+        sequence.retained_residency  = RetainedResidency::None;
+        sequence.rewrite_checkpoint  = {};
+        // The lane went device-retained -> empty: cached lane plans that saw the old device
+        // state (a reuse on it) are stale and must be rebuilt.
+        ++lane_release_generation_[lane];
     }
     // Abandoned or not, the in-flight record is retired: the host extents release back to the
     // arena NOW that both device events report completion, so no reader or writer of those
@@ -1333,38 +1368,26 @@ void ProgramImplCore::complete_host_transfer(std::uint32_t lane, bool abandoned)
                    abandoned ? 1 : 0, host_kv_cache_used_bytes());
 }
 
-void ProgramImplCore::release_host_residency(SequenceState& sequence) noexcept {
-    // The table entry, not the lane, owns the arena extents; evicting it returns them to the
-    // arenas. Detaching the id alone would leak the resident prefix.
-    if (sequence.host_entry) {
-        host_prefixes.evict(*sequence.host_entry);
-        sequence.host_entry.reset();
-    }
+// Drop one table entry, returning all of its extents to the arenas. Entries are lane-free: no
+// lane state is touched, and plans referencing the entry are invalidated through the table
+// version bump, not through any lane.
+void ProgramImplCore::evict_host_entry(qwen3_6::detail::HostPrefixId id) noexcept {
+    const auto* entry = host_prefixes.find(id);
+    if (entry == nullptr || entry->in_flight_claims != 0) { return; } // readers hold the extents
+    const std::size_t boundary = entry->payload.reuse_boundary;
+    host_prefixes.evict(id);
+    ++host_table_version_;
+    host_kv_debugf("evict entry=%llu boundary=%zu occupied=%zu",
+                   static_cast<unsigned long long>(id), boundary, host_kv_cache_used_bytes());
 }
 
-void ProgramImplCore::evict_host_retained_lane(std::uint32_t lane) noexcept {
-    SequenceState& sequence = sequences[lane];
-    if (!sequence.retained || sequence.retained_residency != RetainedResidency::Host) {
-        return;
-    }
-    // clear_lane releases the host extents (residency Host) and wipes the lane state.
-    clear_lane(sequence, requests[lane]);
-    host_eviction_pending.push_back(lane);
-    host_kv_debugf("evict lane=%u occupied=%zu", lane, host_kv_cache_used_bytes());
-}
-
-std::span<const std::uint32_t> ProgramImplCore::harvest_host_retains() {
-    if (host_kv_cache_bytes == 0) { return {}; }
+void ProgramImplCore::harvest_host_retains() {
+    if (host_kv_cache_bytes == 0) { return; }
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
         if (!host_retain_transfers[lane]) { continue; }
         if (!host_transfer_events_done(lane)) { continue; }
-        const bool abandoned = host_retain_transfers[lane]->abandoned;
-        complete_host_transfer(lane, abandoned);
+        complete_host_transfer(lane, host_retain_transfers[lane]->abandoned);
     }
-    host_eviction_report.clear();
-    for (std::uint32_t lane : host_eviction_pending) { host_eviction_report.push_back(lane); }
-    host_eviction_pending.clear();
-    return host_eviction_report;
 }
 
 void ProgramImplCore::wait_host_retain(std::uint32_t lane) {
@@ -1377,6 +1400,12 @@ void ProgramImplCore::wait_host_retain(std::uint32_t lane) {
     // clear_lane on this same lane (dropped, exactly as the harvest boundary would do).
     host_transfer_drain(lane);
     complete_host_transfer(lane, transfer->abandoned);
+}
+
+void ProgramImplCore::wait_all_host_retains() {
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        wait_host_retain(lane);
+    }
 }
 
 bool ProgramImplCore::has_host_retain_in_flight() const noexcept {
@@ -1407,6 +1436,17 @@ std::size_t ProgramImplCore::host_kv_cache_used_bytes() const noexcept {
 void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_t lane) {
     if (host_kv_cache_bytes == 0) { return; }
     if (!sequence.kv) { host_kv_debugf("retain-skip lane=%u reason=no-kv", lane); return; }
+    // The DFlash backend state is cyclic cache state that the entry cannot snapshot; a host
+    // entry from a DFlash program would be unusable for the append path, so retain is skipped
+    // and the prefix stays device-resident (evictable as before).
+    if (speculative_backend == SpeculativeBackend::DFlash) {
+        host_kv_debugf("retain-skip lane=%u reason=dflash-backend", lane);
+        return;
+    }
+    if (!sequence.tail_hidden_valid) {
+        host_kv_debugf("retain-skip lane=%u reason=no-tail", lane);
+        return;
+    }
     const std::uint32_t text_pages = sequence.kv->text.mapped_page_count();
     if (text_pages == 0) { host_kv_debugf("retain-skip lane=%u reason=empty", lane); return; }
     const std::uint32_t backend_pages =
@@ -1436,26 +1476,37 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         return;
     }
 
-    // Sequential feasibility per arena: text (always) plus the backend when present. Each
-    // region needs its own contiguous free extent; the sequential simulation must agree with
-    // the real ordered allocation that follows, so per-region can_allocate is NOT enough
-    // (it over-approximates when the regions' combined size exceeds the largest free extent
-    // while each region alone fits). The peer branch mirrors the real allocation's outer
-    // `if (have_peer)` guard exactly: the bundle constructor always creates text_peer with the
-    // peer rank, so have_peer_backend && !have_peer is unreachable by construction.
+    // Sequential feasibility per arena: text (always), the backend when present, the GDN
+    // current-slot snapshot (always; it is what makes the entry claimable on ANY lane once the
+    // origin lane is released), and the rank-0 tail hidden (always; MTP bridge and zero-suffix
+    // sampling need it). Each region needs its own contiguous free extent; the sequential
+    // simulation must agree with the real ordered allocation that follows, so per-region
+    // can_allocate is NOT enough (it over-approximates when the regions' combined size exceeds
+    // the largest free extent while each region alone fits). The peer branch mirrors the real
+    // allocation's outer `if (have_peer)` guard exactly: the bundle constructor always creates
+    // text_peer with the peer rank, so have_peer_backend && !have_peer is unreachable by
+    // construction.
+    const std::size_t gdn_local_bytes =
+        linear_state_slot_bytes(decoder->linear_attention.spec);
+    const std::size_t gdn_peer_bytes =
+        have_peer ? linear_state_slot_bytes(peer->decoder->linear_attention.spec) : 0;
+    const std::size_t tail_bytes = sequence.tail_hidden.bytes();
     const auto fits = [&]() {
-        std::array<HostKVAllocationPlan, 2> local_plan{{text_layout, text_pages}};
+        std::array<HostKVAllocationPlan, 4> local_plan{{text_layout, text_pages}};
         std::size_t local_regions = 1;
         if (have_backend) { local_plan[local_regions++] = {backend_layout, backend_pages}; }
+        local_plan[local_regions++] = {nullptr, 0, gdn_local_bytes};
+        local_plan[local_regions++] = {nullptr, 0, tail_bytes};
         if (!host_kv_arena->can_allocate_all({local_plan.data(), local_regions})) {
             return false;
         }
         if (have_peer) {
-            std::array<HostKVAllocationPlan, 2> peer_plan{{peer_text_layout, text_pages}};
+            std::array<HostKVAllocationPlan, 3> peer_plan{{peer_text_layout, text_pages}};
             std::size_t peer_regions = 1;
             if (have_peer_backend) {
                 peer_plan[peer_regions++] = {peer_backend_layout, backend_pages};
             }
+            peer_plan[peer_regions++] = {nullptr, 0, gdn_peer_bytes};
             if (!host_kv_arena_peer->can_allocate_all({peer_plan.data(), peer_regions})) {
                 return false;
             }
@@ -1464,15 +1515,17 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
     };
     std::vector<std::uint32_t> evicted;
     while (!fits()) {
-        // Evict the oldest stamped table entry; its origin lane's control state is released
-        // with it. In-flight lanes have no entry and cannot be victims. The current lane has no
-        // entry yet (its own retain inserts one at transfer completion), so no exclusion is
-        // needed. Single-threaded executor: release-then-allocate can never observe a torn
-        // arena state.
+        // Evict the oldest stamped table entry. Entries are lane-free (their origin lane was
+        // released when the entry was published), so eviction never touches a lane; queued
+        // plans referencing the entry are invalidated through the table version. In-flight
+        // entries are unevictable; the current lane has no entry yet (its own retain inserts
+        // one at transfer completion), so no exclusion is needed. Single-threaded executor:
+        // release-then-allocate can never observe a torn arena state.
         const auto* victim = host_prefixes.oldest_evictable();
         if (victim == nullptr) { break; }
-        evict_host_retained_lane(victim->payload.origin_lane);
-        evicted.push_back(victim->payload.origin_lane);
+        const std::uint32_t victim_lane = victim->payload.origin_lane;
+        evict_host_entry(victim->id);
+        evicted.push_back(victim_lane);
     }
     if (!fits()) {
         host_kv_debugf("retain-skip lane=%u reason=capacity", lane);
@@ -1487,38 +1540,39 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
     }
 
     HostRetainTransfer& transfer = host_retain_transfers[lane].emplace();
-    transfer.text_local = host_kv_arena->allocate(*text_layout, text_pages);
-    if (!transfer.text_local) {
+    auto fail_allocate = [&] {
         host_retain_transfers[lane].reset();
-        throw std::logic_error("host KV retain allocation failed after feasibility check");
-    }
+        throw std::logic_error("host retain allocation failed after feasibility check");
+    };
+    transfer.text_local = host_kv_arena->allocate(*text_layout, text_pages);
+    if (!transfer.text_local) { fail_allocate(); }
     if (have_backend) {
         transfer.backend_local = host_kv_arena->allocate(*backend_layout, backend_pages);
-        if (!transfer.backend_local) {
-            host_retain_transfers[lane].reset();
-            throw std::logic_error("host KV retain allocation failed after feasibility check");
-        }
+        if (!transfer.backend_local) { fail_allocate(); }
     }
+    transfer.gdn_local = host_kv_arena->allocate_raw(gdn_local_bytes);
+    if (!transfer.gdn_local) { fail_allocate(); }
+    transfer.tail_local = host_kv_arena->allocate_raw(tail_bytes);
+    if (!transfer.tail_local) { fail_allocate(); }
     if (have_peer) {
         const ScopedDevice scope(peer->device.device);
         transfer.text_peer = host_kv_arena_peer->allocate(*peer_text_layout, text_pages);
-        if (!transfer.text_peer) {
-            host_retain_transfers[lane].reset();
-            throw std::logic_error("peer host KV retain allocation failed after feasibility check");
-        }
+        if (!transfer.text_peer) { fail_allocate(); }
         if (have_peer_backend) {
             transfer.backend_peer = host_kv_arena_peer->allocate(*peer_backend_layout,
                                                                  backend_pages);
-            if (!transfer.backend_peer) {
-                host_retain_transfers[lane].reset();
-                throw std::logic_error(
-                    "peer host KV retain allocation failed after feasibility check");
-            }
+            if (!transfer.backend_peer) { fail_allocate(); }
         }
+        transfer.gdn_peer = host_kv_arena_peer->allocate_raw(gdn_peer_bytes);
+        if (!transfer.gdn_peer) { fail_allocate(); }
     }
 
     // The copies run on the dedicated pinned-transfer streams behind a gate on the compute
-    // stream, so they cannot stall the other lanes' rounds; the events arm on the copy streams.
+    // stream, so they cannot stall the other lanes' rounds; the events arm on the copy
+    // streams. The GDN snapshot and tail hidden ride the same gate: at the terminal both are
+    // final, and they are exactly the state the cross-lane claim restores.
+    const std::int32_t state_slot =
+        LinearStateSlots::current_state_slot(lane, max_concurrency);
     CUDA_CHECK(cudaEventRecord(host_copy_gate, device.stream));
     CUDA_CHECK(cudaStreamWaitEvent(host_copy_stream, host_copy_gate, 0));
     copy_kv_pages_to_host(decoder->text_kv.pool(), sequence.kv->text, text_pages,
@@ -1527,6 +1581,12 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         copy_kv_pages_to_host(backend_kv_cache()->pool(), *sequence.kv->backend, backend_pages,
                               host_kv_arena->view(*transfer.backend_local), host_copy_stream);
     }
+    snapshot_linear_state_slot_to_host(decoder->linear_attention, state_slot,
+                                       host_kv_arena->raw_view(*transfer.gdn_local).data(),
+                                       host_copy_stream);
+    CUDA_CHECK(cudaMemcpyAsync(host_kv_arena->raw_view(*transfer.tail_local).data(),
+                               sequence.tail_hidden.data, tail_bytes, cudaMemcpyDeviceToHost,
+                               host_copy_stream));
     if (have_peer) {
         const ScopedDevice scope(peer->device.device);
         CUDA_CHECK(cudaEventRecord(host_copy_gate_peer, peer->device.stream));
@@ -1539,6 +1599,9 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
                                   host_kv_arena_peer->view(*transfer.backend_peer),
                                   host_copy_stream_peer);
         }
+        snapshot_linear_state_slot_to_host(peer->decoder->linear_attention, state_slot,
+                                           host_kv_arena_peer->raw_view(*transfer.gdn_peer).data(),
+                                           host_copy_stream_peer);
     }
     CUDA_CHECK(cudaEventRecord(host_retain_events[lane][0], host_copy_stream));
     if (peer) { CUDA_CHECK(cudaEventRecord(host_retain_events[lane][1], host_copy_stream_peer)); }
@@ -1563,22 +1626,37 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
 
 void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const RequestPlanImpl& plan,
                                           std::uint32_t base) {
-    // The caller verified residency == Host and reuse != FullReset. Restore exactly the prefix
-    // the reuse path consumes: the first `base` text tokens, and (MTP) the first `base - 1`
-    // backend tokens, which is the most any reuse path may read (the plan guarantees
-    // mtp_kv_valid >= base - 1).
-    const qwen3_6::detail::HostPrefixId entry_id = *sequence.host_entry;
+    // Cross-lane claim: the plan names the entry, and the lane it lands on is whatever idle
+    // lane the executor chose -- no affinity to the origin lane. The lane must be EMPTY (no
+    // retained state of any kind): a lane still holding device KV would be double-booked by
+    // the fresh bundle, and the executor's admission pass guarantees this (a host-entry plan
+    // only lands on an empty lane or through the retained-eviction pass).
+    if (!plan.host_entry) {
+        throw std::logic_error("host claim plan references no table entry");
+    }
+    if (sequence.kv || sequence.retained || sequence.retained_residency != RetainedResidency::None) {
+        throw std::logic_error("host claim landed on a lane that is not empty");
+    }
+    const qwen3_6::detail::HostPrefixId entry_id = *plan.host_entry;
     qwen3_6::detail::HostPrefixEntry<HostPrefixResidency>* entry = host_prefixes.find(entry_id);
     if (entry == nullptr) {
         throw std::logic_error("host prefix entry missing at claim");
     }
+    const HostPrefixResidency& payload = entry->payload;
+    if (payload.reuse_boundary < base || base == 0) {
+        throw std::logic_error("host claim base exceeds the entry frontier");
+    }
     host_prefixes.begin_claim(entry_id);
-    const HostKVResidency& host = entry->payload.kv;
+    host_prefixes.stamp(entry_id, ++host_lru_counter);
+    const HostKVResidency& host = payload.kv;
     const std::uint32_t text_pages    = pages_for_tokens(base);
     const std::uint32_t backend_pages =
         (speculative_backend == SpeculativeBackend::Mtp && base > 0) ? pages_for_tokens(base - 1)
                                                                      : 0U;
     const auto claim_start = Clock::now();
+    const std::size_t gdn_local_bytes = linear_state_slot_bytes(decoder->linear_attention.spec);
+    const std::size_t gdn_peer_bytes =
+        payload.gdn_peer ? linear_state_slot_bytes(peer->decoder->linear_attention.spec) : 0;
     const std::size_t claim_bytes = [&] {
         std::size_t bytes = 0;
         if (text_pages > 0) {
@@ -1600,6 +1678,7 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
                 if (lbp) { bytes += static_cast<std::size_t>(backend_pages) * lbp->page_stride; }
             }
         }
+        bytes += gdn_local_bytes + gdn_peer_bytes + payload.tail_bytes;
         return bytes;
     }();
     reserve_sequence_kv(sequence, plan.text_kv_page_entitlement, plan.backend_kv_page_entitlement);
@@ -1643,10 +1722,47 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
                                         peer->device.stream);
             }
         }
-        // The reuse path below issues KV reads on both streams; the claim must be settled before
-        // the first of them.
+        // GDN current state and the rank-0 tail hidden: the bit-exact state the reuse path
+        // reads, restored into THIS lane's slots. The target lane's previous slot contents are
+        // stale by construction (the lane was empty), so no pre-zeroing is needed.
+        const std::int32_t state_slot =
+            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+        if (!payload.gdn_local) {
+            throw std::logic_error("host entry has no GDN snapshot");
+        }
+        restore_linear_state_slot_from_host(decoder->linear_attention, state_slot,
+                                            host_kv_arena->raw_view(*payload.gdn_local).data(),
+                                            device.stream);
+        if (payload.gdn_peer) {
+            if (!peer) {
+                throw std::logic_error("host entry has a peer GDN snapshot without a peer rank");
+            }
+            const ScopedDevice scope(peer->device.device);
+            restore_linear_state_slot_from_host(peer->decoder->linear_attention, state_slot,
+                                                host_kv_arena_peer->raw_view(*payload.gdn_peer).data(),
+                                                peer->device.stream);
+        }
+        if (payload.tail_bytes != 0 && payload.tail_local) {
+            CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data,
+                                       host_kv_arena->raw_view(*payload.tail_local).data(),
+                                       payload.tail_bytes, cudaMemcpyHostToDevice,
+                                       device.stream));
+        }
+        // The reuse path below issues KV reads on both streams; the claim must be settled
+        // before the first of them.
         if (peer) { CUDA_CHECK(cudaStreamSynchronize(peer->device.stream)); }
         CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        // Install the entry's content so every downstream check sees a device-resident lane
+        // exactly as if the prefix had never left. The GDN slot, KV and tail are settled above.
+        sequence.ledger = payload.tokens;
+        sequence.prefix_identity = payload.identity;
+        sequence.execution_frontier = payload.reuse_boundary;
+        sequence.ledger_frontier    = payload.reuse_boundary;
+        sequence.text_kv_valid      = payload.reuse_boundary;
+        sequence.mtp_kv_valid       = payload.reuse_boundary;
+        sequence.tail_hidden_valid  = payload.tail_bytes != 0 && payload.tail_local.has_value();
+        sequence.retained           = true;
+        sequence.retained_residency = RetainedResidency::Device;
     } catch (...) {
         host_prefixes.end_claim(entry_id);
         unbind_sequence_kv(sequence);
@@ -1656,13 +1772,17 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
     const double h2d_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - claim_start).count();
     host_prefixes.end_claim(entry_id);
-    // Lane semantics destroy the prefix once claimed (the lane goes active); evict the entry
-    // so its extents return to the arenas exactly as the lane-owned copies used to.
-    release_host_residency(sequence);
-    sequence.retained_residency = RetainedResidency::None;
-    host_kv_debugf("claim lane=%u entry=%llu text_pages=%u backend_pages=%u bytes=%zu h2d_ms=%.3f occupied=%zu",
-                   sequence.lane, static_cast<unsigned long long>(entry_id), text_pages, backend_pages,
-                   claim_bytes, h2d_ms, host_kv_cache_used_bytes());
+    // Consume: the lane now owns the prefix on device (it goes active, and a later terminal
+    // re-retains a fresh snapshot). Evict the entry so its extents return to the arenas; the
+    // evict is a no-op when a concurrent claim still holds it (that claim consumes it instead)
+    // or when LRU already evicted it. The table version bump invalidates plans that still
+    // reference the id.
+    const std::size_t claimed_boundary = payload.reuse_boundary;
+    evict_host_entry(entry_id);
+    host_kv_debugf("claim lane=%u entry=%llu boundary=%zu text_pages=%u backend_pages=%u bytes=%zu h2d_ms=%.3f occupied=%zu",
+                   sequence.lane, static_cast<unsigned long long>(entry_id), claimed_boundary,
+                   text_pages, backend_pages, claim_bytes, h2d_ms,
+                   host_kv_cache_used_bytes());
 }
 
 
@@ -1676,16 +1796,14 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
-    // A host-resident retained lane is evicted: its copies are dropped back to the arena. A
-    // still-in-flight retain is abandoned -- its host extent stays owned by the transfer table
+    // A still-in-flight retain is abandoned -- its host extent stays owned by the transfer table
     // until the stream-ordered D2H retires, so no other allocation can observe the partially
     // written extent. The device pages released here MAY be re-issued to another request on
     // the compute stream while the abandoned D2H is still reading them (the two streams have
     // no ordering); that overlap is benign because the abandoned transfer's destination is
     // never published -- the copy may observe any page contents, and nobody reads the result.
-    if (sequence.retained_residency == RetainedResidency::Host) {
-        release_host_residency(sequence);
-    }
+    // Host-resident prefixes no longer live in the lane (they are table entries): nothing to
+    // release here; the entry outlives the lane and is reclaimed by LRU/claim/eviction.
     if (sequence.retained_residency == RetainedResidency::HostTransferIn) {
         if (auto& transfer = host_retain_transfers[sequence.lane]; transfer) {
             transfer->abandoned = true;
@@ -1704,9 +1822,10 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
     sequence.retained_residency      = RetainedResidency::None;
-    sequence.host_entry              = std::nullopt;
     sequence.rewrite_checkpoint      = {};
     request.pending                  = {};
+    // Any cached lane plan that saw this lane's previous device state is now stale.
+    ++lane_release_generation_[sequence.lane];
 }
 
 qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {

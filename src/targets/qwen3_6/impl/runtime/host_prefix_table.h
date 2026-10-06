@@ -86,21 +86,23 @@ public:
         return nullptr;
     }
 
-    // Content lookup: returns the matching entry with the deepest reuse boundary. The
-    // identity decides whether two prompts share a resident prefix; the payload decides its
-    // boundary. A use refreshes the LRU stamp (claiming counts as use). `on_use` stamps with
-    // the caller's monotonic counter.
-    template <class Matches, class OnUse>
+    // Content lookup: `depth_of(prompt, payload)` returns the entry's usable match depth (0 =
+    // no match). The DEEPEST match wins -- not the largest stored boundary: a prompt that
+    // fails the deep identity check may still share a short token prefix with several entries,
+    // and picking by stored boundary would select an unrelated long entry and claim it for a
+    // trivial prefix. Ties keep the first inserted. A use refreshes the LRU stamp (claiming
+    // counts as use); `on_use` supplies the caller's monotonic counter.
+    template <class DepthOf, class OnUse>
     HostPrefixEntry<Payload>* find_best(const HostPrefixPrompt<Payload>& prompt,
-                                        Matches matches, OnUse on_use)
+                                        DepthOf depth_of, OnUse on_use)
     {
         HostPrefixEntry<Payload>* best = nullptr;
+        std::size_t best_depth = 0;
         for (auto& entry : entries_) {
-            if (!matches(prompt, entry.payload)) { continue; }
-            if (best != nullptr && best->payload.reuse_boundary >= entry.payload.reuse_boundary) {
-                continue;
-            }
+            const std::size_t depth = depth_of(prompt, entry.payload);
+            if (depth <= best_depth) { continue; }
             best = &entry;
+            best_depth = depth;
         }
         if (best != nullptr) { best->lru_stamp = on_use(); }
         return best;

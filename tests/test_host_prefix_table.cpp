@@ -1,5 +1,5 @@
-// CPU-only unit tests for HostPrefixTable (P1): membership, content lookup with deepest-
-// boundary tie-break, LRU ordering, the in-flight claim guard, and evict callback ordering.
+// CPU-only unit tests for HostPrefixTable (P1): membership, content lookup with deepest-match
+// selection, LRU ordering, the in-flight claim guard, and evict callback ordering.
 // The payload is a fake (no CUDA, no arena): token vector + identity stand-in + boundary +
 // a bytes counter standing in for the arena extents' occupied bytes.
 
@@ -43,13 +43,17 @@ struct FakePayload {
     std::size_t reuse_boundary_bytes() const noexcept { return reuse_boundary; }
 };
 
-bool matches(const FakePrompt& prompt, const FakePayload& payload) {
-    if (prompt.tokens.empty() || prompt.tokens[0] != payload.identity.marker) { return false; }
-    if (payload.identity.tokens.size() > prompt.tokens.size()) { return false; }
-    for (std::size_t i = 0; i < payload.identity.tokens.size(); ++i) {
-        if (prompt.tokens[i] != payload.identity.tokens[i]) { return false; }
+// Match depth: the resident identity run the prompt reproduces (0 = no match). Mirrors the
+// production match_entry: the full identity prefix must match, and the returned depth is the
+// usable boundary.
+std::size_t match_depth(const FakePrompt& prompt, const FakePayload& payload) {
+    if (prompt.tokens.empty() || prompt.tokens[0] != payload.identity.marker) { return 0; }
+    const std::size_t count = payload.identity.tokens.size();
+    if (count > prompt.tokens.size()) { return 0; }
+    for (std::size_t i = 0; i < count; ++i) {
+        if (prompt.tokens[i] != payload.identity.tokens[i]) { return 0; }
     }
-    return true;
+    return count;
 }
 
 struct Counter {
@@ -95,8 +99,8 @@ int test_find_best_deepest_and_lru_refresh() {
         [&] { return id++; });
     Counter counter;
     const FakePrompt prompt{.tokens = run};
-    HostPrefixEntry<FakePayload>* best = table.find_best(prompt, matches, counter);
-    if (!expect(best != nullptr && best->id == deep, "deepest boundary wins")) {
+    HostPrefixEntry<FakePayload>* best = table.find_best(prompt, match_depth, counter);
+    if (!expect(best != nullptr && best->id == deep, "deepest match wins")) {
         return failures;
     }
     if (!expect(counter.value == 1, "on_use called once")) { return failures; }
@@ -107,7 +111,7 @@ int test_find_best_deepest_and_lru_refresh() {
     }
     // A prompt matching only the shallow entry claims it.
     const FakePrompt short_prompt{.tokens = {1, 2, 7, 8}};
-    best = table.find_best(short_prompt, matches, counter);
+    best = table.find_best(short_prompt, match_depth, counter);
     if (!expect(best != nullptr && best->id == shallow, "shallow-only match")) {
         return failures;
     }
@@ -116,7 +120,7 @@ int test_find_best_deepest_and_lru_refresh() {
     }
     // Unrelated prompt: no match, no stamp.
     const FakePrompt other{.tokens = {9, 9}};
-    if (table.find_best(other, matches, counter) != nullptr) { return fail("unrelated match"); }
+    if (table.find_best(other, match_depth, counter) != nullptr) { return fail("unrelated match"); }
     if (!expect(counter.value == 2, "unrelated prompt does not stamp")) { return failures; }
     return 0;
 }

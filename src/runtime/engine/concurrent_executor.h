@@ -565,11 +565,8 @@ private:
         complete_error(request, std::move(error));
     }
 
-    void invalidate_lane_plans(std::uint32_t lane) noexcept { ++lane_plan_versions_[lane]; }
-
     void remove_completed_slot(std::uint32_t lane) {
         slots_[lane].reset();
-        invalidate_lane_plans(lane);
     }
 
     void consume_service_work(const std::shared_ptr<Request>& request, std::uint64_t work) {
@@ -747,6 +744,20 @@ private:
     }
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
+        // Finalize ALL in-flight host retains before planning: an undrained terminal D2H is
+        // about to insert a table entry (bumping the table version), and its origin lane
+        // still reads as device-retained -- planning before the drain can produce a base
+        // plan that is stale by the time it is used.
+        instance_.program->wait_all_host_retains();
+        if (request->base_plan &&
+            request->base_plan->host_table_version() !=
+                instance_.program->host_table_version()) {
+            // The content-addressed host table changed (insert/evict/claim-consume): a queued
+            // request may now see a deeper match (or none). Re-plan the base and drop the
+            // cached lane plans, which bind the stale base.
+            request->base_plan.reset();
+            for (auto& plan : request->lane_plans) { plan.reset(); }
+        }
         if (!request->base_plan) {
             request->base_plan.emplace(
                 instance_.program->plan_request_base(request->prompt, request->options.execution));
@@ -759,24 +770,27 @@ private:
 
     void ensure_lane_plan(const std::shared_ptr<Request>& request, std::uint32_t lane) {
         if (slots_[lane] != nullptr) { return; }
-        if (request->lane_plan_versions[lane] == lane_plan_versions_[lane] &&
-            request->lane_plans[lane]) {
+        // Finalize any in-flight retain D2H on this lane before reading its state: while it is
+        // in flight the lane reads as a device retain, and planning then would miss the
+        // release this very wait is about to settle.
+        instance_.program->wait_host_retain(lane);
+        // A cached plan is valid only for the lane's device state at the time it was planned.
+        // The program's per-lane generation covers every state change: lane clears (any
+        // eviction, completion) and a host-retain transfer retiring (device-retained ->
+        // empty). A mismatch rebuilds the plan against the current state.
+        const std::uint64_t generation = instance_.program->lane_release_generation(lane);
+        if (request->lane_plan_versions[lane] == generation && request->lane_plans[lane]) {
             return;
         }
-        // Finalize any in-flight retain D2H on this lane before planning: while it is in
-        // flight the lane reads as an unreusable device retain, and a plan computed then
-        // would miss the prefix this very request is about to claim (or, worse, the
-        // FullReset admission would destroy the copy mid-flight). The drain is versioned
-        // away after the first plan per (request, lane, lane version).
-        instance_.program->wait_host_retain(lane);
         request->lane_plans[lane].reset();
         request->lane_plans[lane].emplace(
             instance_.program->plan_request_for_lane(lane, request->prompt, *request->base_plan));
-        request->lane_plan_versions[lane] = lane_plan_versions_[lane];
+        request->lane_plan_versions[lane] = generation;
     }
 
     [[nodiscard]] std::optional<LaneChoice>
     find_admission_lane(const std::shared_ptr<Request>& request) {
+        instance_.program->wait_all_host_retains();
         std::optional<LaneChoice> selected;
         std::uint32_t selected_reuse = 0;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -788,6 +802,13 @@ private:
             // admitting on it (FullReset). Prefer a non-retained lane, and only take a
             // retained lane through the eviction pass below when nothing else is feasible.
             if (reuse == 0 && instance_.program->has_retained_lane(lane)) { continue; }
+            // A host-entry claim materializes a fresh device bundle on this lane: it must
+            // land on a lane whose device state is EMPTY (a retained lane's pages would be
+            // double-booked). The first pass skips occupied lanes; the eviction pass below
+            // can free one when nothing else is feasible.
+            if (plan.uses_host_entry() && instance_.program->has_retained_lane(lane)) {
+                continue;
+            }
             if (instance_.program->can_admit_lane(lane, plan) &&
                 (!selected || reuse > selected_reuse)) {
                 selected       = LaneChoice{.lane = lane};
@@ -801,7 +822,10 @@ private:
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
-            if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
+            // A host-entry claim needs an EMPTY lane, so when it lands on a retained lane the
+            // lane's own retained state is released by the eviction pass too (evict_self).
+            const bool evict_self = plan.uses_host_entry();
+            if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan, evict_self) &&
                 (!selected || reuse > selected_reuse)) {
                 selected = LaneChoice{
                     .lane           = lane,
@@ -845,6 +869,15 @@ private:
             throw std::logic_error("selected admission lane has no request plan");
         }
         if (choice.evict_retained) {
+            // A host-entry claim materializes a fresh device bundle and requires an EMPTY lane,
+            // so the selected lane's OWN retained state must be released before the claim. The
+            // loop below only frees *other* retained lanes because start_prefill_lane's in-place
+            // reuse replaces the selected lane's own bundle; a claim cannot accept that.
+            if (request->lane_plans[lane]->uses_host_entry() &&
+                instance_.program->has_retained_lane(lane)) {
+                instance_.program->wait_host_retain(lane);
+                instance_.program->evict_retained_lane(lane);
+            }
             for (std::uint32_t retained_lane = 0;
                  retained_lane < max_concurrency_ &&
                  !instance_.program->can_admit_lane(lane, *request->lane_plans[lane]);
@@ -855,7 +888,6 @@ private:
                     // abandon a copy that was already on its way to the arena.
                     instance_.program->wait_host_retain(retained_lane);
                     instance_.program->evict_retained_lane(retained_lane);
-                    invalidate_lane_plans(retained_lane);
                 }
             }
             if (!instance_.program->can_admit_lane(lane, *request->lane_plans[lane])) {
@@ -890,7 +922,6 @@ private:
             request->backfill_epoch         = backfill_epoch;
             request->backfill_class         = backfill_class;
             slots_[lane]                    = request;
-            invalidate_lane_plans(lane);
 
             TransientRegion transient;
             if (needs_prefill) {
@@ -917,7 +948,6 @@ private:
                 prefill_lane_.reset();
             }
             slots_[lane].reset();
-            invalidate_lane_plans(lane);
             complete_error(request, error);
             throw;
         }
@@ -1235,15 +1265,7 @@ private:
                         lock.unlock();
                         try {
                             std::scoped_lock execution_lock(execution_mutex_);
-                            for (const std::uint32_t evicted_lane :
-                                 instance_.program->harvest_host_retains()) {
-                                if (evicted_lane >= max_concurrency_ ||
-                                    slots_[evicted_lane] != nullptr) {
-                                    throw std::logic_error(
-                                        "host retention eviction reported an active lane");
-                                }
-                                invalidate_lane_plans(evicted_lane);
-                            }
+                            instance_.program->harvest_host_retains();
                         } catch (...) {
                             // queue is already released; fail_all re-takes it internally.
                             fail_all(std::current_exception());
@@ -1267,15 +1289,9 @@ private:
             try {
                 std::scoped_lock execution_lock(execution_mutex_);
                 // Retire finished host-retain transfers (device pages return to the pool and
-                // the lane becomes Host-resident). LRU-evicted lanes are already cleared by
-                // the Program; their executor slots must be idle, and any queued request that
-                // planned a reuse on the destroyed prefix must re-plan from scratch.
-                for (const std::uint32_t evicted_lane : instance_.program->harvest_host_retains()) {
-                    if (evicted_lane >= max_concurrency_ || slots_[evicted_lane] != nullptr) {
-                        throw std::logic_error("host retention eviction reported an active lane");
-                    }
-                    invalidate_lane_plans(evicted_lane);
-                }
+                // the lane is released entirely). Queued plans see the change through the
+                // table version and the per-lane release generation; no explicit invalidation.
+                instance_.program->harvest_host_retains();
                 const bool have_pending          = expire_pending_requests();
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary);
@@ -1340,7 +1356,6 @@ private:
     std::uint64_t next_request_id_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<std::uint32_t> prefill_lane_;
-    std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;
     RuntimeStats cumulative_stats_;
