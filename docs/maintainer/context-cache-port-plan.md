@@ -219,7 +219,11 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     host-image pool sized for the GDN conv/recurrent state, the continuation hidden, and an
     optional DFlash local region. Wiring the D2H/H2D transfer of the hidden and DFlash region into
     the program belongs to L5, where the program owns the device slots.
-- L5 engine integration (PrefixIndex, resource policy, cost model, executor) — pending.
+- L5 engine integration.
+  - L5a `PrefixIndex` — done: `feat(runtime): add the prefix shortlist index`.
+  - L5b cost model — done: `feat(runtime): add the context cost model`.
+  - L5c resource policy (retention, reclaim, session lineage) — pending.
+  - L5d executor integration and real-artifact verification — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
 L1/L2 are observable only through the parsed markers and resolved frontiers; Engine reuse

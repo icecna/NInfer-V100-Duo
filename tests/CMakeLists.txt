@@ -305,6 +305,11 @@ set_tests_properties(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
 # Product protocol contracts.
+# Engine-level context-cache primitives: shortlist index and cost model.
+ninfer_add_test(ninfer_prefix_index_test
+  SOURCES test_prefix_index.cpp)
+ninfer_add_test(ninfer_context_cost_test
+  SOURCES test_context_cost.cpp)
 ninfer_add_test(ninfer_openai_schema_test
   SOURCES test_openai_schema.cpp
   LIBRARIES ninfer_serve)
