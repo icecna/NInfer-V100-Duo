@@ -83,6 +83,23 @@ int test_prefix_consistency() {
                           "resident digest disagrees with the prompt digest");
     }
 
+    // Recomputing from the ledger's token ids reproduces the assigned table, so a residency whose
+    // generated tokens were appended gets the same digests the next request computes.
+    ResidentPrefixIdentity recomputed;
+    recomputed.assign(prompt);
+    recomputed.append_generated(2, 0);
+    std::vector<int> ledger = prompt.token_ids;
+    ledger.push_back(101);
+    ledger.push_back(102);
+    recomputed.recompute_digests(ledger);
+    for (std::size_t frontier = 0; frontier <= ledger.size(); ++frontier) {
+        PreparedPromptData extended = make_prompt(ledger);
+        std::vector<PrefixDigest> expected;
+        ninfer::targets::qwen3_6::detail::assign_prefix_digests(extended, expected);
+        failures += check(recomputed.digest_at(frontier) == expected[frontier],
+                          "recomputed digest disagrees with the ledger digest");
+    }
+
     // A differing token changes exactly the frontiers after it.
     PreparedPromptData changed = prompt;
     changed.token_ids[2]       = 99;

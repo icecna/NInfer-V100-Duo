@@ -1346,10 +1346,18 @@ void ProgramImplCore::complete_host_transfer(std::uint32_t lane, bool abandoned)
         residency.identity         = std::move(sequence.prefix_identity);
         residency.origin_lane      = lane;
         residency.reuse_boundary   = sequence.execution_frontier;
+        // The digest table must reflect the ledger's real token ids (generated tokens included),
+        // so a later request can shortlist this residency before the exact match runs.
+        residency.identity.recompute_digests(residency.tokens);
+        const qwen3_6::detail::PrefixShortlistKey shortlist{
+            .digest       = residency.identity.digest_at(residency.reuse_boundary),
+            .frontier     = static_cast<std::uint32_t>(residency.reuse_boundary),
+            .identity_tag = prefix_identity_tag};
         const qwen3_6::detail::HostPrefixId id =
             host_prefixes.insert(std::move(residency),
                                  [this] { return ++host_prefix_id_counter; },
                                  sequence.session_key);
+        host_prefix_index.insert(id, shortlist);
         host_prefixes.stamp(id, ++host_lru_counter);
         ++host_table_version_;        sequence.ledger.clear();
         sequence.prefix_identity.clear();
@@ -1382,6 +1390,7 @@ void ProgramImplCore::evict_host_entry(qwen3_6::detail::HostPrefixId id) noexcep
     if (entry == nullptr || entry->in_flight_claims != 0) { return; } // readers hold the extents
     const std::size_t boundary = entry->payload.reuse_boundary;
     host_prefixes.evict(id);
+    host_prefix_index.erase(id);
     ++host_table_version_;
     host_kv_debugf("evict entry=%llu boundary=%zu occupied=%zu",
                    static_cast<unsigned long long>(id), boundary, host_kv_cache_used_bytes());

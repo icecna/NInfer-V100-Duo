@@ -161,7 +161,7 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     // re-derives the reuse path. The table version is stamped always so a later table mutation
     // re-plans this base even when the lookup found nothing (a new entry may now match).
     base->host_table_version = host_table_version_;
-    if (host_kv_cache_bytes != 0 && host_prefixes.size() != 0 &&
+    if (host_kv_cache_bytes != 0 && host_prefix_index.size() != 0 &&
         options.allow_prefix_reuse) {
         // An entry is claimable only at its EXACT frontier. Its paged KV is per-token, but the
         // GDN linear-state snapshot and the rank-0 tail hidden are the state AT the frontier,
@@ -187,14 +187,35 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         const std::string_view session_key =
             prompt.context_cache.session_key ? std::string_view(*prompt.context_cache.session_key)
                                              : std::string_view{};
-        const auto* best = host_prefixes.find_best(
-            prompt,
-            [&match_entry](const HostPrefixPrompt<HostPrefixResidency>&,
-                          const HostPrefixResidency& e) { return match_entry(e); },
-            [this] { return ++host_lru_counter; }, session_key);
+        const std::vector<qwen3_6::detail::HostPrefixId> candidates = host_prefix_index.matches(
+            static_cast<std::uint32_t>(prompt.token_ids.size()),
+            [&](std::uint32_t frontier) {
+                return qwen3_6::detail::PrefixShortlistKey{
+                    .digest       = base->prefix_digests[frontier],
+                    .frontier     = frontier,
+                    .identity_tag = base->prefix_identity_tag};
+            });
+        const HostPrefixResidency* best       = nullptr;
+        qwen3_6::detail::HostPrefixId best_id = qwen3_6::detail::kInvalidHostPrefixId;
+        std::size_t best_depth                = 0;
+        for (const qwen3_6::detail::HostPrefixId handle : candidates) {
+            const auto* entry = host_prefixes.find(handle);
+            if (entry == nullptr) { continue; }
+            const bool session_match = !session_key.empty() && entry->session_key == session_key;
+            if (!session_key.empty() && !entry->session_key.empty() && !session_match) {
+                continue;
+            }
+            const std::size_t depth = match_entry(entry->payload);
+            if (depth == 0) { continue; }
+            if (best == nullptr || depth > best_depth || (depth == best_depth && session_match)) {
+                best       = &entry->payload;
+                best_id    = handle;
+                best_depth = depth;
+            }
+        }
         if (best != nullptr) {
-            base->host_entry      = best->id;
-            base->host_reuse_base = static_cast<std::uint32_t>(match_entry(best->payload));
+            base->host_entry      = best_id;
+            base->host_reuse_base = static_cast<std::uint32_t>(best_depth);
         }
     }
 

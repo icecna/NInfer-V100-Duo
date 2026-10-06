@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6::detail {
@@ -40,6 +41,15 @@ struct PrefixShortlistKey {
 // prompt.token_ids.size() + 1; out[frontier] covers tokens [0, frontier) and out[0] is the seed.
 void assign_prefix_digests(const PreparedPromptData& prompt, std::vector<PrefixDigest>& out);
 
+// Same, from explicit axes, so a resident identity can recompute its digest table from the
+// ledger's real token ids after generation.
+void assign_prefix_digests(std::span<const TokenId> tokens, std::span<const std::uint8_t> token_types,
+                           std::span<const std::int32_t> temporal,
+                           std::span<const std::int32_t> height,
+                           std::span<const std::int32_t> width,
+                           const std::vector<VisionItem>& vision_items,
+                           std::vector<PrefixDigest>& out);
+
 class ResidentPrefixIdentity {
 public:
     void reserve(std::size_t tokens);
@@ -54,6 +64,11 @@ public:
 
     // Digest of the first `frontier` tokens. Requires frontier <= size().
     [[nodiscard]] const PrefixDigest& digest_at(std::size_t frontier) const;
+
+    // Recompute the digest table from the ledger's real token ids (the identity already holds the
+    // matching token types, positions, and Vision items). Required after generated tokens are
+    // appended, whose ids the incremental digest could not see.
+    void recompute_digests(std::span<const TokenId> tokens);
 
 private:
     std::vector<std::uint8_t> token_types_;

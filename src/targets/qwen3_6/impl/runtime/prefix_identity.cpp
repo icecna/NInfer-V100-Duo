@@ -122,35 +122,54 @@ std::uint32_t make_prefix_identity_tag(std::uint32_t speculative_backend,
     return tag;
 }
 
+void assign_prefix_digests(std::span<const TokenId> tokens, std::span<const std::uint8_t> token_types,
+                           std::span<const std::int32_t> temporal,
+                           std::span<const std::int32_t> height,
+                           std::span<const std::int32_t> width,
+                           const std::vector<VisionItem>& vision_items,
+                           std::vector<PrefixDigest>& out) {
+    const std::size_t count = tokens.size();
+    if (token_types.size() != count || temporal.size() != count || height.size() != count ||
+        width.size() != count) {
+        throw std::invalid_argument("prefix identity axis length mismatch");
+    }
+    out.assign(count + 1, kDigestSeed);
+    PrefixDigest running = kDigestSeed;
+
+    // A Vision item is mixed once its consumer tokens are complete, so out[frontier] summarizes
+    // exactly the media included in the prefix. An item with no consumer span is mixed at the seed.
+    std::vector<std::size_t> item_frontiers(vision_items.size());
+    for (std::size_t index = 0; index < item_frontiers.size(); ++index) {
+        item_frontiers[index] = vision_item_frontier(vision_items[index]);
+    }
+    std::size_t next_item = 0;
+    while (next_item < item_frontiers.size() && item_frontiers[next_item] == 0) {
+        mix_vision_item(running, vision_items[next_item]);
+        ++next_item;
+    }
+    for (std::size_t index = 0; index < count; ++index) {
+        mix_token(running, tokens[index], token_types[index], temporal[index], height[index],
+                  width[index]);
+        while (next_item < item_frontiers.size() && item_frontiers[next_item] == index + 1) {
+            mix_vision_item(running, vision_items[next_item]);
+            ++next_item;
+        }
+        out[index + 1] = running;
+    }
+}
+
 void assign_prefix_digests(const PreparedPromptData& prompt, std::vector<PrefixDigest>& out) {
     const std::size_t tokens = prompt.token_ids.size();
     if (prompt.token_types.size() != tokens || prompt.positions.size() != 3 * tokens) {
         throw std::invalid_argument("prepared prompt identity metadata has an invalid shape");
     }
-    out.assign(tokens + 1, kDigestSeed);
-    PrefixDigest running = kDigestSeed;
-
-    // A Vision item is mixed once its consumer tokens are complete, so out[frontier] summarizes
-    // exactly the media included in the prefix. An item with no consumer span is mixed at the seed.
-    std::vector<std::size_t> item_frontiers(prompt.vision_items.size());
-    for (std::size_t index = 0; index < item_frontiers.size(); ++index) {
-        item_frontiers[index] = vision_item_frontier(prompt.vision_items[index]);
-    }
-    std::size_t next_item = 0;
-    while (next_item < item_frontiers.size() && item_frontiers[next_item] == 0) {
-        mix_vision_item(running, prompt.vision_items[next_item]);
-        ++next_item;
-    }
-    for (std::size_t index = 0; index < tokens; ++index) {
-        mix_token(running, prompt.token_ids[index], prompt.token_types[index],
-                  prompt.positions[index], prompt.positions[tokens + index],
-                  prompt.positions[2 * tokens + index]);
-        while (next_item < item_frontiers.size() && item_frontiers[next_item] == index + 1) {
-            mix_vision_item(running, prompt.vision_items[next_item]);
-            ++next_item;
-        }
-        out[index + 1] = running;
-    }
+    assign_prefix_digests(
+        std::span<const TokenId>(prompt.token_ids),
+        std::span<const std::uint8_t>(prompt.token_types),
+        std::span<const std::int32_t>(prompt.positions.data(), tokens),
+        std::span<const std::int32_t>(prompt.positions.data() + tokens, tokens),
+        std::span<const std::int32_t>(prompt.positions.data() + 2 * tokens, tokens),
+        prompt.vision_items, out);
 }
 
 void ResidentPrefixIdentity::reserve(std::size_t tokens) {
@@ -230,6 +249,16 @@ const PrefixDigest& ResidentPrefixIdentity::digest_at(std::size_t frontier) cons
         throw std::out_of_range("prefix digest frontier exceeds resident identity");
     }
     return digests_[frontier];
+}
+
+void ResidentPrefixIdentity::recompute_digests(std::span<const TokenId> tokens) {
+    if (tokens.size() != size()) {
+        throw std::invalid_argument("resident prefix digest recompute must cover the identity");
+    }
+    assign_prefix_digests(tokens, std::span<const std::uint8_t>(token_types_),
+                          std::span<const std::int32_t>(positions_[0]),
+                          std::span<const std::int32_t>(positions_[1]),
+                          std::span<const std::int32_t>(positions_[2]), vision_items_, digests_);
 }
 
 bool ResidentPrefixIdentity::matches(const PreparedPromptData& prompt, std::size_t count) const {

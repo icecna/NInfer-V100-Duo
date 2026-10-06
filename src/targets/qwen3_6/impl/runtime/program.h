@@ -15,6 +15,7 @@
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include "runtime/engine/context_cache/prefix_index.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -445,6 +446,11 @@ public:
     std::optional<HostKVArena> host_kv_arena;
     std::optional<HostKVArena> host_kv_arena_peer;
     qwen3_6::detail::HostPrefixTable<HostPrefixResidency> host_prefixes;
+    // Shortlist index over the hosted residencies: keyed by (identity_tag, frontier, digest) so a
+    // request compares digests before the authoritative token/media match. Kept in lockstep with
+    // host_prefixes on insert, evict, and clear.
+    runtime::PrefixIndex<qwen3_6::detail::HostPrefixId, qwen3_6::detail::PrefixShortlistKey>
+        host_prefix_index;
     std::uint64_t host_prefix_id_counter = 0;
 
     std::array<SequenceState, kMaximumConcurrency> sequences;

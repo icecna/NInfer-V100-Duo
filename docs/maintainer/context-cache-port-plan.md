@@ -232,7 +232,13 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     request names one while keeping anonymous entries reusable, records the last request that
     reused an entry, and evicts never-reused entries before demanded ones. Real-artifact gate
     re-run passes.
-  - L5e `PrefixIndex` + cost model + multi-checkpoint integration — pending.
+  - L5e `PrefixIndex` shortlist integration — done: `feat(runtime): shortlist host prefixes by
+    content digest`. The hosted residency index is keyed by (identity_tag, frontier, digest); a
+    residency's digest table is recomputed from the ledger's real token ids after generation so
+    generated-region frontiers stay matchable; the base plan shortlists candidates before the
+    authoritative token/media match, preserving the session filter and preference. Real-artifact
+    gate re-run passes both phases.
+  - L5f cost-model ranking and full multi-checkpoint / retention-policy integration — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
 L1/L2 are observable only through the parsed markers and resolved frontiers; Engine reuse
