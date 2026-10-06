@@ -640,6 +640,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     SequenceState& sequence = sequences[lane];
     RequestControl& request = requests[lane];
+    // The lane's lineage for this request; an anonymous request carries no key.
+    sequence.session_key = prompt.context_cache.session_key.value_or(std::string{});
     if (plan.impl_ == nullptr) { throw std::invalid_argument("request plan is empty"); }
     RequestPlanImpl& request_plan = *plan.impl_;
     if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
@@ -1346,10 +1348,10 @@ void ProgramImplCore::complete_host_transfer(std::uint32_t lane, bool abandoned)
         residency.reuse_boundary   = sequence.execution_frontier;
         const qwen3_6::detail::HostPrefixId id =
             host_prefixes.insert(std::move(residency),
-                                 [this] { return ++host_prefix_id_counter; });
+                                 [this] { return ++host_prefix_id_counter; },
+                                 sequence.session_key);
         host_prefixes.stamp(id, ++host_lru_counter);
-        ++host_table_version_;
-        sequence.ledger.clear();
+        ++host_table_version_;        sequence.ledger.clear();
         sequence.prefix_identity.clear();
         sequence.execution_frontier  = 0;
         sequence.ledger_frontier     = 0;
@@ -1652,6 +1654,8 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
     }
     host_prefixes.begin_claim(entry_id);
     host_prefixes.stamp(entry_id, ++host_lru_counter);
+    host_prefixes.mark_demand(entry_id, ++host_demand_counter);
+    if (sequence.session_key.empty()) { sequence.session_key = entry->session_key; }
     const HostKVResidency& host = payload.kv;
     const std::uint32_t text_pages    = pages_for_tokens(base);
     const std::uint32_t backend_pages =

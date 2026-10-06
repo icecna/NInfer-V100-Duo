@@ -226,7 +226,13 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     `feat(runtime): add the context retention policy`. Owner/session lineage, shared vs private
     candidate visibility, bounded demand LRU, demand-ordered victims, and the gain-above-loss
     admission rule.
-  - L5d executor integration and real-artifact verification — pending.
+  - L5d session/demand retention in the working host-prefix path — done:
+    `feat(runtime): tag retained host prefixes with the request lineage`. The host prefix table
+    tags an entry with the publishing request's session key, prefers a same-lineage entry when the
+    request names one while keeping anonymous entries reusable, records the last request that
+    reused an entry, and evicts never-reused entries before demanded ones. Real-artifact gate
+    re-run passes.
+  - L5e `PrefixIndex` + cost model + multi-checkpoint integration — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
 L1/L2 are observable only through the parsed markers and resolved frontiers; Engine reuse

@@ -265,6 +265,67 @@ int test_eviction_pressure() {
     return 0;
 }
 
+int test_session_filtered_lookup() {
+    HostPrefixTable<FakePayload> table;
+    HostPrefixId id = 0;
+    const std::vector<std::int32_t> run{1, 2, 3};
+    auto make = [&](const char* session) {
+        return table.insert(
+            FakePayload{.identity = FakeIdentity{.marker = 1, .tokens = run},
+                        .reuse_boundary = run.size()},
+            [&] { return id++; }, session);
+    };
+    const HostPrefixId s1 = make("s1");
+    const HostPrefixId s2 = make("s2");
+    const HostPrefixId anon = make("");
+    Counter counter;
+    const FakePrompt prompt{.tokens = run};
+
+    auto* best = table.find_best(prompt, match_depth, counter, "s1");
+    if (!expect(best != nullptr && best->id == s1, "same-session entry wins the tie")) {
+        return failures;
+    }
+    best = table.find_best(prompt, match_depth, counter, "s3");
+    if (!expect(best != nullptr && best->id == anon, "unknown session falls back to anonymous")) {
+        return failures;
+    }
+    best = table.find_best(prompt, match_depth, counter, "");
+    if (!expect(best != nullptr && best->id == s1, "anonymous lookup accepts the first inserted")) {
+        return failures;
+    }
+    if (!expect(table.find(s2)->lru_stamp == 0, "a foreign-session entry is never stamped")) {
+        return failures;
+    }
+    return 0;
+}
+
+int test_demand_aware_eviction() {
+    HostPrefixTable<FakePayload> table;
+    HostPrefixId id = 0;
+    const HostPrefixId a = table.insert(FakePayload{}, [&] { return id++; });
+    const HostPrefixId b = table.insert(FakePayload{}, [&] { return id++; });
+    table.stamp(a, 1);
+    table.stamp(b, 2);
+    if (!expect(table.oldest_evictable()->id == a, "lru victim without demand")) {
+        return failures;
+    }
+    table.mark_demand(a, 5);
+    if (!expect(table.oldest_evictable()->id == b, "a demanded entry resists eviction")) {
+        return failures;
+    }
+    const HostPrefixId c = table.insert(FakePayload{}, [&] { return id++; });
+    if (!expect(table.oldest_evictable()->id == c, "a never-used entry is the preferred victim")) {
+        return failures;
+    }
+    table.mark_demand(b, 9);
+    table.evict(c);
+    if (!expect(table.oldest_evictable()->id == a,
+                "the least recently demanded entry is the victim")) {
+        return failures;
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -274,6 +335,8 @@ int main() {
     failures += test_in_flight_claim_guard();
     failures += test_evict_callback_and_removal();
     failures += test_eviction_pressure();
+    failures += test_session_filtered_lookup();
+    failures += test_demand_aware_eviction();
     if (failures == 0) { std::printf("ok\n"); return 0; }
     std::printf("%d host prefix table check(s) failed\n", failures);
     return 1;

@@ -245,6 +245,9 @@ struct SequenceState {
     bool retained                 = false;
     RetainedResidency retained_residency = RetainedResidency::None;
     RewriteCheckpoint rewrite_checkpoint;
+    // Session lineage of the request that owns this lane; published with the retained entry so a
+    // later request from the same lineage can reuse it, and anonymous requests still can.
+    std::string session_key;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -478,6 +481,8 @@ public:
     // tracking the events itself.
     std::array<std::uint64_t, kMaximumConcurrency> lane_release_generation_{};
     std::uint64_t host_lru_counter = 0;
+    // Monotonic demand stamp: the last request that reused a host entry resists eviction.
+    std::uint64_t host_demand_counter = 0;
     // Bumped on every table mutation (insert, evict, claim-consume). Plans stamp the version at
     // computation time; a mismatch means a referenced entry may have appeared or disappeared and
     // the request must re-plan. The version, not lane ids, is the invalidation unit: host

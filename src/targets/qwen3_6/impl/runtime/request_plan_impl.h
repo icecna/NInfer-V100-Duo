@@ -184,11 +184,14 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
                        ? boundary
                        : 0;
         };
+        const std::string_view session_key =
+            prompt.context_cache.session_key ? std::string_view(*prompt.context_cache.session_key)
+                                             : std::string_view{};
         const auto* best = host_prefixes.find_best(
             prompt,
             [&match_entry](const HostPrefixPrompt<HostPrefixResidency>&,
                           const HostPrefixResidency& e) { return match_entry(e); },
-            [this] { return ++host_lru_counter; });
+            [this] { return ++host_lru_counter; }, session_key);
         if (best != nullptr) {
             base->host_entry      = best->id;
             base->host_reuse_base = static_cast<std::uint32_t>(match_entry(best->payload));

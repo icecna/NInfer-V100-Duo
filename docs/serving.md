@@ -706,6 +706,12 @@ active slot, serving an unrelated conversation can replace the retained entry; i
 cache of every conversation. Only the current resident frontier and a saved complete turn/response
 checkpoint are eligible reuse positions, rather than an arbitrary longest common token prefix.
 
+A retained prefix also records the context-cache session lineage that published it. When a request
+names a lineage (`prompt_cache_key`, or the Responses session lineage), a prefix published by that
+same lineage is preferred over an unrelated one; anonymous prefixes stay reusable by anyone, and an
+entry published by a different named lineage is not offered. A prefix that a request actually
+reused resists eviction longer than one that was never reused.
+
 The shared family runtime distinguishes `full_reset`, `append_frontier`,
 `restore_turn_checkpoint`, and `restore_response_checkpoint`. Both checkpoint kinds include the
 recurrent, hidden, and selected speculative-backend continuation state required to recompute a
