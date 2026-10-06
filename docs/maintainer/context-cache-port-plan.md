@@ -205,7 +205,16 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
   frontiers`.
 - L3 identity shortlist digests — done: `feat(runtime): add prefix shortlist digests and identity
   tag`.
-- L4 checkpoint storage (KV refcounts, host extent store, state image) — pending.
+- L4 checkpoint storage. Concrete first steps, because the host extent store has no consumer
+  without a page registry:
+  - L4a `KvPageRegistry`: per-logical-page references, active references, source pins, writer
+    references, protected columns, plus checkpoint-frontier protection and inactive truncate,
+    mirroring upstream `LogicalKVPageStore` + `KVAddressSpaceStore` on top of the local page ids.
+  - L4b `HostKvExtentStore` over `HostKVArena`: ordered logical-page membership, source pin on
+    reserve, publish a host replica, and split/release zero-reference runs; bound to L4a.
+  - L4c state image: role/reference/pin metadata over the linear-attention pool plus a host pool,
+    including the continuation hidden and the DFlash local state (currently excluded from host
+    snapshots).
 - L5 engine integration (PrefixIndex, resource policy, cost model, executor) — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
