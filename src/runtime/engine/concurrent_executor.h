@@ -763,6 +763,12 @@ private:
             request->lane_plans[lane]) {
             return;
         }
+        // Finalize any in-flight retain D2H on this lane before planning: while it is in
+        // flight the lane reads as an unreusable device retain, and a plan computed then
+        // would miss the prefix this very request is about to claim (or, worse, the
+        // FullReset admission would destroy the copy mid-flight). The drain is versioned
+        // away after the first plan per (request, lane, lane version).
+        instance_.program->wait_host_retain(lane);
         request->lane_plans[lane].reset();
         request->lane_plans[lane].emplace(
             instance_.program->plan_request_for_lane(lane, request->prompt, *request->base_plan));
@@ -778,6 +784,10 @@ private:
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
+            // A retained lane whose prefix this plan does NOT reuse would be destroyed by
+            // admitting on it (FullReset). Prefer a non-retained lane, and only take a
+            // retained lane through the eviction pass below when nothing else is feasible.
+            if (reuse == 0 && instance_.program->has_retained_lane(lane)) { continue; }
             if (instance_.program->can_admit_lane(lane, plan) &&
                 (!selected || reuse > selected_reuse)) {
                 selected       = LaneChoice{.lane = lane};
@@ -841,6 +851,9 @@ private:
                  ++retained_lane) {
                 if (retained_lane != lane && slots_[retained_lane] == nullptr &&
                     instance_.program->has_retained_lane(retained_lane)) {
+                    // Finalize an in-flight D2H first: destroying the lane mid-transfer would
+                    // abandon a copy that was already on its way to the arena.
+                    instance_.program->wait_host_retain(retained_lane);
                     instance_.program->evict_retained_lane(retained_lane);
                     invalidate_lane_plans(retained_lane);
                 }
@@ -1210,6 +1223,36 @@ private:
                         active = active || slots_[lane] != nullptr;
                     }
                     if (!active) {
+                        // The terminal round may leave the lane's terminal host-retain D2H in
+                        // flight; the next executor boundary that would finalize it only runs
+                        // when new work arrives, so an idle engine would keep reporting an
+                        // incomplete retention. Settle whatever is already done (in-flight
+                        // copies are skipped, not blocked on) before waiting, then re-check
+                        // the wake predicate after re-locking so a submit that landed while we
+                        // held the execution mutex is not lost. The established lock order is
+                        // execution -> queue (publish_runtime_stats), so queue is released
+                        // first here.
+                        lock.unlock();
+                        try {
+                            std::scoped_lock execution_lock(execution_mutex_);
+                            for (const std::uint32_t evicted_lane :
+                                 instance_.program->harvest_host_retains()) {
+                                if (evicted_lane >= max_concurrency_ ||
+                                    slots_[evicted_lane] != nullptr) {
+                                    throw std::logic_error(
+                                        "host retention eviction reported an active lane");
+                                }
+                                invalidate_lane_plans(evicted_lane);
+                            }
+                        } catch (...) {
+                            // queue is already released; fail_all re-takes it internally.
+                            fail_all(std::current_exception());
+                            return;
+                        }
+                        lock.lock();
+                        // The wait MUST stay inside !active: a worker with an active request
+                        // and an empty pending queue has work to run NOW (the active round),
+                        // and waiting here would stall it until the next submit.
                         queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
                     }
                 }
@@ -1223,6 +1266,16 @@ private:
 
             try {
                 std::scoped_lock execution_lock(execution_mutex_);
+                // Retire finished host-retain transfers (device pages return to the pool and
+                // the lane becomes Host-resident). LRU-evicted lanes are already cleared by
+                // the Program; their executor slots must be idle, and any queued request that
+                // planned a reuse on the destroyed prefix must re-plan from scratch.
+                for (const std::uint32_t evicted_lane : instance_.program->harvest_host_retains()) {
+                    if (evicted_lane >= max_concurrency_ || slots_[evicted_lane] != nullptr) {
+                        throw std::logic_error("host retention eviction reported an active lane");
+                    }
+                    invalidate_lane_plans(evicted_lane);
+                }
                 const bool have_pending          = expire_pending_requests();
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary);

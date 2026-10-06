@@ -19,6 +19,7 @@ add_library(ninfer_core STATIC
   core/device.cu
   core/dtype.cpp
   core/host_worker_pool.cpp
+  core/host_kv_arena.cpp
   core/gdn_replay_records.cpp
   core/cyclic_kv_cache.cpp
   core/paged_kv_cache.cpp

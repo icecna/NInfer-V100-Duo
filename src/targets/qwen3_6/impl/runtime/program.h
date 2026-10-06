@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
+#include "core/host_kv_arena.h"
 #include "ninfer/ops/allreduce.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
@@ -137,6 +138,29 @@ struct SequenceKVBundle {
     std::optional<PagedKVAllocation> backend_peer;
 };
 
+// Physical home of a retained lane's paged KV. `Device` is the historical behavior (pages stay in
+// the pool until the lane is evicted); `Host` means the pages were copied to the per-device host
+// arena at the terminal boundary and released back to the pool; `HostTransferIn` is the in-flight
+// window between the D2H enqueue and its completion, during which the device pages are still held
+// and the lane behaves exactly like `Device`. GDN linear state is NOT part of this residency: it
+// lives in the lane's own per-lane device slot forever, which is what keeps lane-affine reuse valid
+// across a host round trip.
+enum class RetainedResidency : std::uint8_t {
+    None,
+    Device,
+    Host,
+    HostTransferIn,
+};
+
+// The completed host copies of a `RetainedResidency::Host` lane, one arena allocation per device
+// pool. Page counts live in the allocations themselves. Empty unless `Host`.
+struct HostKVResidency {
+    std::optional<HostKVAllocation> text_local;
+    std::optional<HostKVAllocation> text_peer;
+    std::optional<HostKVAllocation> backend_local;
+    std::optional<HostKVAllocation> backend_peer;
+};
+
 struct DecodeGraphProfile {
     std::uint32_t batch_size             = 1;
     std::uint32_t min_execution_frontier = 0;
@@ -177,6 +201,12 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
     bool retained                 = false;
+    RetainedResidency retained_residency = RetainedResidency::None;
+    HostKVResidency host_kv;
+    // Monotonic order among host-resident retained lanes; smallest is the LRU victim. Assigned
+    // when a D2H transfer completes (or a host lane is re-retained), so an in-flight lane has no
+    // stamp yet and cannot be evicted.
+    std::uint64_t host_lru_stamp = 0;
     RewriteCheckpoint rewrite_checkpoint;
 };
 
@@ -272,6 +302,20 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    // Polls in-flight retain D2H transfers; a completed transfer releases its device pages and
+    // parks the copies in the host arena (or, when the lane moved on first, just drops the host
+    // extent). Called at every executor boundary; returns the lanes whose retained state was
+    // discarded by an LRU host eviction this call, so the executor can invalidate their plans.
+    [[nodiscard]] std::span<const std::uint32_t> harvest_host_retains();
+    // Blocks until any in-flight retain D2H on `lane` is finalized: the prefix becomes
+    // host-resident and its device pages are released. No-op when the lane has no in-flight
+    // transfer. Admission planning calls this before reading the lane's retained state so a
+    // just-finished conversation is never missed by the reuse pass (an in-flight lane would
+    // otherwise read as an unreusable device retain and be destroyed by a FullReset admission).
+    void wait_host_retain(std::uint32_t lane);
+    [[nodiscard]] bool has_host_retain_in_flight() const noexcept;
+    [[nodiscard]] std::size_t host_kv_cache_capacity() const noexcept;
+    [[nodiscard]] std::size_t host_kv_cache_used_bytes() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
@@ -343,8 +387,45 @@ public:
     Tensor tail_hidden_store;
     Tensor rewrite_checkpoint_hidden_store;
 
+    // Host-backed retained prefixes. `host_kv_cache_bytes` is the TOTAL across devices; each
+    // arena holds its own device's share. Zero disables the whole feature and every host path
+    // below is a no-op (retains stay device-resident exactly as before). The arenas are
+    // declared BEFORE `sequences` and the transfer table below so that the HostKVAllocations
+    // those members hold release into still-live arenas at destruction.
+    std::size_t host_kv_cache_bytes = 0;
+    std::optional<HostKVArena> host_kv_arena;
+    std::optional<HostKVArena> host_kv_arena_peer;
+
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;
+    // Per-lane completion events for in-flight D2H transfers: [lane][0] rank 0 stream,
+    // [lane][1] rank 1 stream (tp2 only). Created once when the feature is enabled.
+    std::array<std::array<cudaEvent_t, 2>, kMaximumConcurrency> host_retain_events{};
+    // Dedicated pinned-transfer streams: the retain D2H must not stall the compute stream, on
+    // which the other lanes' decode rounds run; the gate event serializes the copy behind the
+    // terminal round's own work (and the KV pages it just wrote) before touching them.
+    cudaStream_t host_copy_stream     = nullptr;
+    cudaEvent_t host_copy_gate        = nullptr;
+    cudaStream_t host_copy_stream_peer = nullptr;
+    cudaEvent_t host_copy_gate_peer   = nullptr;
+    // One in-flight retain D2H transfer per lane. The host extents are owned here until both
+    // device events report completion, so an abandoned transfer (its lane was cleared or reused
+    // first) still lands its copies in memory that nobody else has been handed yet, and is only
+    // dropped back to the arena once the reads/writes have retired.
+    struct HostRetainTransfer {
+        std::optional<HostKVAllocation> text_local;
+        std::optional<HostKVAllocation> text_peer;
+        std::optional<HostKVAllocation> backend_local;
+        std::optional<HostKVAllocation> backend_peer;
+        bool abandoned = false;
+    };
+    std::array<std::optional<HostRetainTransfer>, kMaximumConcurrency> host_retain_transfers{};
+    std::uint64_t host_lru_counter = 0;
+    // Lanes whose host-retained state was discarded by an LRU host eviction since the last
+    // harvest; harvest moves this into `host_eviction_report` and hands it to the executor for
+    // lane-plan invalidation.
+    std::vector<std::uint32_t> host_eviction_pending;
+    std::vector<std::uint32_t> host_eviction_report;
 
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
@@ -471,6 +552,22 @@ private:
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
+    // Host-backing of retained prefixes (no-op with host_kv_cache_bytes == 0).
+    void init_host_kv_cache(const SequencePlanImpl& plan);
+    void retain_host_sequence(SequenceState& sequence, std::uint32_t lane);
+    void claim_host_sequence(SequenceState& sequence, const RequestPlanImpl& plan, std::uint32_t base);
+    void release_host_residency(SequenceState& sequence) noexcept;
+    void evict_host_retained_lane(std::uint32_t lane) noexcept;
+    void complete_host_transfer(std::uint32_t lane, bool abandoned);
+    void copy_kv_pages_to_host(const PagedKVPool& pool, const PagedKVAllocation& allocation,
+                               std::uint32_t pages, const HostKVAllocationView& host,
+                               cudaStream_t stream) const;
+    void copy_kv_pages_from_host(const PagedKVPool& pool, const PagedKVAllocation& allocation,
+                                 std::uint32_t pages, const HostKVAllocationView& host,
+                                 cudaStream_t stream) const;
+    bool host_transfer_events_done(std::uint32_t lane) const;
+    bool host_retain_copies_done() const;
+    void host_transfer_drain(std::uint32_t lane) const;
     void materialize_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                                  std::uint32_t backend_tokens = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,

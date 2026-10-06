@@ -202,6 +202,19 @@ void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
+std::span<const std::uint32_t> Program<Variant>::harvest_host_retains() {
+    return impl_->harvest_host_retains();
+}
+
+template <>
+void Program<Variant>::wait_host_retain(std::uint32_t lane) { impl_->wait_host_retain(lane); }
+
+template <>
+bool Program<Variant>::has_host_retain_in_flight() const noexcept {
+    return impl_->has_host_retain_in_flight();
+}
+
+template <>
 GenerationTimings Program<Variant>::generation_timings_lane(std::uint32_t lane) const noexcept {
     return impl_->generation_timings_lane(lane);
 }

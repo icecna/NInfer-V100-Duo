@@ -111,7 +111,8 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
+           "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--context-host-cache-mib N] "
+           "[--max-concurrency N] "
            "[--rope native|yarn] [--yarn-factor F] [--yarn-origin O] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2] "
@@ -145,6 +146,10 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
+           "       --context-host-cache-mib defaults to 0 (disabled); reserves that much pinned\n"
+           "       host RAM in total, split evenly across the TP devices, so terminal requests\n"
+           "       can keep their KV out of the device pool; a later request reusing the prefix\n"
+           "       pays one H2D restore instead of a prefill.\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default).\n"
            "       Prefix reuse supports --tp 2 with --spec mtp, including exact prompt hits.\n"
            "       Reuse resumes a retained frontier or complete turn/response checkpoint;\n"
@@ -224,6 +229,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
+        } else if (arg == "--context-host-cache-mib") {
+            const std::uint64_t mib = parse_u64(
+                require_value("--context-host-cache-mib"), "context-host-cache-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--context-host-cache-mib is out of range");
+            }
+            options.context_host_cache_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));

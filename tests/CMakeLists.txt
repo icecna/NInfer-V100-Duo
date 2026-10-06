@@ -74,6 +74,7 @@ ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
 ninfer_add_test(ninfer_decode_graph_test SOURCES test_decode_graph.cpp)
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
+ninfer_add_test(ninfer_host_kv_arena_test SOURCES test_host_kv_arena.cpp)
 ninfer_add_test(ninfer_request_memory_test SOURCES test_request_memory.cpp)
 ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
 ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
@@ -178,6 +179,14 @@ ninfer_add_test(ninfer_qwen3_8_27b_v100-duo_prefix_real_test
   LIBRARIES ninfer_engine)
 target_link_libraries(ninfer_qwen3_8_27b_v100-duo_prefix_real_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_8_27b_v100-duo_prefix_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# Host retained prefix layer: terminal D2H offload + admission H2D claim must be exact
+# round-trips against the device-resident control on the same artifact.
+ninfer_add_test(ninfer_qwen3_8_27b_v100-duo_host_kv_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_v100-duo_host_kv_real.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_8_27b_v100-duo_host_kv_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen3_8_27b_v100-duo_host_kv_real_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 # `--rope yarn` past the native 262144-position window, on real weights, at both tp widths.
 # Artifact-gated; the tp2 leg additionally needs two devices.

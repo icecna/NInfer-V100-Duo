@@ -13,11 +13,15 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
@@ -29,6 +33,28 @@ std::int32_t checked_i32(std::uint32_t value, const char* label) {
         throw std::overflow_error(label);
     }
     return static_cast<std::int32_t>(value);
+}
+
+// Observability for the host retained prefix layer. Gated behind NINFER_HOST_KV_DEBUG so
+// production traffic is untouched; verification scripts run the service with the flag set and
+// audit the printed arena byte accounting, transfer events, and evictions.
+[[nodiscard]] inline bool host_kv_debug_enabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("NINFER_HOST_KV_DEBUG");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    return enabled;
+}
+
+inline void host_kv_debugf(const char* fmt, ...) {
+    if (!host_kv_debug_enabled()) { return; }
+    va_list args;
+    va_start(args, fmt);
+    std::fprintf(stderr, "[ninfer host-kv] ");
+    std::vfprintf(stderr, fmt, args);
+    std::fputc('\n', stderr);
+    std::fflush(stderr);
+    va_end(args);
 }
 
 std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
@@ -481,6 +507,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
         peer->device.synchronize();
     }
     device.synchronize();
+    init_host_kv_cache(plan);
     prepare_graphs();
     work.reset();
     work.reset_peak();
@@ -491,6 +518,27 @@ ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
     if (peer && peer->device.stream != nullptr) {
         (void)cudaStreamSynchronize(peer->device.stream);
+    }
+    if (host_copy_stream != nullptr) { (void)cudaStreamSynchronize(host_copy_stream); }
+    if (host_copy_stream_peer != nullptr) {
+        (void)cudaStreamSynchronize(host_copy_stream_peer);
+    }
+    if (host_copy_gate != nullptr) { (void)cudaEventDestroy(host_copy_gate); }
+    if (host_copy_gate_peer != nullptr) { (void)cudaEventDestroy(host_copy_gate_peer); }
+    if (host_copy_stream != nullptr) { (void)cudaStreamDestroy(host_copy_stream); }
+    if (host_copy_stream_peer != nullptr) { (void)cudaStreamDestroy(host_copy_stream_peer); }
+    // Release host extents only after the copy streams have drained: an in-flight D2H may still
+    // be reading its destination extent, and the arena (a later-declared member) outlives none
+    // of the allocations explicitly here.
+    for (auto& sequence : sequences) { release_host_residency(sequence); }
+    for (auto& transfer : host_retain_transfers) { transfer.reset(); }
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (host_retain_events[lane][0] != nullptr) {
+            (void)cudaEventDestroy(host_retain_events[lane][0]);
+        }
+        if (host_retain_events[lane][1] != nullptr) {
+            (void)cudaEventDestroy(host_retain_events[lane][1]);
+        }
     }
 }
 
@@ -669,6 +717,28 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             : 0U;
     request.lifecycle = Lifecycle::Empty;
     sequence.retained = false;
+    if (sequence.retained_residency == RetainedResidency::Host) {
+        // The prefix lives in the host arena: restore it to device pages before the reuse path
+        // below runs, so every downstream check sees a device-resident lane exactly as before.
+        // The synchronous H2D is the claimed cost of a host claim; the GPU holds no work for
+        // this lane, and the executor is serial by construction.
+        if (request_plan.reuse == ReusePath::FullReset) {
+            release_host_residency(sequence);
+            host_kv_debugf("reset-host lane=%u reason=full-reset occupied=%zu", sequence.lane,
+                           host_kv_cache_used_bytes());
+            sequence.retained_residency = RetainedResidency::None;
+        } else {
+            claim_host_sequence(sequence, request_plan, base);
+        }
+    } else if (sequence.retained_residency == RetainedResidency::HostTransferIn) {
+        // Device pages are still in place (the transfer is conservative), so the reuse path
+        // proceeds unchanged; the in-flight copy is abandoned and its host extent drops back to
+        // the arena when the D2H retires.
+        sequence.retained_residency = RetainedResidency::None;
+        if (auto& transfer = host_retain_transfers[sequence.lane]; transfer) {
+            transfer->abandoned = true;
+        }
+    }
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
             sequence.kv.reset();
@@ -1048,6 +1118,12 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
                 release_sequence_growth_entitlement(sequence);
                 unbind_sequence_kv(sequence);
                 sequence.retained = true;
+                sequence.retained_residency = RetainedResidency::Device;
+                // Offload the retained prefix to the host arena (no-op when disabled or when
+                // capacity requires keeping it device-resident). Runs before the response
+                // completes so the D2H rides the stream behind the final round without blocking
+                // the last tokens.
+                retain_host_sequence(sequence, lanes[row]);
                 request.lifecycle = Lifecycle::Complete;
             } else {
                 request.lifecycle = Lifecycle::Active;
@@ -1075,7 +1151,515 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
     if (!has_retained_lane(lane)) { return; }
     clear_lane(sequences[lane], requests[lane]);
+    host_kv_debugf("retained-evict lane=%u reason=admission occupied=%zu", lane,
+                   host_kv_cache_used_bytes());
 }
+
+// ---------------------------------------------------------------------------
+// Host-backed retained prefixes
+//
+// A terminal request's paged KV (text pool + MTP backend pool, per device) can be copied to the
+// per-device pinned host arena so the device pages return to the pool immediately. The copy is
+// stream-ordered behind the final round and its completion is polled at executor boundaries;
+// while in flight the lane behaves exactly like a device-resident retain. A later admission that
+// reuses the prefix claims it: fresh device pages, synchronous H2D, then the ordinary reuse
+// path. GDN linear state never moves -- it stays in the lane's own per-lane device slot, which is
+// what keeps lane-affine reuse valid across the round trip.
+// ---------------------------------------------------------------------------
+
+void ProgramImplCore::init_host_kv_cache(const SequencePlanImpl& plan) {
+    host_kv_cache_bytes = plan.context_host_cache_bytes;
+    if (host_kv_cache_bytes == 0) { return; }
+    if (speculative_backend == SpeculativeBackend::DFlash) {
+        throw std::invalid_argument("the host retained-prefix cache has no DFlash path");
+    }
+    if (speculative_backend == SpeculativeBackend::None) {
+        // The retain hook itself is backend-agnostic, but the reuse planner's checkpoint
+        // arithmetic (turn checkpoint at prompt_end - 2) is qualified for the MTP route only;
+        // the non-speculative route has no host retained-prefix path.
+        throw std::invalid_argument(
+            "the host retained-prefix cache requires --spec mtp (the non-speculative reuse "
+            "route has no qualified path)");
+    }
+    const std::size_t per_device = host_kv_cache_bytes / static_cast<std::size_t>(tp);
+    if (per_device == 0) {
+        throw std::invalid_argument("context host cache is smaller than one tp share");
+    }
+    auto layouts_for = [](qwen3_6::DecoderState& decoder) {
+        std::vector<HostKVPageLayout> layouts;
+        layouts.push_back(plan_host_kv_page_layout(decoder.text_kv.pool().spec()));
+        if (decoder.mtp_cache() != nullptr) {
+            layouts.push_back(plan_host_kv_page_layout(decoder.mtp_cache()->pool().spec()));
+        }
+        return layouts;
+    };
+    host_kv_arena.emplace(per_device, layouts_for(*decoder));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&host_copy_stream, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaEventCreateWithFlags(&host_copy_gate, cudaEventDisableTiming));
+    if (peer) {
+        // Pinned backing for the peer rank is allocated with that device current.
+        const ScopedDevice scope(peer->device.device);
+        host_kv_arena_peer.emplace(per_device, layouts_for(*peer->decoder));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&host_copy_stream_peer, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&host_copy_gate_peer, cudaEventDisableTiming));
+    }
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&host_retain_events[lane][0], cudaEventDisableTiming));
+        if (peer) {
+            const ScopedDevice scope(peer->device.device);
+            CUDA_CHECK(
+                cudaEventCreateWithFlags(&host_retain_events[lane][1], cudaEventDisableTiming));
+        }
+    }
+}
+
+void ProgramImplCore::copy_kv_pages_to_host(const PagedKVPool& pool,
+                                            const PagedKVAllocation& allocation,
+                                            std::uint32_t pages,
+                                            const HostKVAllocationView& host,
+                                            cudaStream_t stream) const {
+    const HostKVPageLayout& layout = host.layout();
+    if (pool.spec().plane_order != PagedKVPlaneOrder::PageMajor) {
+        throw std::logic_error("host retained-prefix cache requires PageMajor KV pools");
+    }
+    if (pool.plane_count() != layout.planes.size()) {
+        throw std::logic_error("host KV layout does not match the pool plane set");
+    }
+    const std::span<const std::int32_t> page_ids = allocation.page_ids();
+    if (page_ids.size() < pages) {
+        throw std::logic_error("host KV transfer exceeds the allocation's mapped pages");
+    }
+    std::byte* host_base = host.data();
+    for (std::uint32_t page = 0; page < pages; ++page) {
+        const std::int32_t physical = page_ids[page];
+        std::byte* dst = host_base + static_cast<std::size_t>(page) * layout.page_stride;
+        for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+            const Tensor& slab      = pool.plane(plane);
+            // The device per-page extent (last-dim stride of the PageMajor slab) must equal the
+            // host plane payload; the layouts are derived from the same plane specs.
+            if (slab.nb[3] != static_cast<std::int64_t>(layout.planes[plane].page_payload_bytes)) {
+                throw std::logic_error("host KV page payload does not match the device pool");
+            }
+            const std::byte* src = static_cast<const std::byte*>(slab.data) +
+                                   static_cast<std::size_t>(physical) * static_cast<std::size_t>(slab.nb[3]);
+            CUDA_CHECK(cudaMemcpyAsync(dst + layout.planes[plane].offset, src,
+                                       layout.planes[plane].page_payload_bytes,
+                                       cudaMemcpyDeviceToHost, stream));
+        }
+    }
+}
+
+void ProgramImplCore::copy_kv_pages_from_host(const PagedKVPool& pool,
+                                              const PagedKVAllocation& allocation,
+                                              std::uint32_t pages,
+                                              const HostKVAllocationView& host,
+                                              cudaStream_t stream) const {
+    const HostKVPageLayout& layout = host.layout();
+    if (pool.spec().plane_order != PagedKVPlaneOrder::PageMajor) {
+        throw std::logic_error("host retained-prefix cache requires PageMajor KV pools");
+    }
+    if (pool.plane_count() != layout.planes.size()) {
+        throw std::logic_error("host KV layout does not match the pool plane set");
+    }
+    const std::span<const std::int32_t> page_ids = allocation.page_ids();
+    if (page_ids.size() < pages) {
+        throw std::logic_error("host KV transfer exceeds the allocation's mapped pages");
+    }
+    const std::byte* host_base = host.data();
+    for (std::uint32_t page = 0; page < pages; ++page) {
+        const std::int32_t physical = page_ids[page];
+        const std::byte* src = host_base + static_cast<std::size_t>(page) * layout.page_stride;
+        for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+            const Tensor& slab = pool.plane(plane);
+            if (slab.nb[3] != static_cast<std::int64_t>(layout.planes[plane].page_payload_bytes)) {
+                throw std::logic_error("host KV page payload does not match the device pool");
+            }
+            std::byte* dst = static_cast<std::byte*>(slab.data) +
+                             static_cast<std::size_t>(physical) * static_cast<std::size_t>(slab.nb[3]);
+            CUDA_CHECK(cudaMemcpyAsync(dst, src + layout.planes[plane].offset,
+                                       layout.planes[plane].page_payload_bytes,
+                                       cudaMemcpyHostToDevice, stream));
+        }
+    }
+}
+
+bool ProgramImplCore::host_transfer_events_done(std::uint32_t lane) const {
+    // Peer first, then rank 0: the same order the round's own drain uses. cudaEventQuery
+    // returns cudaErrorNotReady as its normal "still running" status, not a fault.
+    if (peer) {
+        const cudaError_t status = cudaEventQuery(host_retain_events[lane][1]);
+        if (status == cudaErrorNotReady) { return false; }
+        CUDA_CHECK(status);
+    }
+    const cudaError_t status = cudaEventQuery(host_retain_events[lane][0]);
+    if (status == cudaErrorNotReady) { return false; }
+    CUDA_CHECK(status);
+    return true;
+}
+
+void ProgramImplCore::host_transfer_drain(std::uint32_t lane) const {
+    if (peer) { CUDA_CHECK(cudaEventSynchronize(host_retain_events[lane][1])); }
+    CUDA_CHECK(cudaEventSynchronize(host_retain_events[lane][0]));
+}
+
+void ProgramImplCore::complete_host_transfer(std::uint32_t lane, bool abandoned) {
+    auto& transfer = host_retain_transfers[lane];
+    if (!transfer) { return; }
+    if (!abandoned) {
+        SequenceState& sequence = sequences[lane];
+        if (!sequence.retained || sequence.retained_residency != RetainedResidency::HostTransferIn) {
+            throw std::logic_error("host retain transfer completed for a lane that moved on");
+        }
+        sequence.host_kv.text_local    = std::move(transfer->text_local);
+        sequence.host_kv.text_peer     = std::move(transfer->text_peer);
+        sequence.host_kv.backend_local = std::move(transfer->backend_local);
+        sequence.host_kv.backend_peer  = std::move(transfer->backend_peer);
+        // The device pages are no longer needed; their block-table row was unbound at the
+        // terminal, so releasing the bundle just returns the physical pages to the pool.
+        sequence.kv.reset();
+        sequence.retained_residency = RetainedResidency::Host;
+        sequence.host_lru_stamp     = ++host_lru_counter;
+    }
+    // Abandoned or not, the in-flight record is retired: the host extents release back to the
+    // arena NOW that both device events report completion, so no reader or writer of those
+    // extents can still be in flight.
+    transfer.reset();
+    host_kv_debugf("complete lane=%u abandoned=%d occupied=%zu", lane,
+                   abandoned ? 1 : 0, host_kv_cache_used_bytes());
+}
+
+void ProgramImplCore::release_host_residency(SequenceState& sequence) noexcept {
+    sequence.host_kv.text_local.reset();
+    sequence.host_kv.text_peer.reset();
+    sequence.host_kv.backend_local.reset();
+    sequence.host_kv.backend_peer.reset();
+}
+
+void ProgramImplCore::evict_host_retained_lane(std::uint32_t lane) noexcept {
+    SequenceState& sequence = sequences[lane];
+    if (!sequence.retained || sequence.retained_residency != RetainedResidency::Host) {
+        return;
+    }
+    // clear_lane releases the host extents (residency Host) and wipes the lane state.
+    clear_lane(sequence, requests[lane]);
+    host_eviction_pending.push_back(lane);
+    host_kv_debugf("evict lane=%u occupied=%zu", lane, host_kv_cache_used_bytes());
+}
+
+std::span<const std::uint32_t> ProgramImplCore::harvest_host_retains() {
+    if (host_kv_cache_bytes == 0) { return {}; }
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (!host_retain_transfers[lane]) { continue; }
+        if (!host_transfer_events_done(lane)) { continue; }
+        const bool abandoned = host_retain_transfers[lane]->abandoned;
+        complete_host_transfer(lane, abandoned);
+    }
+    host_eviction_report.clear();
+    for (std::uint32_t lane : host_eviction_pending) { host_eviction_report.push_back(lane); }
+    host_eviction_pending.clear();
+    return host_eviction_report;
+}
+
+void ProgramImplCore::wait_host_retain(std::uint32_t lane) {
+    if (lane >= max_concurrency) { return; }
+    auto& transfer = host_retain_transfers[lane];
+    if (!transfer) { return; }
+    // The transfer's source pages are still owned by the lane's kv bundle (released only at
+    // finalize), so draining here cannot race a rewrite: the lane is slot-free, and the copy
+    // either completes into the arena (usable) or had already been marked abandoned by a
+    // clear_lane on this same lane (dropped, exactly as the harvest boundary would do).
+    host_transfer_drain(lane);
+    complete_host_transfer(lane, transfer->abandoned);
+}
+
+bool ProgramImplCore::has_host_retain_in_flight() const noexcept {
+    for (const auto& transfer : host_retain_transfers) {
+        if (transfer) { return true; }
+    }
+    return false;
+}
+
+bool ProgramImplCore::host_retain_copies_done() const {
+    // True when nothing is in flight, or when every in-flight D2H's device events report
+    // completion (the bytes have moved; the harvest at the next boundary can finalize).
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (host_retain_transfers[lane] && !host_transfer_events_done(lane)) { return false; }
+    }
+    return true;
+}
+
+std::size_t ProgramImplCore::host_kv_cache_capacity() const noexcept {
+    return host_kv_cache_bytes;
+}
+
+std::size_t ProgramImplCore::host_kv_cache_used_bytes() const noexcept {
+    return (host_kv_arena ? host_kv_arena->occupied_bytes() : 0) +
+           (host_kv_arena_peer ? host_kv_arena_peer->occupied_bytes() : 0);
+}
+
+void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_t lane) {
+    if (host_kv_cache_bytes == 0) { return; }
+    if (!sequence.kv) { host_kv_debugf("retain-skip lane=%u reason=no-kv", lane); return; }
+    const std::uint32_t text_pages = sequence.kv->text.mapped_page_count();
+    if (text_pages == 0) { host_kv_debugf("retain-skip lane=%u reason=empty", lane); return; }
+    const std::uint32_t backend_pages =
+        sequence.kv->backend ? sequence.kv->backend->mapped_page_count() : 0U;
+
+    const HostKVPageLayout* text_layout =
+        host_kv_arena->layout_for(decoder->text_kv.pool().spec());
+    const HostKVPageLayout* backend_layout =
+        backend_pages != 0 ? host_kv_arena->layout_for(backend_kv_cache()->pool().spec())
+                           : nullptr;
+    if (text_layout == nullptr || (backend_pages != 0 && backend_layout == nullptr)) {
+        host_kv_debugf("retain-skip lane=%u reason=no-layout", lane);
+        return;
+    }
+    const bool have_peer       = sequence.kv->text_peer.has_value();
+    const bool have_backend    = sequence.kv->backend.has_value();
+    const bool have_peer_backend = sequence.kv->backend_peer.has_value();
+    const HostKVPageLayout* peer_text_layout =
+        have_peer ? host_kv_arena_peer->layout_for(peer->decoder->text_kv.pool().spec()) : nullptr;
+    const HostKVPageLayout* peer_backend_layout =
+        have_peer_backend
+            ? host_kv_arena_peer->layout_for(peer->decoder->mtp_cache()->pool().spec())
+            : nullptr;
+    if ((have_peer && peer_text_layout == nullptr) ||
+        (have_peer_backend && peer_backend_layout == nullptr)) {
+        host_kv_debugf("retain-skip lane=%u reason=no-peer-layout", lane);
+        return;
+    }
+
+    // Sequential feasibility per arena: text (always) plus the backend when present. Each
+    // region needs its own contiguous free extent; the sequential simulation must agree with
+    // the real ordered allocation that follows, so per-region can_allocate is NOT enough
+    // (it over-approximates when the regions' combined size exceeds the largest free extent
+    // while each region alone fits). The peer branch mirrors the real allocation's outer
+    // `if (have_peer)` guard exactly: the bundle constructor always creates text_peer with the
+    // peer rank, so have_peer_backend && !have_peer is unreachable by construction.
+    const auto fits = [&]() {
+        std::array<HostKVAllocationPlan, 2> local_plan{{text_layout, text_pages}};
+        std::size_t local_regions = 1;
+        if (have_backend) { local_plan[local_regions++] = {backend_layout, backend_pages}; }
+        if (!host_kv_arena->can_allocate_all({local_plan.data(), local_regions})) {
+            return false;
+        }
+        if (have_peer) {
+            std::array<HostKVAllocationPlan, 2> peer_plan{{peer_text_layout, text_pages}};
+            std::size_t peer_regions = 1;
+            if (have_peer_backend) {
+                peer_plan[peer_regions++] = {peer_backend_layout, backend_pages};
+            }
+            if (!host_kv_arena_peer->can_allocate_all({peer_plan.data(), peer_regions})) {
+                return false;
+            }
+        }
+        return true;
+    };
+    std::vector<std::uint32_t> evicted;
+    while (!fits()) {
+        // Evict the oldest host-resident retained lane (this lane excluded; in-flight lanes have
+        // no stamp and cannot be victims). Single-threaded executor: release-then-allocate can
+        // never observe a torn arena state.
+        std::uint32_t victim = 0;
+        bool have_victim     = false;
+        std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
+        for (std::uint32_t other = 0; other < max_concurrency; ++other) {
+            if (other == lane) { continue; }
+            const SequenceState& candidate = sequences[other];
+            if (!candidate.retained ||
+                candidate.retained_residency != RetainedResidency::Host) {
+                continue;
+            }
+            if (candidate.host_lru_stamp < oldest) {
+                oldest      = candidate.host_lru_stamp;
+                victim      = other;
+                have_victim = true;
+            }
+        }
+        if (!have_victim) { break; }
+        evict_host_retained_lane(victim);
+        evicted.push_back(victim);
+    }
+    if (!fits()) {
+        host_kv_debugf("retain-skip lane=%u reason=capacity", lane);
+        return;
+    } // stays device-resident; device eviction takes it later
+
+    // A fast terminal in the same lane may leave its own in-flight transfer behind; it is
+    // necessarily abandoned (the lane went active again), drain it so the slot is free.
+    if (host_retain_transfers[lane]) {
+        host_transfer_drain(lane);
+        complete_host_transfer(lane, host_retain_transfers[lane]->abandoned);
+    }
+
+    HostRetainTransfer& transfer = host_retain_transfers[lane].emplace();
+    transfer.text_local = host_kv_arena->allocate(*text_layout, text_pages);
+    if (!transfer.text_local) {
+        host_retain_transfers[lane].reset();
+        throw std::logic_error("host KV retain allocation failed after feasibility check");
+    }
+    if (have_backend) {
+        transfer.backend_local = host_kv_arena->allocate(*backend_layout, backend_pages);
+        if (!transfer.backend_local) {
+            host_retain_transfers[lane].reset();
+            throw std::logic_error("host KV retain allocation failed after feasibility check");
+        }
+    }
+    if (have_peer) {
+        const ScopedDevice scope(peer->device.device);
+        transfer.text_peer = host_kv_arena_peer->allocate(*peer_text_layout, text_pages);
+        if (!transfer.text_peer) {
+            host_retain_transfers[lane].reset();
+            throw std::logic_error("peer host KV retain allocation failed after feasibility check");
+        }
+        if (have_peer_backend) {
+            transfer.backend_peer = host_kv_arena_peer->allocate(*peer_backend_layout,
+                                                                 backend_pages);
+            if (!transfer.backend_peer) {
+                host_retain_transfers[lane].reset();
+                throw std::logic_error(
+                    "peer host KV retain allocation failed after feasibility check");
+            }
+        }
+    }
+
+    // The copies run on the dedicated pinned-transfer streams behind a gate on the compute
+    // stream, so they cannot stall the other lanes' rounds; the events arm on the copy streams.
+    CUDA_CHECK(cudaEventRecord(host_copy_gate, device.stream));
+    CUDA_CHECK(cudaStreamWaitEvent(host_copy_stream, host_copy_gate, 0));
+    copy_kv_pages_to_host(decoder->text_kv.pool(), sequence.kv->text, text_pages,
+                          host_kv_arena->view(*transfer.text_local), host_copy_stream);
+    if (have_backend) {
+        copy_kv_pages_to_host(backend_kv_cache()->pool(), *sequence.kv->backend, backend_pages,
+                              host_kv_arena->view(*transfer.backend_local), host_copy_stream);
+    }
+    if (have_peer) {
+        const ScopedDevice scope(peer->device.device);
+        CUDA_CHECK(cudaEventRecord(host_copy_gate_peer, peer->device.stream));
+        CUDA_CHECK(cudaStreamWaitEvent(host_copy_stream_peer, host_copy_gate_peer, 0));
+        copy_kv_pages_to_host(peer->decoder->text_kv.pool(), *sequence.kv->text_peer, text_pages,
+                              host_kv_arena_peer->view(*transfer.text_peer), host_copy_stream_peer);
+        if (have_peer_backend) {
+            copy_kv_pages_to_host(peer->decoder->mtp_cache()->pool(), *sequence.kv->backend_peer,
+                                  backend_pages,
+                                  host_kv_arena_peer->view(*transfer.backend_peer),
+                                  host_copy_stream_peer);
+        }
+    }
+    CUDA_CHECK(cudaEventRecord(host_retain_events[lane][0], host_copy_stream));
+    if (peer) { CUDA_CHECK(cudaEventRecord(host_retain_events[lane][1], host_copy_stream_peer)); }
+    sequence.retained_residency = RetainedResidency::HostTransferIn;
+    std::string evicted_str = evicted.empty() ? "none" : "";
+    for (std::size_t i = 0; i < evicted.size(); ++i) {
+        if (i != 0) { evicted_str += ","; }
+        evicted_str += std::to_string(evicted[i]);
+    }
+    host_kv_debugf(
+        "retain lane=%u text_pages=%u backend_pages=%u local_bytes=%zu peer_bytes=%zu evicted=%s "
+        "occupied=%zu",
+        lane, text_pages, backend_pages,
+        static_cast<std::size_t>(text_pages) * text_layout->page_stride +
+            static_cast<std::size_t>(backend_pages) *
+                (backend_layout ? backend_layout->page_stride : 0),
+        static_cast<std::size_t>(text_pages) * (peer_text_layout ? peer_text_layout->page_stride : 0) +
+            static_cast<std::size_t>(backend_pages) *
+                (peer_backend_layout ? peer_backend_layout->page_stride : 0),
+        evicted_str.c_str(), host_kv_cache_used_bytes());
+}
+
+void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const RequestPlanImpl& plan,
+                                          std::uint32_t base) {
+    // The caller verified residency == Host and reuse != FullReset. Restore exactly the prefix
+    // the reuse path consumes: the first `base` text tokens, and (MTP) the first `base - 1`
+    // backend tokens, which is the most any reuse path may read (the plan guarantees
+    // mtp_kv_valid >= base - 1).
+    const std::uint32_t text_pages    = pages_for_tokens(base);
+    const std::uint32_t backend_pages =
+        (speculative_backend == SpeculativeBackend::Mtp && base > 0) ? pages_for_tokens(base - 1)
+                                                                     : 0U;
+    const auto claim_start = Clock::now();
+    const std::size_t claim_bytes = [&] {
+        std::size_t bytes = 0;
+        if (text_pages > 0) {
+            const HostKVPageLayout* lt = host_kv_arena->layout_for(decoder->text_kv.pool().spec());
+            if (lt) { bytes += static_cast<std::size_t>(text_pages) * lt->page_stride; }
+            if (sequence.host_kv.text_peer) {
+                const HostKVPageLayout* lpt =
+                    host_kv_arena_peer->layout_for(peer->decoder->text_kv.pool().spec());
+                if (lpt) { bytes += static_cast<std::size_t>(text_pages) * lpt->page_stride; }
+            }
+        }
+        if (backend_pages > 0) {
+            const HostKVPageLayout* lb =
+                host_kv_arena->layout_for(backend_kv_cache()->pool().spec());
+            if (lb) { bytes += static_cast<std::size_t>(backend_pages) * lb->page_stride; }
+            if (sequence.host_kv.backend_peer) {
+                const HostKVPageLayout* lbp =
+                    host_kv_arena_peer->layout_for(peer->decoder->mtp_cache()->pool().spec());
+                if (lbp) { bytes += static_cast<std::size_t>(backend_pages) * lbp->page_stride; }
+            }
+        }
+        return bytes;
+    }();
+    reserve_sequence_kv(sequence, plan.text_kv_page_entitlement, plan.backend_kv_page_entitlement);
+    try {
+        if (text_pages > 0) {
+            sequence.kv->text.materialize_pages(text_pages, device.stream);
+            if (sequence.kv->text_peer) {
+                const ScopedDevice scope(peer->device.device);
+                sequence.kv->text_peer->materialize_pages(text_pages, peer->device.stream);
+            }
+        }
+        if (backend_pages > 0) {
+            sequence.kv->backend->materialize_pages(backend_pages, device.stream);
+            if (sequence.kv->backend_peer) {
+                const ScopedDevice scope(peer->device.device);
+                sequence.kv->backend_peer->materialize_pages(backend_pages, peer->device.stream);
+            }
+        }
+        if (text_pages > 0 && sequence.host_kv.text_local) {
+            copy_kv_pages_from_host(decoder->text_kv.pool(), sequence.kv->text, text_pages,
+                                    host_kv_arena->view(*sequence.host_kv.text_local),
+                                    device.stream);
+            if (sequence.kv->text_peer && sequence.host_kv.text_peer) {
+                const ScopedDevice scope(peer->device.device);
+                copy_kv_pages_from_host(peer->decoder->text_kv.pool(), *sequence.kv->text_peer,
+                                        text_pages,
+                                        host_kv_arena_peer->view(*sequence.host_kv.text_peer),
+                                        peer->device.stream);
+            }
+        }
+        if (backend_pages > 0 && sequence.host_kv.backend_local) {
+            copy_kv_pages_from_host(backend_kv_cache()->pool(), *sequence.kv->backend,
+                                    backend_pages,
+                                    host_kv_arena->view(*sequence.host_kv.backend_local),
+                                    device.stream);
+            if (sequence.kv->backend_peer && sequence.host_kv.backend_peer) {
+                const ScopedDevice scope(peer->device.device);
+                copy_kv_pages_from_host(peer->decoder->mtp_cache()->pool(),
+                                        *sequence.kv->backend_peer, backend_pages,
+                                        host_kv_arena_peer->view(*sequence.host_kv.backend_peer),
+                                        peer->device.stream);
+            }
+        }
+        // The reuse path below issues KV reads on both streams; the claim must be settled before
+        // the first of them.
+        if (peer) { CUDA_CHECK(cudaStreamSynchronize(peer->device.stream)); }
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+    } catch (...) {
+        unbind_sequence_kv(sequence);
+        sequence.kv.reset();
+        throw;
+    }
+    const double h2d_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - claim_start).count();
+    release_host_residency(sequence);
+    sequence.retained_residency = RetainedResidency::None;
+    host_kv_debugf("claim lane=%u text_pages=%u backend_pages=%u bytes=%zu h2d_ms=%.3f occupied=%zu",
+                   sequence.lane, text_pages, backend_pages, claim_bytes, h2d_ms,
+                   host_kv_cache_used_bytes());
+}
+
 
 GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) const noexcept {
     return lane < max_concurrency ? requests[lane].timings : GenerationTimings{};
@@ -1087,6 +1671,21 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
+    // A host-resident retained lane is evicted: its copies are dropped back to the arena. A
+    // still-in-flight retain is abandoned -- its host extent stays owned by the transfer table
+    // until the stream-ordered D2H retires, so no other allocation can observe the partially
+    // written extent. The device pages released here MAY be re-issued to another request on
+    // the compute stream while the abandoned D2H is still reading them (the two streams have
+    // no ordering); that overlap is benign because the abandoned transfer's destination is
+    // never published -- the copy may observe any page contents, and nobody reads the result.
+    if (sequence.retained_residency == RetainedResidency::Host) {
+        release_host_residency(sequence);
+    }
+    if (sequence.retained_residency == RetainedResidency::HostTransferIn) {
+        if (auto& transfer = host_retain_transfers[sequence.lane]; transfer) {
+            transfer->abandoned = true;
+        }
+    }
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
     sequence.execution_frontier = 0;
@@ -1099,6 +1698,9 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.mtp_draft_count         = 0;
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
+    sequence.retained_residency      = RetainedResidency::None;
+    sequence.host_kv                 = {};
+    sequence.host_lru_stamp          = 0;
     sequence.rewrite_checkpoint      = {};
     request.pending                  = {};
 }
@@ -2865,6 +3467,11 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.cuda_graph_node_count          = graph_node_count;
     out.kv_payload_bytes               = kv_payload_bytes;
     out.gdn_state_bytes                = gdn_state_bytes;
+    out.host_kv_cache_bytes            = host_kv_cache_bytes;
+    out.host_kv_cache_occupied_bytes   =
+        (host_kv_arena ? host_kv_arena->occupied_bytes() : 0) +
+        (host_kv_arena_peer ? host_kv_arena_peer->occupied_bytes() : 0);
+    out.host_kv_retain_complete       = host_retain_copies_done();
     return out;
 }
 

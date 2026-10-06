@@ -32,6 +32,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -168,6 +169,7 @@ struct GenerationScript {
     // When set, decode_batch throws instead of licensing the token at this index. This is the
     // engine-scope leg: a Program/CUDA failure, not an output-session failure.
     int throw_at_decode_index = -1;
+    int consumed_lane          = -1; // set by start_prefill_lane (lane-selection test hook);
 };
 
 class ScriptedProgram {
@@ -175,6 +177,14 @@ public:
     explicit ScriptedProgram(std::uint32_t max_concurrency) : max_concurrency_(max_concurrency) {}
 
     void push_script(GenerationScript script) { queued_.push_back(std::move(script)); }
+
+    // Lane-selection test hook: a lane marked retained must never be admitted by a plan that
+    // does not reuse its prefix (the scripted plans always report reusable_prompt_tokens == 0).
+    void mark_retained_lane(std::uint32_t lane) { retained_lanes_.insert(lane); }
+    [[nodiscard]] int consumed_lane() const noexcept {
+        for (const GenerationScript& s : consumed_) { if (s.consumed_lane >= 0) { return s.consumed_lane; } }
+        return -1;
+    }
 
     [[nodiscard]] rt::AdmissionResources admission_capacity() const noexcept {
         return rt::AdmissionResources{
@@ -211,7 +221,8 @@ public:
 
     [[nodiscard]] bool can_admit_lane_after_retained_eviction(std::uint32_t lane,
                                                               const ScriptedPlan& plan) const noexcept {
-        return can_admit_lane(lane, plan);
+        // Evicting the lane's own retained prefix always frees enough room for the plan.
+        return can_admit_lane(lane, plan) || (lane < max_concurrency_ && has_retained_lane(lane));
     }
 
     rt::PrefillStepResult start_prefill_lane(std::uint32_t lane, q36::PreparedPrompt&& prompt,
@@ -219,6 +230,8 @@ public:
         if (queued_.empty()) { throw std::logic_error("scripted program has no remaining script"); }
         Lane& state     = lanes_[lane];
         state.script    = std::move(queued_.front());
+        consumed_.push_back(state.script);
+        consumed_.back().consumed_lane = static_cast<int>(lane);
         queued_.pop_front();
         state.lifecycle = Lifecycle::Active;
         state.emitted   = 0;
@@ -298,8 +311,13 @@ public:
         if (lane < max_concurrency_) { clear(lane); }
     }
 
-    [[nodiscard]] bool has_retained_lane(std::uint32_t) const noexcept { return false; }
-    void evict_retained_lane(std::uint32_t) noexcept {}
+    [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept {
+        return retained_lanes_.count(lane) != 0;
+    }
+    void evict_retained_lane(std::uint32_t lane) noexcept { retained_lanes_.erase(lane); }
+    [[nodiscard]] std::span<const std::uint32_t> harvest_host_retains() { return {}; }
+    void wait_host_retain(std::uint32_t) {}
+    [[nodiscard]] bool has_host_retain_in_flight() const noexcept { return false; }
     [[nodiscard]] ninfer::GenerationTimings generation_timings_lane(std::uint32_t) const noexcept {
         return {};
     }
@@ -356,6 +374,8 @@ private:
     const std::uint32_t max_concurrency_;
     std::array<Lane, ninfer::kMaximumConcurrency> lanes_{};
     std::deque<GenerationScript> queued_;
+    std::vector<GenerationScript> consumed_;
+    std::set<std::uint32_t> retained_lanes_;
     std::vector<TokenId> batch_;
     std::size_t maximum_batch_rows_ = 0;
 };
@@ -682,6 +702,31 @@ void test_engine_scope_failure_still_fails_all(const q36::Frontend& frontend,
            "a request after a device failure was not refused as unavailable");
 }
 
+// Lane admission must not destroy a retained prefix it does not reuse: with lane 0 retained and
+// lane 1 free, a non-reusing request is admitted on lane 1. Admitting it on lane 0 would
+// FullReset the retained prefix -- exactly the shared-service incident (a 54-token request from a
+// different client destroyed a 90k-token retained prefix on its lane).
+void test_non_reusing_request_avoids_retained_lane(const q36::Frontend& frontend,
+                                                   const ninfer::DeviceContext& device) {
+    ScriptedInstance instance{.loaded  = std::make_shared<ScriptedLoaded>(ScriptedLoaded{frontend}),
+                              .program = std::make_unique<ScriptedProgram>(2),
+                              .request_memory         = {},
+                              .kv_capacity_resolution = {}};
+    instance.program->mark_retained_lane(0); // simulated retained prefix on lane 0
+    instance.program->push_script(GenerationScript{.tokens = {0, 29}});
+    Executor executor(instance, executor_options(2), device);
+
+    const Outcome outcome = run_request(executor, frontend, 2);
+    expect(outcome.ok && outcome.content == "xb",
+           "the request on the non-retained lane did not complete exactly");
+    expect(instance.program->consumed_lane() == 1,
+           "a non-reusing request was admitted on the retained lane (it would destroy the "
+           "prefix)");
+    expect(instance.program->has_retained_lane(0),
+           "the retained lane was disturbed by an admission that did not reuse it");
+    expect(instance.program->all_lanes_idle(), "a lane was left active after the request");
+}
+
 } // namespace
 
 int main() {
@@ -695,6 +740,7 @@ int main() {
 
     test_decoder_conformance(frontend);
     test_invalid_utf8_request_completes(frontend, device);
+    test_non_reusing_request_avoids_retained_lane(frontend, device);
     test_multi_row_isolation(frontend, device);
     test_request_scope_failure_is_isolated(frontend, device, true);
     test_request_scope_failure_is_isolated(frontend, device, false);

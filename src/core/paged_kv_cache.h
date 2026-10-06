@@ -102,6 +102,7 @@ public:
     PagedKVPool& operator=(PagedKVPool&&)      = delete;
 
     [[nodiscard]] std::uint32_t page_group_count() const noexcept;
+    [[nodiscard]] const PagedKVPoolSpec& spec() const noexcept { return spec_; }
     [[nodiscard]] std::uint32_t logical_page_capacity() const noexcept;
     [[nodiscard]] std::int32_t table_row_count() const noexcept;
     [[nodiscard]] std::size_t plane_count() const noexcept;

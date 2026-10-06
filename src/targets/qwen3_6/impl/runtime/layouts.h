@@ -87,6 +87,10 @@ struct SequencePlanningInputs {
     // channels) is the model's own extent divided by `tp`, because each device holds only its own
     // head shard. Page COUNTS are not divided: all devices carry the same pages.
     int tp = 1;
+    // Total pinned host bytes backing the retained-prefix host cache, split evenly across the tp
+    // devices. Zero disables the feature (retains stay device-resident, exactly the old path).
+    // Carried like rope: the Program reads it from the plan, not from EngineOptions.
+    std::size_t context_host_cache_bytes = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -116,6 +120,8 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool use_cuda_graph = true;
     int device          = 0;
     int tp              = 1;
+    // See SequencePlanningInputs: host cache bytes carried so the Program can build its arenas.
+    std::size_t context_host_cache_bytes = 0;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t request_transient_capacity_bytes = 0;

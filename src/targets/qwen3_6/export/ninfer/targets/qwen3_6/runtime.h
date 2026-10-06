@@ -172,6 +172,18 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+    // Polls in-flight retain D2H transfers at an executor boundary: a completed transfer parks
+    // its copies in the host arena and returns the device pages to the pool (or, when the lane
+    // moved on first, just drops the host extent). Returns the lanes whose host-retained state
+    // was discarded by an LRU host eviction since the last call, so the executor can invalidate
+    // their lane plans. No-op while the host cache is disabled.
+    [[nodiscard]] std::span<const std::uint32_t> harvest_host_retains();
+    // Blocks until any in-flight retain D2H on `lane` is finalized (the prefix becomes
+    // host-resident and its device pages are released); no-op when no transfer is in flight.
+    // Admission planning calls it before reading the lane's retained state so a just-finished
+    // conversation is visible to the reuse pass instead of being destroyed by a FullReset.
+    void wait_host_retain(std::uint32_t lane);
+    [[nodiscard]] bool has_host_retain_in_flight() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

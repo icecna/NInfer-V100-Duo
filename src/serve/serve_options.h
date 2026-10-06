@@ -33,6 +33,11 @@ struct ServeOptions {
     double yarn_factor                     = 4.0;
     std::uint32_t yarn_origin              = 262144;
     KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
+    // Pinned host bytes for the retained-prefix host cache; 0 disables it (the default).
+    // Terminal requests offload their paged KV here and free device pages; prefix reuse later
+    // restores it with one synchronous H2D. The budget is split evenly across --tp ranks.
+    // Serve flag: --context-host-cache-mib.
+    std::size_t context_host_cache_bytes   = 0;
     std::uint32_t max_concurrency          = 1;
     std::uint32_t max_pending_requests     = 16;
     std::uint32_t pending_timeout_ms       = 30000;

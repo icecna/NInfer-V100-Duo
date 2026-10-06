@@ -110,6 +110,12 @@ struct EngineOptions {
     double yarn_factor                 = 4.0;
     std::uint32_t yarn_origin          = 262144;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
+    // Pinned host bytes backing the retained-prefix host cache; 0 disables it (the default).
+    // A terminal request's paged KV is copied there and its device pages return to the pool;
+    // reusing the prefix later restores it with one synchronous H2D. The budget is split
+    // evenly across tp ranks. Serve-only knob (--context-host-cache-mib); a one-shot CLI
+    // session terminates its lanes and gains nothing.
+    std::size_t context_host_cache_bytes = 0;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
@@ -458,6 +464,15 @@ struct MemorySummary {
     std::uint32_t kv_capacity                 = 0; // Resolved page-aligned Main KV capacity.
     std::uint32_t kv_capacity_page_groups     = 0;
     std::uint32_t kv_capacity_max_page_groups = 0;
+    // Pinned host bytes of the retained-prefix host cache (0 = disabled) and the portion
+    // occupied by host-resident retained lanes. Host resource, summed over tp ranks.
+    std::size_t host_kv_cache_bytes          = 0;
+    std::size_t host_kv_cache_occupied_bytes = 0;
+    // False while an in-flight terminal D2H retain still has pending device events. A caller
+    // may poll this (via memory_summary) before submitting the next request, so that the next
+    // admission boundary harvests a completed transfer and prefix reuse is served by the H2D
+    // claim instead of falling back to the still-device-resident pages.
+    bool host_kv_retain_complete          = true;
     KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
     ArenaMemorySummary weights;
     ArenaMemorySummary sequence;
