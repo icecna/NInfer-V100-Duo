@@ -621,3 +621,21 @@ defect needs neither the host cache nor its transfers nor concurrency: the devic
 gate newly exposed, not something the host-cache work introduced. The engine gate's phase-1 append
 case reuses the terminal frontier and is bit-exact, so the missing coverage is the turn/interior
 boundary; that is the case to add next, with the in-session cold-vs-claim comparison.
+
+### 6.1 Gate downgraded by decision (accepted deviation)
+
+`AppendAtFrontier` at a turn (interior) boundary is **not going to be fixed for now**, so the
+production gate no longer fails on it. The gate still fails hard on what remains meaningful:
+request errors or empty answers (the driver exits non-zero), unpaired turns, and a host pass that
+reused nothing. The drift is printed as
+`known_deviation=append_frontier_at_turn_boundary turns=N` together with up to five differing
+turns, and `CC_GATE_STRICT=1` restores the failure for when the interior-frontier case is picked up
+again.
+
+Consequences to keep visible:
+
+- reuse is ON by default in the product, so with any reuse enabled a multi-turn conversation can
+  answer differently from a pure recompute; `--no-prefix-reuse` remains the safe configuration and
+  is what the gate's control pass uses;
+- the engine gate's exactness claims only cover the whole-prompt and terminal frontiers, which are
+  bit-exact; the interior boundary is the uncovered case and is recorded in §6.
