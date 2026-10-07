@@ -60,8 +60,8 @@ cleanup() {
 trap cleanup EXIT
 
 run_pass() {
-  local name="$1" cache="$2" out="$3"
-  log "pass $name: --context-host-cache-mib $cache"
+  local name="$1" cache="$2" out="$3" conc="$4"
+  log "pass $name: --context-host-cache-mib $cache --concurrency $conc"
   "$repo_dir/build-host-retained/apps/ninfer-serve" "$artifact" \
     --tp 2 --devices 1,0 --host 127.0.0.1 --port "$port" \
     --max-concurrency 2 --max-context 160000 --kv-capacity 280000 --kv-dtype int8 \
@@ -83,7 +83,7 @@ run_pass() {
 
   "$python_bin" "$repo_dir/tools/smoke/context_cache_session.py" \
     --base-url "http://127.0.0.1:$port" --sessions "$sessions" --turns "$turns" \
-    --concurrency "$concurrency" --out "$out" | tee "$work_dir/$name.summary"
+    --concurrency "$conc" --out "$out" | tee "$work_dir/$name.summary"
   curl -s --max-time 10 "http://127.0.0.1:$port/metrics" > "$work_dir/$name.metrics" || true
   stop_serve
 }
@@ -92,11 +92,15 @@ log "stopping ai-server for exclusive GPU use"
 service ai-server stop >/dev/null 2>&1 || true
 sleep 3
 
-run_pass control 0 "$work_dir/control.jsonl"
-run_pass host "$cache_mib" "$work_dir/host.jsonl"
+# The two compared passes run ONE request at a time: greedy output is schedule dependent (a
+# different batch shape changes reductions, and the two passes do not hit the same checkpoints), so
+# identical text is only meaningful when the schedule is. The concurrent pass then checks that
+# concurrency still reuses, bounds occupancy and produces no errors, without comparing text.
+run_pass control 0 "$work_dir/control.jsonl" 1
+run_pass host "$cache_mib" "$work_dir/host.jsonl" 1
 
 if [ "$evict_mib" -gt 0 ]; then
-  run_pass evict "$evict_mib" "$work_dir/evict.jsonl"
+  run_pass evict "$evict_mib" "$work_dir/evict.jsonl" "$concurrency"
 fi
 
 "$python_bin" - "$work_dir" <<'PY'
