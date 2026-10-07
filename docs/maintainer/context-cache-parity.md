@@ -28,9 +28,13 @@ Staged plan (each stage keeps the build green and lands with tests):
   source pins, writer, protected/committed columns, device/host replica) and an ordered address
   space with a committed frontier, a checkpoint frontier, whole-page prefix views/fork, and
   inactive-prefix truncate. Host-only tests. Builds on `KvPageRegistry` as the starting point.
+  Status: prefix view (`KvAddressSpace::fork_prefix`) and device-pool adoption
+  (`KvPageRegistry::adopt` / `KvAddressSpace::adopt`) landed with host-only tests.
 - **B2 host extents with sharing.** Host extents whose membership can be referenced by more than
   one residency, plus an owned sub-page tail for a frontier inside a page; the release/partition
   rules that let a checkpoint drop without freeing the terminal's pages. Host-only tests.
+  Status: extent reference counting (`HostKvExtentStore::retain`) landed with a host-only test;
+  the shared-run plus owned-tail composition is still to build.
 - **B3 program adoption.** `SequenceKVBundle` becomes an address-space handle; retain builds a
   checkpoint as a prefix view (share whole pages, own the sub-page tail) and the claim restores
   through the address space. Real-artifact gate must pass.
