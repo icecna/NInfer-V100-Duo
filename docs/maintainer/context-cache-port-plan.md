@@ -466,6 +466,19 @@ consistent with it also drifting from a cold replay (tokens 12-26) rather than b
 settle which layout is real by reading a few elements of one layer with both strides and comparing
 against a known value, then fix whichever of `recurrent_slot`/`transfer_slot` is wrong.
 
+SELF-CORRECTION on that lead: it cannot be the cause by itself. `gdn_mix` runs the GDN recurrence
+through `state_.recurrent_slot(gidx, current_slot)`, and cold runs are numerically correct and
+byte-identical across sessions, so `recurrent_slot`'s contiguous view is right and the pool is
+slot-major. `transfer_slot`'s `slot_stride = slot_count()` assumption is therefore stale, but it is
+SELF-INVERSE: the snapshot maps device->host with one index mapping and the restore maps host->device
+with the same mapping, so the device slot is restored exactly (which is precisely what the three
+equal `ec183a...` host hashes show). A self-inverse scramble cannot make the claim decode
+differently from a cold prefill. It is a real robustness bug worth fixing on its own (it also
+scrambles the host bytes, so any consumer that reads the host snapshot with the other layout would
+be wrong), but it is not the L5g cause. The cause is still not identified: KV coverage, KV content,
+ingress, host extent lifetime, state round trip and the capture-time slot mapping are all verified
+correct, and the in-session divergence at token 1 persists.
+
 1. **B4a state image.** Give every lane that can own a checkpoint its own state-image record
    (`{read, write}` slot pair) in the existing linear-state pool; the pool already reserves the
    third slot group introduced for the frontier snapshot, so no new allocation shape is needed.
