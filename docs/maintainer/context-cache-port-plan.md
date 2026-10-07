@@ -479,6 +479,22 @@ be wrong), but it is not the L5g cause. The cause is still not identified: KV co
 ingress, host extent lifetime, state round trip and the capture-time slot mapping are all verified
 correct, and the in-session divergence at token 1 persists.
 
+RESOLVED (core bug): `transfer_slot` in `src/core/linear_state_transfer.cu` assumed the slot was the
+fastest axis with `slot_stride = pool.slot_count()`, but `conv_slot`/`recurrent_slot` return
+CONTIGUOUS per-slot views -- which is what `LinearAttentionStatePool::copy_slot` (the in-device
+capture) and upstream's `StateImageDevicePool::copy_to_host`/`copy_from_host` both use. Upstream's
+code settled it. Fixed in `9d22a5e8` to copy each layer's slot contiguously. Effect on the real gate:
+the terminal cross-lane claims went from drifting against the control session (first differing token
+26/32/12) to being EXACTLY equal (32/32, i.e. no difference), and `A_next`/`B_next`/`C_next` all
+report first diff at 32. So what had been accepted as an inherent "claim-path drift" was this bug.
+The checkpoint claim improved from token 1 to token 3 but is still wrong, and a late-capture
+experiment (re-capturing the frontier slot AFTER the MTP draft advance, `NINFER_HOST_KV_LATE_CAPTURE`)
+changes nothing, so the capture point relative to the draft is not the remaining differentiator.
+With the state transport now correct, the checkpoint's residual difference has to come from the
+remaining uncompared input of its first decode round; the strongest remaining candidate is the
+tail hidden (the checkpoint's `rewrite_checkpoint_hidden` versus the terminal's `tail_hidden`),
+which is the only other piece the two entry kinds snapshot differently.
+
 1. **B4a state image.** Give every lane that can own a checkpoint its own state-image record
    (`{read, write}` slot pair) in the existing linear-state pool; the pool already reserves the
    third slot group introduced for the frontier snapshot, so no new allocation shape is needed.
