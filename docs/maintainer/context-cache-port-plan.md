@@ -342,6 +342,25 @@ session), not against the control session. Remaining unexplored surface: what th
 round does
 with the restored state (its inputs and the target forward at the boundary), and whether the peer
 rank's state is restored equivalently.
+  - L5g upstream mechanism (read at `Neroued/ninfer@68c54356`, `src/models/qwen3_5/program/storage/`).
+    A checkpoint is a FORK of two things, and the decode addresses them directly:
+    `sequence.state` is a `{read, write}` pair of state-image handles; `state_selectors()` maps them
+    to physical slots (`sequence.cpp:62`), `settle_state_fork()` commits a fork
+    (`sequence.cpp:72`), and `refresh_state_views()` points `sequence.tail_hidden` at the read
+    slot's continuation hidden (`sequence.cpp:67`). Prefill writes the checkpoint's state into
+    `selectors.destination` and takes the capture hidden from that slot's continuation hidden
+    (`prefill.cpp:500`). KV is a `kv_address_space` handle with committed columns
+    (`text_kv_addresses->active(...)`, `sequence.cpp:93-101`). The consequence for this port is
+    architectural: upstream has no "claim restores a list of fields" step at all -- the decode reads
+    the checkpoint's own state slot and its own KV address space, so coverage ends at the frontier
+    and no reader can see past it. The local design instead copies the terminal's host KV into the
+    claiming lane and re-derives the sequence fields, which is why the state image (B4), the
+    boundary-free restore path, and the committed-column coverage (B2) are the parts that still
+    have to be built. Note that the local attention window is exact in all three readers (decode
+    `pos+1`, prefill `base_i + len`, MTP verify `frontier + extent + 1`), so the earlier scrub
+    result is NOT evidence of a page-granular read and may have been a bug in the scrub itself;
+    upstream's coverage matters because it removes the possibility, not because a local reader is
+    known to run past the frontier.
   - L5h cost-model ranking — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
