@@ -1738,7 +1738,7 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         // The frontier slot holds the target state the prefill froze AT the checkpoint; the rewrite
         // checkpoint slot cannot be used because decode advances it afterwards.
         const std::int32_t frontier_slot =
-            LinearStateSlots::frontier_state_slot(lane, max_concurrency);
+            LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency);
         snapshot_linear_state_slot_to_host(
             decoder->linear_attention, frontier_slot,
             host_kv_arena->raw_view(*transfer.prefix_gdn_local).data(), host_copy_stream);
