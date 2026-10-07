@@ -57,6 +57,7 @@ def post_json(url: str, payload: dict[str, Any], stream: bool, timeout: float) -
                     "ttft": float("nan"), "total": time.monotonic() - started}
         ttft = float("nan")
         text: list[str] = []
+        first_delta = True
         for raw in response:
             line = raw.decode().strip()
             if not line.startswith("data:"):
@@ -66,10 +67,16 @@ def post_json(url: str, payload: dict[str, Any], stream: bool, timeout: float) -
                 break
             chunk = json.loads(data)
             delta = chunk["choices"][0].get("delta") or {}
-            piece = delta.get("content")
+            # Thinking models stream `reasoning_content` before `content`; both are part of the
+            # answer this gate compares and both start the TTFT clock.
+            piece = delta.get("content") or ""
+            reason = delta.get("reasoning_content") or ""
+            if first_delta and (piece or reason):
+                first_delta = False
+                ttft = time.monotonic() - started
+            if reason:
+                text.append(reason)
             if piece:
-                if ttft != float("nan"):
-                    ttft = time.monotonic() - started
                 text.append(piece)
         return {"text": "".join(text), "ttft": ttft, "total": time.monotonic() - started}
 
@@ -177,11 +184,15 @@ def main() -> int:
     ttft_hit = [row["ttft"] for row in rows if row.get("reused_tokens", 0.0) > 0]
     ttft_miss = [row["ttft"] for row in rows if row.get("reused_tokens", 0.0) == 0]
     errors = [row for row in rows if "error" in row]
-    print(f"requests={len(rows)} errors={len(errors)} hits={hits} reused_tokens={int(reused)}")
+    empty = [row for row in rows if not row.get("text")]
+    print(f"requests={len(rows)} errors={len(errors)} empty_text={len(empty)} hits={hits} "
+          f"reused_tokens={int(reused)}")
     print(f"ttft_hit_p50={percentile(ttft_hit, 0.5):.3f} ttft_miss_p50={percentile(ttft_miss, 0.5):.3f}")
     for row in errors[:3]:
         print(f"error session={row['session']} turn={row['turn']}: {row['error']}")
-    return 1 if errors else 0
+    # An empty answer makes the cross-pass text comparison vacuous, which is how a passing gate can
+    # prove nothing; treat it as a failure instead.
+    return 1 if (errors or empty) else 0
 
 
 if __name__ == "__main__":
