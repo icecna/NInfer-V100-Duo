@@ -1640,7 +1640,10 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         evicted.push_back(victim_lane);
     }
     if (!fits()) {
-        host_kv_debugf("retain-skip lane=%u reason=capacity", lane);
+        // Report how much room is actually left in one run: a capacity skip with a large free
+        // total is fragmentation, and it is the case a quantization or a page-list would fix.
+        host_kv_debugf("retain-skip lane=%u reason=capacity free=%zu largest_free=%zu", lane,
+                       host_kv_arena->free_bytes(), host_kv_arena->largest_free_extent_bytes());
         return;
     } // stays device-resident; device eviction takes it later
 

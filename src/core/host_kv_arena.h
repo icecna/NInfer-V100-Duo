@@ -150,6 +150,17 @@ public:
 
     [[nodiscard]] std::size_t occupied_bytes() const noexcept { return occupied_bytes_; }
 
+    // The largest single free run. A new allocation has to fit in one run, so this is the number
+    // that separates "full" from "fragmented"; upstream never compacts, so it is the quantity to
+    // watch before deciding to quantize allocations or to page-list the extents.
+    [[nodiscard]] std::size_t largest_free_extent_bytes() const noexcept {
+        std::size_t largest = 0;
+        for (const FreeExtent& extent : free_extents_) {
+            if (extent.bytes > largest) { largest = extent.bytes; }
+        }
+        return largest;
+    }
+
     [[nodiscard]] std::size_t free_bytes() const noexcept {
         return capacity_bytes_ - occupied_bytes_;
     }
