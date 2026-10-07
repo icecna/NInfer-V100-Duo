@@ -67,6 +67,7 @@ run_pass() {
     --max-concurrency 2 --max-context 160000 --kv-capacity 280000 --kv-dtype int8 \
     --prefill-chunk 2560 --spec mtp --draft-tokens 3 --lm-head-draft \
     --context-host-cache-mib "$cache" $extra \
+    --request-log-jsonl "$work_dir/$name.requests.jsonl" \
     > "$work_dir/$name.log" 2>&1 &
   serve_pid=$!
   local ready=0
