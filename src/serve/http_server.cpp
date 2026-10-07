@@ -163,6 +163,18 @@ void HttpServer::log_request_error(const RequestLogContext& context, const std::
     request_jsonl_.write_request_error(context, message);
 }
 
+void HttpServer::publish_throughput_rates(const ThroughputReport& report) noexcept {
+    const double window = report.interval_seconds;
+    const auto rate     = [window](std::uint64_t tokens) {
+        return window > 0.0 ? static_cast<double>(tokens) / window : 0.0;
+    };
+    prefill_tokens_per_second_.store(rate(report.computed_prefill_tokens),
+                                     std::memory_order_relaxed);
+    decode_tokens_per_second_.store(rate(report.committed_decode_tokens),
+                                    std::memory_order_relaxed);
+    throughput_window_seconds_.store(window, std::memory_order_relaxed);
+}
+
 void HttpServer::log_throughput(const ThroughputReport& report) {
     log_line(format_throughput(report));
     request_jsonl_.write_throughput(report);
@@ -184,6 +196,7 @@ void HttpServer::run_stats_reporter() {
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
+        publish_throughput_rates(report);
         if (report_has_activity(report)) { log_throughput(report); }
         previous      = current;
         previous_time = now;
@@ -193,6 +206,7 @@ void HttpServer::run_stats_reporter() {
     const Clock::time_point now        = Clock::now();
     const ThroughputReport tail        = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
+    publish_throughput_rates(tail);
     if (tail.computed_prefill_tokens != 0 || tail.committed_decode_tokens != 0 ||
         tail.decode_rounds != 0) {
         log_throughput(tail);
@@ -302,6 +316,18 @@ void HttpServer::register_routes() {
         body += "# TYPE host_context_peak_bytes gauge\n";
         body += "host_context_peak_bytes ";
         body += std::to_string(memory.host_kv_cache_peak_bytes);
+        body += '\n';
+        body += "# TYPE prefill_tokens_per_second gauge\n";
+        body += "prefill_tokens_per_second ";
+        body += std::to_string(prefill_tokens_per_second_.load(std::memory_order_relaxed));
+        body += '\n';
+        body += "# TYPE decode_tokens_per_second gauge\n";
+        body += "decode_tokens_per_second ";
+        body += std::to_string(decode_tokens_per_second_.load(std::memory_order_relaxed));
+        body += '\n';
+        body += "# TYPE throughput_window_seconds gauge\n";
+        body += "throughput_window_seconds ";
+        body += std::to_string(throughput_window_seconds_.load(std::memory_order_relaxed));
         body += '\n';
         body += "# TYPE host_context_entries gauge\n";
         body += "host_context_entries ";

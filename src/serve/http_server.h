@@ -59,6 +59,14 @@ private:
     void log_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void log_request_error(const RequestLogContext& context, const std::string& message);
     void log_throughput(const ThroughputReport& report);
+
+    // Latest throughput window, published for the metrics endpoint. The rates are per second over
+    // the window the reporter last measured and zero when that window saw no work, so a scrape
+    // never reads a stale speed while the engine is idle.
+    void publish_throughput_rates(const ThroughputReport& report) noexcept;
+    std::atomic<double> prefill_tokens_per_second_{0.0};
+    std::atomic<double> decode_tokens_per_second_{0.0};
+    std::atomic<double> throughput_window_seconds_{0.0};
     void run_stats_reporter();
     void stop_stats_reporter();
 
