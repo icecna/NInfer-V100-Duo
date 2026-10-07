@@ -177,6 +177,16 @@ enum class RetainedResidency : std::uint8_t {
 // pool. Page counts live in the allocations themselves. Empty unless `Host`. The handles are
 // shared so an optional shorter residency at an earlier frontier can reference the same whole
 // pages as its terminal instead of copying them; the arena charges each allocation once.
+// One referenced run of pages inside an arena allocation. A residency holds segments instead of
+// one allocation per region so that an entry published after a claim can reference the claimed
+// entry's pages for the common prefix and allocate only the pages this request appended: the
+// arena charges each allocation once, so a shared page is stored and accounted once.
+struct HostKvSegment {
+    std::shared_ptr<HostKVAllocation> allocation;
+    std::uint32_t first_page = 0;
+    std::uint32_t page_count = 0;
+};
+
 struct HostKVResidency {
     std::shared_ptr<HostKVAllocation> text_local;
     std::shared_ptr<HostKVAllocation> text_peer;
