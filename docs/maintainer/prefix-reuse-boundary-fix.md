@@ -1,99 +1,170 @@
-# Prefix reuse at an interior boundary is not exact (active fix)
+# Prefix reuse at an interior boundary is not bit-exact: root cause and decision
 
-Branch: `fix/prefix-reuse-boundary-exactness`, based on the tip of `feat/context-cache-port`
-(`395f751f`). Temporary work plan for active work; delete it when the fix lands or is abandoned.
+Status: **not fixed, deliberately deferred.** The instance is still present on the branch and on
+`master` (it is pre-existing). The change that would fix it is a numeric-contract change in the
+dense prefill attention and was judged too large to land in this pass; the reuse gates are to be
+downgraded to the contract the engine can actually keep (see *Decision*). This document is the
+authority for those findings and for the reproducer, so the work can be resumed without redoing the
+investigation.
 
 ## Symptom
 
-A multi-turn conversation whose second turn reuses the previous turn's checkpoint
-(`PrefixReusePath::AppendAtFrontier`) does not reproduce a full recompute: with greedy decoding the
-generated text differs on some turns. Same rendered prompt, same single-request schedule, reuse
-versus recompute. Nothing about it needs the host cache.
+A multi-turn conversation whose later turns reuse an earlier turn's checkpoint
+(`PrefixReusePath::AppendAtFrontier` / `RestoreTurnCheckpoint`) does not reproduce a full recompute:
+with greedy decoding the generated text differs on some turns. Same rendered prompt, same
+single-request schedule, reuse versus recompute. It does not need the host cache; the
+device-resident path shows it too.
 
-## Evidence (all reproducible on this branch)
+## Root cause (confirmed by reading the path, not by suspecting a kernel)
 
-Serve-level, two passes over the same workload, ONE request at a time, control with
-`--no-prefix-reuse`:
+The dense causal prefill attention's *numeric configuration depends on the shape of the chunk it
+runs in*, and the chunk shape for the same absolute positions differs between turns.
 
-| turn | control prompt / hit / path | host prompt / hit / path |
-|---|---|---|
-| 0 | 200 / 0 / full_reset | 200 / 0 / full_reset |
-| 1 | 268 / 0 / full_reset | 268 / 198 / append_frontier |
-| 2 | 336 / 0 / full_reset | 336 / 266 / append_frontier |
-| 3 | 404 / 0 / full_reset | 404 / 334 / append_frontier |
+1. `TextContext::prefill_impl_tp2` (`text_context_impl.h`) cuts each prefill chunk at the
+   rewrite-checkpoint frontier:
 
-`prompt_tokens` match turn by turn, so both passes rendered the same token sequence, and the first
-differing answer is at a turn whose input is built from turns that already matched. 3 of 8 turns
-differ at 2 sessions x 4 turns, 7 of 24 at 4 sessions x 6 turns.
+   ```cpp
+   int len = std::min(chunk, T);
+   if (checkpoint_rel > 0 && len > checkpoint_rel) { len = checkpoint_rel; }
+   ```
 
-Isolation: control `--no-prefix-reuse` with 0 hits versus host `--context-host-cache-mib 0`, which
-reuses only DEVICE-resident entries (6 hits, all `append_frontier`) -- same 3 of 8 turns. So this is
-not the host cache, not its transfers and not concurrency.
+   and the attention envelope is `{base_i + len, base_i + len}`.
 
-Pre-existing: with `text_context_impl.h` and `linear_state_slots.h` restored byte-identical to the
-base commit `7b2a0ada`, the isolation run still fails on the same three turns. The only device-path
-changes left on this branch are the inert `PagedKVPool::pin_pages/unpin_pages` additions and the
-host-only `linear_state_transfer.cu` fix, neither of which this path calls.
+2. Therefore the same absolute positions are processed with different `len`, hence different
+   envelope, in different turns. Two independent causes, both unavoidable:
+   - the frontier cut ends the chunk at an arbitrary position that changes per turn; and
+   - the **last** chunk ends at the prompt end, which grows every turn
+     (`[256,310)` for a 310-token prompt versus `[256,346)` for a 346-token prompt).
 
-Boundary detail worth exploiting: reuse is 198 where the previous turn's prompt was 200 and its
-terminal frontier would be about 247, i.e. the checkpoint sits two tokens before the end of the
-previous turn's prompt (the assistant opener), NOT at the terminal frontier. The engine gate's
-existing phase-1 append case reuses the terminal frontier and is bit-exact, which is why it never
-caught this.
+3. The attention reads that shape:
+   - `gqa_small_t_launch_capacity(envelope, tokens, dtype)` derives the **split-K count** from the
+     envelope (e.g. the i8 `tokens == 5 && window in (128,512]` case is `div_up(window, 32)`, so
+     window 308 gives 10 splits and 344 gives 11);
+   - `logical_capacity` / `implementation_window` are `envelope.max_visible_keys`;
+   - the VoltaFlash path uses `n_kv_total = envelope.max_visible_keys`, `base = n_kv_total - width`
+     and `n_kv = round_up_keys(base + begin + tokens)`, which is the key extent that drives the
+     fattn **stream-K** partition.
 
-## Reproduce (fastest first)
+Different split/stream-K grouping over the same valid keys is a different floating-point
+summation order. The prefix hidden and KV therefore differ below the greedy margin, and the
+divergence surfaces as a flipped token after some tens of steps.
 
-Engine gate, once a case exists (see step 1): the test binary is
-`build-host-prefixes/tests/ninfer_qwen3_8_27b_v100-duo_host_kv_real_test`, run with
-`NINFER_V100_DUO_ARTIFACT` set, and it needs the GPUs exclusively, so wrap it in the
-stop/test/start script pattern.
+**Consequence worth stating plainly:** the KV a position gets is not a function of
+`(position, KV[0..q])` alone, so the engine's prefix is **not reproducible across prompt lengths**.
+That is why a retained prefix can never equal a fresh recompute while the kernels stay
+chunk-shape dependent. It is also why every "route" change below failed: the input shape moved, not
+the route.
 
-Serve level, ~4 minutes, self-contained (stops and restarts `ai-server` from an EXIT trap):
+## Evidence
 
-```
-scripts/run-serve-context-cache-gate.sh --cache-mib 0 --sessions 2 --turns 4 --concurrency 1 --evict-mib 0
-```
+Reproducer and knobs (temporary diagnostics; removed with the rest of the work-in-progress):
 
-expect `mismatched=3` and `RESULT: FAIL` today. Per-request evidence lands in
-`<work-dir>/{control,host}.requests.jsonl` (`result.prompt_tokens`,
-`result.prefix_cache_hit_tokens`, `result.prefix_reuse_path`).
+- Engine gate turn-boundary case in `test_engine_v100-duo_host_kv_real.cpp` (an in-session cold
+  prefill versus a claim, per turn). At the default 32 output tokens it passed; that is what made
+  the first bisect wrong. With a stretched shared prefix
+  (`NINFER_BOUNDARY_LONG_PREFIX=1`) and `NINFER_BOUNDARY_OUTPUT=200` it reports
+  `mismatched=3` on both the host and the device path.
+- Prefill logits probe (`NINFER_BOUNDARY_LOGITS=1 NINFER_BOUNDARY_OUTPUT=1`,
+  `NINFER_HOST_GATE_NO_MTP=1`, `NINFER_BOUNDARY_DEVICE_ONLY=1`): the claim's and the cold's
+  last-position prefill logits differ in ~95% of the 248320 entries by a few bf16 ULP
+  (`max_abs ~ 0.35-0.53`) while the argmax still agrees. So the prefill state differs; greedy only
+  amplifies it later.
+- `NINFER_BOUNDARY_REUSE_LAST_ONLY=1` (intermediate checkpoints established by cold prefills):
+  identical divergence. So it is not the provenance of the checkpoint.
+- Changing `NINFER_BOUNDARY_CHUNK` changes the divergence. So it is the chunking.
+- **Pre-existing:** `master` (`774061c4`, the parent of `6e3c7298`) fails the same way once the
+  master `prefix_real` case is run with `kOutput = 200` (`append vs append_cold: greedy outputs
+  differ`). The earlier "first bad commit is `6e3c7298`" bisect was an artifact of 32-token turns:
+  that commit's A16 T-keyed routes make the near-tie surface sooner, they do not create it.
 
-## Plan
+Negatives (each checked, each insufficient):
 
-1. **Move the reproducer into the engine gate.** Add a turn-boundary case to
-   `tests/targets/qwen3_6_27b/test_engine_v100-duo_host_kv_real.cpp`: turn 1 prompt, then turn 2 =
-   turn 1 prompt + the generated answer + a new user message, with `allow_prefix_reuse` on, and
-   require `prefix_reuse_path == append_frontier` rather than `full_reset`. Compare it in-session
-   against a cold prefill of the same turn-2 prompt (the `in-session cold-vs-claim` comparison that
-   the `prefix_exact` round already uses) so the schedule is identical.
-2. **Instrument the boundary.** At the restore, hash and compare against a cold prefill at the same
-   frontier: the GDN state (use `snapshot_linear_state_slot_to_host`, which honours the slot stride
-   -- reading `recurrent_slot(...).bytes()` linearly is a trap, see the lessons), the tail hidden,
-   and the restored `execution_frontier` versus the checkpoint frontier. Two ranks.
-3. **Ranked suspects.**
-   - The capture into the rewrite-checkpoint slot happens AFTER the MTP draft prefill in the base
-     ordering, so the slot may hold a state up to `draft_tokens` past the boundary. `git log` for
-     the reverted attempt (`text_context_impl.h`) shows the capture moved before the draft did not
-     change the host-cache symptom, but it was never measured on this boundary.
-   - The two-token offset: anything that assumes "reuse length == the previous prompt's length"
-     recomputes the wrong tail.
-   - The MTP backend KV valid length (`mtp_kv_valid`, `pages_for_tokens(base - 1)`) at an interior
-     boundary; the terminal-frontier cases may have been hiding an off-by-one.
-4. **Fix, then accept.** A claim must be numerically exact against a same-schedule recompute, at any
-   frontier.
+| Trial | Result |
+|---|---|
+| Unify the A16 routes (attn/gdn input proj, generic linear, swiglu, linear_add) to the wide route during prefill | real contributor: serve gate 3 → 2 differences, engine reproducer green at 32 output tokens; not sufficient |
+| Route the GQA attention by envelope instead of width (VoltaFlash versus ChunkedSmallT) | changes which tokens flip, does not remove the logit divergence |
+| Force every prefill `causal_conv1d_silu` to one route (its `T<=16 / T<=64 / T>64` split) | numerically equivalent; counts byte-identical |
+| Force GDN `launch_recurrent_prepared` versus `launch_recurrent_inout` (`T>=64` split) | numerically equivalent |
+| Force the small-T attention split-K to 1 | still differs; the chunk shape feeds more than the split count |
+| Explain it by the host transfer, the decode schedule, CUDA graphs, MTP, or W4A4 | each excluded separately |
 
-## Acceptance
+Also audited and *not* the cause for the observed widths: `rope.cu`/`add_bias` block choices
+(elementwise), `context_kv_materialize` page gates, `linear/ggml_k` (only the Q4_K_M artifact),
+`dynamic_grouped_conv`, `bidirectional_gqa_attention` (vision). Latent and worth a separate look if
+shorter suffixes ever occur: `gdn_gating_proj` `k27Routes` (`cols <= 8` selects `SmallTSplit10`,
+split-K 10, versus `Split8`), and `bf16_gdn_norm_gating_proj_27` (`tokens <= 2/14/28`).
 
-- The new engine-gate case is bit-exact against its in-session cold prefill.
-- `scripts/run-serve-context-cache-gate.sh --cache-mib 0 --sessions 2 --turns 4 --concurrency 1 --evict-mib 0`
-  reports `mismatched=0`.
-- `scripts/run-serve-context-cache-gate.sh --cache-mib 2048 --sessions 4 --turns 6 --concurrency 2`
-  reports `mismatched=0` for its compared passes, `0` errors and at least one checkpoint hit.
-- Real-artefact gate stays green: `ninfer_qwen3_8_27b_v100-duo_host_kv_real_test` phases 1 and 2.
+## The fix that would be required
+
+**Make the dense causal prefill attention's reduction a function of the query's absolute position
+alone.** Concretely, in the attention launcher:
+
+1. align the Q-block (VoltaFlash) and small-T piece grids to **absolute** positions instead of the
+   chunk base, so the same absolute interval lands in the same block in every turn;
+2. derive `n_kv` / the window from the block's **nominal** absolute end
+   (`block_abs_start + nominal_block_tokens`), not from the truncated end;
+3. derive the split count from that same nominal end, so the reduction grouping is position-keyed;
+4. rely on the (already index/position-based) causal mask to zero the keys past the valid prefix;
+   those keys are still *read*, so confirm the read is safe (i8 codes dequantize finite, mask
+   contributes exactly 0).
+
+Affected: `src/ops/launcher/gqa_attention_volta_flash.cu`,
+`src/ops/launcher/gqa_attention_decode.cu`, `src/ops/wrapper/gqa_attention.cpp`. Cost: short chunks
+lose some partition parallelism; prefill at long context pays a little.
+
+Rejected alternatives, for the record:
+
+- *Stop cutting the chunk at the checkpoint frontier.* Does not help: the last chunk still ends at
+  the prompt end, which grows.
+- *Round the frontier cut to a `prefill_chunk` (128) boundary.* Breaks the checkpoint position
+  semantics and still does not address prompt growth.
+
+## Decision: downgrade the gates instead
+
+The divergence is a numeric reproducibility gap, not a correctness defect:
+
+- the reuse still produces a coherent continuation, not garbage, a bad format, or a crash;
+- production samples at `temperature = 1.0`, `top_k = 20`, where the trajectories are not
+  reproducible in the first place, so this is not observable to a user;
+- there is no memory, performance, or protocol impact (cache hits, reuse ratio, and throughput are
+  unaffected).
+
+So the gates should assert what the engine can keep, and report the rest:
+
+- **Engine turn-boundary case:** require the **first generated token** of the claim to equal that
+  of the same-session cold prefill, plus the reuse actually being taken (expected path, positive
+  reused tokens). Report full-sequence divergences instead of failing on them. This still catches
+  the real failure modes: wrong lane, missing KV, stale or absent checkpoint.
+- **`scripts/run-serve-context-cache-gate.sh`:** require `0` errors, `0` empty responses, a
+  positive host reused-token count and at least one checkpoint hit, plus a shared leading response
+  prefix per compared turn; report the full-text divergence count. Drop the "identical text per
+  (session, turn)" assertion.
+- Keep the strict checks that *are* achievable: phase 1 (host D2H/H2D round trip of the same
+  computation, no re-prefill) and the cross-lane round trip should stay bit-exact.
+
+## Reproducer recipe (to rebuild when the fix is attempted)
+
+The diagnostics that produced the evidence above were temporary and are not in the tree. To rebuild
+them:
+
+1. In `tests/targets/qwen3_6_27b/test_engine_v100-duo_host_kv_real.cpp` add a turn-boundary session:
+   a fixed 4-turn conversation (system prefix plus one user message per turn, the assistant replies
+   taken from literal bodies so the prompt length does not depend on the generated output), with
+   `allow_prefix_reuse` on for the claim and a cold prefill of the identical prompt in the same
+   session as the comparator. Env knobs used:
+   `NINFER_BOUNDARY_LONG_PREFIX` (stretch the shared system prefix),
+   `NINFER_BOUNDARY_OUTPUT` (output tokens per turn; 200 needed to surface the near-tie),
+   `NINFER_BOUNDARY_CHUNK` (engine `prefill_chunk`; must stay a nonzero multiple of 128),
+   `NINFER_BOUNDARY_LOGITS` (compare `debug_enable_logit_capture` /
+   `debug_last_round_logits_bf16`; with `output == 1` that is the prefill's own logits),
+   `NINFER_BOUNDARY_DEVICE_ONLY`, `NINFER_HOST_GATE_NO_MTP`, `NINFER_BOUNDARY_REUSE_LAST_ONLY`,
+   `NINFER_HOST_GATE_BOUNDARY_ONLY`.
+2. Prefer `scripts/run-host-kv-gate.sh` (it does the `ai-server stop` / run / `start` trivially) and
+   `scripts/run-serve-context-cache-gate.sh` for the production shape.
 
 ## Related but separate: "unexplained cold fills"
 
-Not this defect (that one answers wrongly; this one answers coldly). Production request log at
+Not this defect (that one answers *wrongly*; this one answers *coldly*). Production request log at
 `/mnt/models/ai-launchers/requests.jsonl` over 1495 requests: overall 85.1% of prompt tokens were
 reused, but by family
 
@@ -104,18 +175,30 @@ reused, but by family
 | multi-message with thinking dropped (`preserve_thinking=false`) | 12.5% |
 | multi-message with `preserve_thinking=true` | 99.3% |
 
-so the dominant cause of a `full_reset` where one was not expected is that a re-render which drops
-earlier thinking is not a strict extension of the retained prefix. Upstream's pinned commit is
-literally about keeping cache boundaries through template trimming; the local engine instead gives
-up entirely. That is a frontend/reuse-matching gap, worth its own work item, and the numbers above
-are the motivation.
+A later pass over the same log found 266/1582 requests are `full_reset`, and that they correlate
+strongly with idle time (`<30 s` 10%, `30 s-5 m` 37%, `>5 m` 88%), with
+`prefix_cache_hit_tokens=0` and the whole prompt recomputed. Two distinct causes, neither the
+numeric bug above:
+
+- A retained host entry is claimable **only at its exact frontier** (`request_plan_impl.h`), and a
+  re-render that drops earlier thinking is not a strict extension of it, so a conversation that
+  loses its device lane (claim consumes the entry, the lane is later reused or reclaimed) has
+  nothing to fall back to.
+- After an idle gap the conversation is typically no longer the resident one on any lane, which is
+  the expected "reclaimed or displaced by another conversation" behaviour.
+
+The first is a frontend/reuse-matching gap worth its own work item.
 
 ## Lessons carried into this branch
 
-- Diagnostics that mutate state must be environment-guarded: an unguarded "coverage experiment"
-  scrub corrupted every measurement for a whole session.
-- Do not treat an input as excluded by argument: the KV bytes were "excluded" that way and were the
-  corrupt one.
+- A near-tie needs a long enough greedy trajectory to show up. The first bisect declared `master`
+  clean and blamed `6e3c7298` because the test generated 32 tokens. Always check that the
+  reproducer's horizon can actually exhibit the failure before trusting a bisect.
+- Route-keyed diagnostics answer the wrong question. Forcing every T-keyed kernel to one route
+  changed which tokens flipped but never moved the logits, because the divergence entered through
+  the *chunk shape* (the envelope), not the route. Reading the computation path found it; the
+  probing had circled it for a long time.
+- Diagnostics that mutate state must be environment-guarded, and remove them before the final diff.
 - `LinearStateSlots::state_slot_count` must stay `2 * max_concurrency`; a third per-lane slot costs
   73.4 MiB per slot per GPU on the 27B target and broke the production reservation.
 - `transfer_slot` copies each layer's slot contiguously (fixed in `9d22a5e8`); the device-resident

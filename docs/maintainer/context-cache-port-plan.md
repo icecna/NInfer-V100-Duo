@@ -625,7 +625,8 @@ boundary; that is the case to add next, with the in-session cold-vs-claim compar
 ## 7. Follow-up workstream
 
 The interior-boundary inexactness in section 6 is a pre-existing reuse-path defect, independent of
-this port, and is being fixed on `fix/prefix-reuse-boundary-exactness` under its own temporary plan,
-[Prefix reuse at an interior boundary is not exact](prefix-reuse-boundary-fix.md). That document is
-the authority for the fix and for the separate "unexplained cold fills" finding; this one stays the
-authority for the port.
+this port. Its root cause is now understood and the fix is deliberately deferred on
+`fix/prefix-reuse-boundary-exactness`, so
+[Prefix reuse at an interior boundary is not bit-exact](prefix-reuse-boundary-fix.md) is the
+authority for the root cause, the rejected alternatives, the gate downgrade and the separate
+"unexplained cold fills" finding; this one stays the authority for the port.
