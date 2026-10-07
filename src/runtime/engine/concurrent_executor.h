@@ -175,8 +175,23 @@ public:
         return Submission(*this, std::move(request));
     }
 
+    // A long prefill holds `execution_mutex_` for its whole step, so blocking on that lock here
+    // left `GET /metrics` unanswered for minutes -- exactly while the host-context gauges matter.
+    // Sample when the engine is between steps and otherwise serve the last published copy, which
+    // matches how `runtime_stats` is already served.
     [[nodiscard]] MemorySummary memory_summary() const {
-        std::scoped_lock lock(execution_mutex_);
+        if (std::unique_lock lock(execution_mutex_, std::try_to_lock); lock.owns_lock()) {
+            const MemorySummary out = sample_memory();
+            std::lock_guard guard(stats_mutex_);
+            published_memory_ = out;
+            return out;
+        }
+        std::lock_guard guard(stats_mutex_);
+        return published_memory_;
+    }
+
+    // Requires `execution_mutex_` to be held by the caller.
+    [[nodiscard]] MemorySummary sample_memory() const {
         MemorySummary out                      = instance_.program->memory_summary();
         out.request_transient                  = instance_.request_memory.summary();
         const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
@@ -1360,6 +1375,7 @@ private:
     std::uint64_t next_protection_epoch_ = 1;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    mutable MemorySummary published_memory_;
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;

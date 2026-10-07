@@ -326,6 +326,9 @@ void HttpServer::register_routes() {
                 stats.computed_prefill_tokens);
         counter("decode_tokens_total", "Tokens committed by decode rounds.",
                 stats.committed_decode_tokens);
+        counter("decode_rounds_total", "Decode rounds executed.", stats.decode_rounds);
+        counter("decode_row_rounds_total", "Decode rows executed across all rounds.",
+                stats.decode_row_rounds);
         res.set_header("Cache-Control", "no-store");
         res.set_content(body, "text/plain; version=0.0.4; charset=utf-8");
     });
