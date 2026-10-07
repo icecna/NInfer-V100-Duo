@@ -21,15 +21,17 @@ import urllib.request
 CHARS_PER_TOKEN = 6.1
 BLOCK = ("The quarterly access review covers authentication, authorization, audit, availability, "
          "and cost controls across every region and tier, for every team and every service. ")
-FAKE_ASSISTANT = "Here is the summary you asked for."
+FAKE_ASSISTANT = "第一段总结。"
+FAKE_ASSISTANT_TWO = "第二段总结。"
 
 
 def pad(tokens: int, tag: str) -> str:
     return f"Review {tag}. " + BLOCK * max(1, int(tokens * CHARS_PER_TOKEN) // len(BLOCK))
 
 
-def post(base: str, model: str, messages: list[dict[str, str]], timeout: float) -> float:
-    payload = json.dumps({"model": model, "messages": messages, "max_tokens": 4,
+def post(base: str, model: str, messages: list[dict[str, str]], max_tokens: int,
+         timeout: float) -> float:
+    payload = json.dumps({"model": model, "messages": messages, "max_tokens": max_tokens,
                           "temperature": 0.0, "stream": False}).encode()
     request = urllib.request.Request(f"{base}/v1/chat/completions", data=payload,
                                      headers={"Content-Type": "application/json"})
@@ -58,17 +60,15 @@ def new_requests(log: pathlib.Path, offset: int) -> list[dict]:
 
 
 def run_pass(args, tag: str, pause_before_last: float) -> list[dict]:
+    # Mirrors the reported cross-request test: one user turn carrying the padding, with the
+    # follow-up histories appended as consecutive assistant messages.
     base, model = args.base_url, args.model
-    system = {"role": "system", "content": pad(args.tokens, tag)}
-    a_user, b_user = f"{tag} ALPHA: start the review.", f"{tag} BRAVO: start the review."
-    a = [system, {"role": "user", "content": a_user}]
-    b = [system, {"role": "user", "content": b_user}]
-    a2 = a + [{"role": "assistant", "content": FAKE_ASSISTANT},
-              {"role": "user", "content": f"{tag} ALPHA turn two."}]
-    b2 = b + [{"role": "assistant", "content": FAKE_ASSISTANT},
-              {"role": "user", "content": f"{tag} BRAVO turn two."}]
-    a3 = a2 + [{"role": "assistant", "content": FAKE_ASSISTANT},
-               {"role": "user", "content": f"{tag} ALPHA turn three."}]
+    question = "\n用一句话总结这段词。"
+    a = [{"role": "user", "content": pad(args.tokens, tag) + question}]
+    b = [{"role": "user", "content": pad(args.tokens, tag + "-B") + question}]
+    a2 = a + [{"role": "assistant", "content": FAKE_ASSISTANT}]
+    b2 = b + [{"role": "assistant", "content": FAKE_ASSISTANT}]
+    a3 = a2 + [{"role": "assistant", "content": FAKE_ASSISTANT_TWO}]
 
     log = pathlib.Path(args.request_log)
     plan = (("A1", a, 0.0), ("B1", b, 0.0), ("A2", a2, 0.0),
@@ -78,7 +78,7 @@ def run_pass(args, tag: str, pause_before_last: float) -> list[dict]:
     for name, messages, pause in plan:
         if pause:
             time.sleep(pause)
-        timings.append((name, post(base, model, messages, args.timeout)))
+        timings.append((name, post(base, model, messages, args.max_tokens, args.timeout)))
 
     # Read the log once, after the pass: reading it per request means waiting for a flush between
     # requests, and that wait can outlast the very window this probe exists to measure.
@@ -104,7 +104,8 @@ def main() -> int:
     parser.add_argument("--base-url", default="http://192.168.1.12:8080")
     parser.add_argument("--model", default="qwen3.8-27b")
     parser.add_argument("--request-log", default="/mnt/models/ai-launchers/requests.jsonl")
-    parser.add_argument("--tokens", type=int, default=8000)
+    parser.add_argument("--tokens", type=int, default=7500)
+    parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--delay", type=float, default=3.0)
     parser.add_argument("--timeout", type=float, default=600.0)
     args = parser.parse_args()
