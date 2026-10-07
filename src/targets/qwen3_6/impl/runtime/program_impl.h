@@ -1236,7 +1236,8 @@ void ProgramImplCore::copy_kv_pages_to_host(const PagedKVPool& pool,
                                             const PagedKVAllocation& allocation,
                                             std::uint32_t pages,
                                             const HostKVAllocationView& host,
-                                            cudaStream_t stream) const {
+                                            cudaStream_t stream,
+                                            std::uint32_t src_first_page) const {
     const HostKVPageLayout& layout = host.layout();
     if (pool.spec().plane_order != PagedKVPlaneOrder::PageMajor) {
         throw std::logic_error("host retained-prefix cache requires PageMajor KV pools");
@@ -1245,12 +1246,12 @@ void ProgramImplCore::copy_kv_pages_to_host(const PagedKVPool& pool,
         throw std::logic_error("host KV layout does not match the pool plane set");
     }
     const std::span<const std::int32_t> page_ids = allocation.page_ids();
-    if (page_ids.size() < pages) {
+    if (src_first_page > page_ids.size() || page_ids.size() - src_first_page < pages) {
         throw std::logic_error("host KV transfer exceeds the allocation's mapped pages");
     }
     std::byte* host_base = host.data();
     for (std::uint32_t page = 0; page < pages; ++page) {
-        const std::int32_t physical = page_ids[page];
+        const std::int32_t physical = page_ids[src_first_page + page];
         std::byte* dst = host_base + static_cast<std::size_t>(page) * layout.page_stride;
         for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
             const Tensor& slab      = pool.plane(plane);

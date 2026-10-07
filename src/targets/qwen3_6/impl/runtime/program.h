@@ -668,9 +668,12 @@ private:
     void claim_host_sequence(SequenceState& sequence, const RequestPlanImpl& plan, std::uint32_t base);
     void evict_host_entry(qwen3_6::detail::HostPrefixId id) noexcept;
     void complete_host_transfer(std::uint32_t lane, bool abandoned);
+    // Copies `pages` pages into the host view from the device allocation, starting at
+    // `src_first_page`, so a residency that shares a claimed entry's pages can copy only the
+    // pages this request appended. The host side starts where the view starts.
     void copy_kv_pages_to_host(const PagedKVPool& pool, const PagedKVAllocation& allocation,
                                std::uint32_t pages, const HostKVAllocationView& host,
-                               cudaStream_t stream) const;
+                               cudaStream_t stream, std::uint32_t src_first_page = 0) const;
     // Copies `pages` pages into the device allocation from `host`, landing at `dest_first_page`
     // so a residency made of several referenced page runs can be restored run by run. The host
     // side starts where the view starts, which `HostKVAllocationView::subview` positions.
