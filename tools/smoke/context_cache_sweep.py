@@ -46,7 +46,7 @@ BLOCK = ("The quarterly access review covers authentication, authorization, audi
          "and cost controls across every region and tier, for every team and every service. ")
 COUNTERS = ("prompt_tokens_cached_total", "checkpoint_selections_total",
             "prefill_tokens_total", "decode_tokens_total",
-            "host_context_occupied_bytes", "host_context_capacity_bytes")
+            "host_context_used_bytes", "host_context_capacity_bytes")
 
 
 def scrape(base_url: str, timeout: float) -> dict[str, float]:
@@ -124,7 +124,7 @@ def session_rows(args: argparse.Namespace, size: int, session: int) -> list[dict
                - before.get("checkpoint_selections_total", 0.0),
                "computed_prefill": after.get("prefill_tokens_total", 0.0)
                - before.get("prefill_tokens_total", 0.0),
-               "host_occupied_bytes": after.get("host_context_occupied_bytes", 0.0),
+               "host_occupied_bytes": after.get("host_context_used_bytes", 0.0),
                "host_capacity_bytes": after.get("host_context_capacity_bytes", 0.0)}
         row.update(result)
         rows.append(row)
@@ -163,7 +163,7 @@ def sweep_size(args: argparse.Namespace, size: int) -> dict[str, Any]:
                                      for row in rows] or [0])),
         "ttft_reused": median([row["ttft"] for row in reused]),
         "ttft_cold": median([row["ttft"] for row in cold]),
-        "occupied_gib": end.get("host_context_occupied_bytes", 0.0) / 2 ** 30,
+        "occupied_gib": end.get("host_context_used_bytes", 0.0) / 2 ** 30,
         "capacity_gib": end.get("host_context_capacity_bytes", 0.0) / 2 ** 30,
     }
     out = pathlib.Path(args.out)

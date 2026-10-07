@@ -144,7 +144,7 @@ def run_session(args: argparse.Namespace, session: int) -> list[dict[str, Any]]:
             "reused_tokens": reused,
             "checkpoint_selections": after.get("checkpoint_selections_total", 0.0)
             - before.get("checkpoint_selections_total", 0.0),
-            "host_cache_occupied_bytes": after.get("host_context_occupied_bytes", 0.0),
+            "host_cache_occupied_bytes": after.get("host_context_used_bytes", 0.0),
         })
         messages = messages + [
             {"role": "assistant", "content": result["text"]},

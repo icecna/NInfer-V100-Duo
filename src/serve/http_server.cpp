@@ -295,8 +295,8 @@ void HttpServer::register_routes() {
                 counters.root_selections);
         counter("checkpoint_selections_total", "Initial bindings with checkpoint reuse.",
                 counters.checkpoint_selections);
-        body += "# TYPE host_context_occupied_bytes gauge\n";
-        body += "host_context_occupied_bytes ";
+        body += "# TYPE host_context_used_bytes gauge\n";
+        body += "host_context_used_bytes ";
         body += std::to_string(memory.host_kv_cache_occupied_bytes);
         body += '\n';
         body += "# TYPE host_context_peak_bytes gauge\n";
