@@ -255,6 +255,20 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     verified terminal-only behaviour. Reinstating it requires establishing where the frontier GDN
     and hidden can be read for both ranks, and a schedule output for the hidden at an arbitrary
     frontier.
+  - L5g diagnosis (reproduced) — the acceptance comparison was re-added and the retry reproduced
+    the divergence. Instrumented evidence: the rewrite-checkpoint capture is at the right frontier
+    (`[prefill-capture] abs=3274 rel=202 len=202 base=3072`, i.e. the final 202-token chunk ends
+    exactly at the prompt frontier), and the prefix residency is published at `frontier=3274` and
+    claimed at `boundary=3274`. So the frontier bookkeeping is not the fault. What differs from the
+    verified terminal claim is the state source: the terminal reads the lane's CURRENT linear-state
+    slot at retain time (after decode) and its phase-1 output matches the cold control, while the
+    prefix reads the REWRITE-CHECKPOINT slot, which was written during prefill and is only read
+    again at retain, after ~30 decode/MTP rounds. The rewrite slot therefore has to be proven
+    stable through decode before it can be a restore source; the existing rewrite-recovery test
+    only validates it immediately after capture. Next experiment: snapshot the checkpoint GDN into
+    a dedicated per-lane buffer at capture time (or read it before decode starts) and copy that
+    buffer at retain, then re-run the comparison. Also observed: filler prompts (frontier 21-24)
+    publish prefix residencies; capture should be restricted to real prompt boundaries.
   - L5h cost-model ranking — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
