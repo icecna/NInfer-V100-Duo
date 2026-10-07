@@ -611,3 +611,13 @@ answers; `--no-prefix-reuse` (or cache 0 plus no reuse) is the safe configuratio
 
 Reproduce:
 `scripts/run-serve-context-cache-gate.sh --cache-mib 2048 --sessions 2 --turns 4 --concurrency 1 --evict-mib 0`
+
+Isolation (same gate, `--cache-mib 0 --sessions 2 --turns 4 --concurrency 1 --evict-mib 0`):
+control `--no-prefix-reuse` with 0 hits versus host `--context-host-cache-mib 0`, which reuses only
+DEVICE-resident entries (6 hits, all `append_frontier`), differs on the same 3 of 8 turns. So the
+defect needs neither the host cache nor its transfers nor concurrency: the device-resident
+`AppendAtFrontier` continue is itself inexact at a turn boundary. Note that reuse is ON by default
+(`--no-prefix-reuse` is the opt-out), so this is a pre-existing reuse-path issue that the production
+gate newly exposed, not something the host-cache work introduced. The engine gate's phase-1 append
+case reuses the terminal frontier and is bit-exact, so the missing coverage is the turn/interior
+boundary; that is the case to add next, with the in-session cold-vs-claim comparison.
