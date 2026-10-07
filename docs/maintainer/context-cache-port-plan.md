@@ -312,12 +312,19 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     So the reader does stop at the position, and neither narrowing `logical_capacity` nor adding a
     decode mask would be a fix (the former would break graph replay: the guard
     `last_pos >= logical_capacity` would `write_neutral`). The scrub result must have perturbed
-    something else, so it is not evidence. Open hypothesis for the next session: the prefix's last
-    page is shared with the terminal, so its records for the frontier's own tokens were produced
-    together with the terminal's later tokens (quantised KV records/group bounds), whereas a cold
-    prefill produced them with only the prompt present. Test by giving the prefix a private KV copy
-    taken at its own frontier (`f5dcca48` shape) and comparing again; if that passes, the checkpoint
-    needs its own committed tail columns, which is exactly B2.
+    something else, so it is not evidence.
+    KV is now also excluded. The gate runs `options.kv_cache = KvCacheStorage::Int8Group64`, and the
+decode kernel's comment and code show the scale is per `(row, 64-group)`, i.e. the group runs along
+the HEAD dimension, not along tokens (`gqa_attention_decode_i8.cuh:7`, `:134-135`, `:268`). A
+token's quantised record therefore cannot be affected by later tokens in its page, so the prefix's
+valid-range KV is bit-identical to what a cold prefill writes, and a private prefix copy would not
+change anything. With the attention window bounded by `pos` and the frontier GDN captured
+faithfully, the remaining suspects are the speculative (MTP) path and any per-request field the
+claim does not restore. Cheapest discriminators, in order: (1) run the same comparison with
+`options.speculative.backend = None` to separate the MTP path from the ordinary decode; (2) print
+the claimed row's `cache_positions`/`mtp_kv_valid` and the drafts the first verify round uses, and
+compare them with the control's; (3) compare the frontier slot's bytes against the state a control
+reaches at the same token count.
   - L5h cost-model ranking — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
