@@ -411,6 +411,20 @@ the identity of `payload.gdn_local` for the checkpoint entry. One measurement le
 recurrent view immediately after the claim restores and before any round runs -- `8a3e...` there
 means something advances the state after the restore, anything else means the restore itself.
 
+DONE, and the restore itself is at fault. The claim prints
+`claim-restored-hash=6e0eee7c2d52bd3b slot=0 boundary=3274` immediately after its restore, and the
+first decode round reports the same value, so nothing advances the state afterwards. The device
+source of the snapshot is verified correct (`8a3e...` at the capture and again at the retain), and
+the restore is a symmetric `transfer_slot` helper the working terminal claim uses. What is left
+unverified is the checkpoint's HOST extent: the bytes the snapshot wrote into the arena are not the
+bytes the claim reads back, i.e. the checkpoint's GDN host allocation is aliased, moved, or
+re-issued in between. That matches the shape of the defect -- the terminal entry works while the
+checkpoint entry does not, and the checkpoint is published first and reclaimed first (its retention
+age precedes the terminal's by construction). Next: hash the checkpoint's host extent right after
+the snapshot and again right before the restore, and audit the arena extent ownership for a
+residency that is published before its terminal (the run needs the checkpoint to coexist with the
+terminal and with a third entry).
+
 1. **B4a state image.** Give every lane that can own a checkpoint its own state-image record
    (`{read, write}` slot pair) in the existing linear-state pool; the pool already reserves the
    third slot group introduced for the frontier snapshot, so no new allocation shape is needed.
