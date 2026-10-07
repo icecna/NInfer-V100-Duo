@@ -320,11 +320,19 @@ token's quantised record therefore cannot be affected by later tokens in its pag
 valid-range KV is bit-identical to what a cold prefill writes, and a private prefix copy would not
 change anything. With the attention window bounded by `pos` and the frontier GDN captured
 faithfully, the remaining suspects are the speculative (MTP) path and any per-request field the
-claim does not restore. Cheapest discriminators, in order: (1) run the same comparison with
-`options.speculative.backend = None` to separate the MTP path from the ordinary decode; (2) print
-the claimed row's `cache_positions`/`mtp_kv_valid` and the drafts the first verify round uses, and
-compare them with the control's; (3) compare the frontier slot's bytes against the state a control
-reaches at the same token count.
+claim does not restore. Discriminators tried since then, all of which change the next steps:
+(1) MTP cannot be disabled for this comparison -- the engine refuses the host retained-prefix cache
+without `--spec mtp` ("the non-speculative reuse route has no qualified path"), so the divergence
+takes place inside the MTP-path by construction. (2) The divergence is not artifact specific: it
+reproduces byte-for-byte on `Qwen3.8-27B-nvfp4.ninfer`, and both artifacts produce identical
+CONTROL outputs while the wrong host value differs per artifact (1472 on QUASAR, 63 on nvfp4),
+which means the restored state is wrong rather than shifted. (3) A claim-field print shows the
+prefix entry lands with `exec == ledger.size()` while the terminal entry lands with
+`exec + 1 == ledger.size()`, but testing the "boundary is an index" reading (`reuse_boundary =
+prefix_frontier - 1`) moves the divergence to token 0, i.e. the count reading is the correct one and
+this asymmetry is not the cause. Remaining unexplored surface: what the first MTP verify round does
+with the restored state (its inputs and the target forward at the boundary), and whether the peer
+rank's state is restored equivalently.
   - L5h cost-model ranking — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
