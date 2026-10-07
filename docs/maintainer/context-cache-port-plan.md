@@ -453,6 +453,19 @@ the capture writes a slot whose content is not yet shown to equal the cold worki
 in-session divergence at token 1 is still unexplained. Everything else on this path is now excluded:
 KV coverage, KV content, ingress, host extent lifetime, and the snapshot/restore round trip.
 
+LEAD (measured): `recurrent_slot(layer, slot)` returns a view with `nb[0] = 4` and
+`bytes() = 1572864` per layer, i.e. it claims to be CONTIGUOUS, while `linear_state_transfer.cu`
+documents and implements the opposite ("the slot is the fastest axis of each layer tensor, so
+element i of slot s lives at `i * slot_count + s`", `slot_stride = pool.slot_count()` = 3 here). The
+two cannot both be right, and the second possibility explains the whole symptom: if the pool is
+slot-major and `transfer_slot` strides by `slot_count()`, then the snapshot permutes the bytes, the
+restore permutes them the same way, and every HOST hash still matches (all three `ec183a...`
+values) while the DEVICE slot the decode reads is left permuted -- which is exactly "round trip
+exact yet the claim decodes differently". The terminal entry would be permuted too, which is
+consistent with it also drifting from a cold replay (tokens 12-26) rather than being exact. Next:
+settle which layout is real by reading a few elements of one layer with both strides and comparing
+against a known value, then fix whichever of `recurrent_slot`/`transfer_slot` is wrong.
+
 1. **B4a state image.** Give every lane that can own a checkpoint its own state-image record
    (`{read, write}` slot pair) in the existing linear-state pool; the pool already reserves the
    third slot group introduced for the frontier snapshot, so no new allocation shape is needed.
