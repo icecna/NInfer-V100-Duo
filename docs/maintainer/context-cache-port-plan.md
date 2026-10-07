@@ -376,6 +376,17 @@ comparison for the same prompt (must report no divergence), phase 1 + phase 2 of
 
 B4 first, because it is the structural difference that makes the local restore a field list:
 
+ROOT CAUSE LOCATED: the checkpoint's GDN state is not the state a cold prefill reaches at the same
+frontier. A calibrated probe (hash of the per-layer RECURRENT slots of the claimed lane, taken in
+the first decode round, `NINFER_HOST_KV_PROBE=1`) gives the same value for two cold prefills of the
+same prompt (`8a3e90281c629cf2`) and a different value for the claim of that prompt
+(`6e0eee7c2d52bd3b`), while the same round's ingress fields are byte-identical
+(`frontier=3274 text_valid=3274 mtp_valid=3274 ledger=3275 drafts=3 extent=3`). So neither KV
+coverage, KV content, nor ingress is at fault: the state captured at the capture point, or the
+slot it is restored into, is wrong. Next: log the slot indices at the capture
+(`linear_state_current_slot_`, `linear_state_frontier_slot_`, `state_.slot_count()`) and hash the
+state at the capture moment, to decide between a wrong capture point and a wrong slot mapping.
+
 1. **B4a state image.** Give every lane that can own a checkpoint its own state-image record
    (`{read, write}` slot pair) in the existing linear-state pool; the pool already reserves the
    third slot group introduced for the frontier snapshot, so no new allocation shape is needed.
