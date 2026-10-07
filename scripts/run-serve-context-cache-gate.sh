@@ -84,7 +84,7 @@ run_pass() {
 
   "$python_bin" "$repo_dir/tools/smoke/context_cache_session.py" \
     --base-url "http://127.0.0.1:$port" --sessions "$sessions" --turns "$turns" \
-    --concurrency "$conc" --out "$out" | tee "$work_dir/$name.summary"
+    --concurrency "$conc" --pad-tokens "${CC_GATE_PAD_TOKENS:-0}" --out "$out" | tee "$work_dir/$name.summary"
   curl -s --max-time 10 "http://127.0.0.1:$port/metrics" > "$work_dir/$name.metrics" || true
   stop_serve
 }

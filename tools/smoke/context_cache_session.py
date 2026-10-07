@@ -102,8 +102,13 @@ def scrape(url: str, timeout: float) -> dict[str, float]:
     return out
 
 
-def session_messages(session: int, topic: str) -> list[dict[str, str]]:
-    return [{"role": "system", "content": FILLER * 6},
+def session_messages(session: int, topic: str, pad_tokens: int = 0) -> list[dict[str, str]]:
+    filler = FILLER * 6
+    if pad_tokens > 0:
+        block = ("The quarterly access review covers authentication, authorization, audit, "
+                 "availability, and cost controls across every region and tier. ")
+        filler += block * max(1, (pad_tokens * 4) // len(block))
+    return [{"role": "system", "content": filler},
             {"role": "user", "content": f"Topic {session + 1}: {topic}. Start the review."}]
 
 
@@ -111,7 +116,7 @@ def run_session(args: argparse.Namespace, session: int) -> list[dict[str, Any]]:
     chat = f"{args.base_url}/v1/chat/completions"
     metrics = f"{args.base_url}/metrics"
     topic = TOPICS[session % len(TOPICS)]
-    messages = session_messages(session, topic)
+    messages = session_messages(session, topic, args.pad_tokens)
     rows: list[dict[str, Any]] = []
     for turn in range(args.turns):
         before = scrape(metrics, args.timeout)
@@ -164,6 +169,10 @@ def main() -> int:
     parser.add_argument("--turns", type=int, default=6)
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--max-tokens", type=int, default=48)
+    # Pads the system prompt towards a target token count so long-context runs exercise the cache
+    # at a realistic size. English filler is about four characters per token; the server reports
+    # the true `prompt_tokens` per turn, which is what the budget checks read.
+    parser.add_argument("--pad-tokens", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
