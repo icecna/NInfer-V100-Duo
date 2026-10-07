@@ -60,13 +60,13 @@ cleanup() {
 trap cleanup EXIT
 
 run_pass() {
-  local name="$1" cache="$2" out="$3" conc="$4"
-  log "pass $name: --context-host-cache-mib $cache --concurrency $conc"
+  local name="$1" cache="$2" out="$3" conc="$4" extra="${5:-}"
+  log "pass $name: --context-host-cache-mib $cache --concurrency $conc $extra"
   "$repo_dir/build-host-retained/apps/ninfer-serve" "$artifact" \
     --tp 2 --devices 1,0 --host 127.0.0.1 --port "$port" \
     --max-concurrency 2 --max-context 160000 --kv-capacity 280000 --kv-dtype int8 \
     --prefill-chunk 2560 --spec mtp --draft-tokens 3 --lm-head-draft \
-    --context-host-cache-mib "$cache" \
+    --context-host-cache-mib "$cache" $extra \
     > "$work_dir/$name.log" 2>&1 &
   serve_pid=$!
   local ready=0
@@ -92,11 +92,13 @@ log "stopping ai-server for exclusive GPU use"
 service ai-server stop >/dev/null 2>&1 || true
 sleep 3
 
-# The two compared passes run ONE request at a time: greedy output is schedule dependent (a
-# different batch shape changes reductions, and the two passes do not hit the same checkpoints), so
-# identical text is only meaningful when the schedule is. The concurrent pass then checks that
-# concurrency still reuses, bounds occupancy and produces no errors, without comparing text.
-run_pass control 0 "$work_dir/control.jsonl" 1
+# The compared passes run ONE request at a time and the control disables prefix reuse ENTIRELY:
+# `--context-host-cache-mib 0` alone still reuses device-resident entries, so it produced a
+# different reuse pattern rather than no reuse, and comparing its output was meaningless. With
+# `--no-prefix-reuse` the control is a pure recompute, and any text difference is a real defect in
+# the reuse path (the in-session gate already shows a claim must be numerically exact). The
+# concurrent pass then checks that concurrency still reuses, bounds occupancy and errors.
+run_pass control 0 "$work_dir/control.jsonl" 1 "--no-prefix-reuse"
 run_pass host "$cache_mib" "$work_dir/host.jsonl" 1
 
 if [ "$evict_mib" -gt 0 ]; then
