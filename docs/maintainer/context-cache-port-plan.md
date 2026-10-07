@@ -285,6 +285,22 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     the checkpoint and read that buffer at retain. That needs a new persistent per-lane state
     layout (`layouts.h`/`layouts_impl.h`), a `set_*` on `TextContext`, and the retain path to read
     the buffer instead of `rewrite_checkpoint_state_slot`; the claim needs no change.
+    Tested and ruled out: a dedicated third per-lane state slot (`LinearStateSlots::frontier_state_slot`,
+    captured with `copy_slot(current, frontier)` right after the target layers and read by retain
+    instead of the rewrite slot) still reproduces the divergence. So the restore really does get the
+    target's state at the frontier, and the GDN is not the fault. Two more facts pin the cause:
+    the two sessions are comparable (a cold round is byte-identical across them), and the restored
+    prefix diverges from the cold prefill starting at the SECOND token (index 1), i.e. after the
+    first decode step, while the first token (from the frozen tail hidden) matches. What the prefix
+    residency has and no other entry has is KV content PAST its frontier: its KV is shared with the
+    terminal, so whole pages past the frontier still hold the terminal's tokens, and the sub-page
+    tail page keeps the terminal's columns. On the terminal claim the frontier is the last valid
+    index, so there is nothing stale to read; on the prefix there is. The fix is therefore exactly
+    the column-level coverage route B was chosen for: give the checkpoint an address space that
+    commits only `frontier % tokens_per_page` columns of its tail page (B2 shared extent plus owned
+    tail), instead of sharing whole terminal pages unmodified. Verifying this cheaply needs a
+    prefix whose last page is either frontier-exclusive or zeroed past the frontier; page-aligning
+    the frontier is not enough on its own because the GDN is only captured at the real frontier.
   - L5h cost-model ranking — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
