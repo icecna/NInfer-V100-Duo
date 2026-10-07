@@ -547,6 +547,11 @@ struct MemorySummary {
     // occupied by host-resident retained lanes. Host resource, summed over tp ranks.
     std::size_t host_kv_cache_bytes          = 0;
     std::size_t host_kv_cache_occupied_bytes = 0;
+    // Entry count, and the largest single free run in the host arena. A new retained prefix must
+    // fit inside one run and the arena never compacts, so a large free total next to a small
+    // largest run is fragmentation rather than occupancy.
+    std::size_t host_kv_cache_entries                   = 0;
+    std::size_t host_kv_cache_largest_free_extent_bytes = 0;
     // False while an in-flight terminal D2H retain still has pending device events. A caller
     // may poll this (via memory_summary) before submitting the next request, so that the next
     // admission boundary harvests a completed transfer and prefix reuse is served by the H2D

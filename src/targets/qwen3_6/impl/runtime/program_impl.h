@@ -1528,6 +1528,17 @@ std::size_t ProgramImplCore::host_kv_cache_used_bytes() const noexcept {
            (host_kv_arena_peer ? host_kv_arena_peer->occupied_bytes() : 0);
 }
 
+std::size_t ProgramImplCore::host_kv_cache_entries() const noexcept {
+    return host_prefixes.size();
+}
+
+std::size_t ProgramImplCore::host_kv_cache_largest_free_extent_bytes() const noexcept {
+    const std::size_t local = host_kv_arena ? host_kv_arena->largest_free_extent_bytes() : 0;
+    const std::size_t peer =
+        host_kv_arena_peer ? host_kv_arena_peer->largest_free_extent_bytes() : 0;
+    return local > peer ? local : peer;
+}
+
 void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_t lane) {
     if (host_kv_cache_bytes == 0) { return; }
     if (!sequence.kv) { host_kv_debugf("retain-skip lane=%u reason=no-kv", lane); return; }
@@ -3936,6 +3947,8 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.host_kv_cache_occupied_bytes   =
         (host_kv_arena ? host_kv_arena->occupied_bytes() : 0) +
         (host_kv_arena_peer ? host_kv_arena_peer->occupied_bytes() : 0);
+    out.host_kv_cache_entries                   = host_kv_cache_entries();
+    out.host_kv_cache_largest_free_extent_bytes = host_kv_cache_largest_free_extent_bytes();
     out.host_kv_retain_complete       = host_retain_copies_done();
     return out;
 }

@@ -299,6 +299,14 @@ void HttpServer::register_routes() {
         body += "context_host_cache_occupied_bytes ";
         body += std::to_string(memory.host_kv_cache_occupied_bytes);
         body += '\n';
+        body += "# TYPE context_host_cache_entries gauge\n";
+        body += "context_host_cache_entries ";
+        body += std::to_string(memory.host_kv_cache_entries);
+        body += '\n';
+        body += "# TYPE context_host_cache_largest_free_extent_bytes gauge\n";
+        body += "context_host_cache_largest_free_extent_bytes ";
+        body += std::to_string(memory.host_kv_cache_largest_free_extent_bytes);
+        body += '\n';
         body += "# TYPE context_host_cache_capacity_bytes gauge\n";
         body += "context_host_cache_capacity_bytes ";
         body += std::to_string(memory.host_kv_cache_bytes);
