@@ -13,6 +13,12 @@
 # Usage:
 #   scripts/run-serve-context-cache-gate.sh [--artifact PATH] [--cache-mib N] [--sessions N]
 #                                           [--turns N] [--concurrency N] [--evict-mib N]
+# CC_GATE_PAD_TOKENS=N grows every prompt towards N tokens for long-context runs.
+#
+# Passes: control (no reuse) and host (host cache) always run one request at a time so their
+# outputs are comparable; the third pass, enabled by --evict-mib N, runs at --concurrency with an
+# N MiB host cache, which is the pass that exercises concurrency (with --max-concurrency 2, three
+# concurrent sessions are two running plus one queued) and a large cache.
 set -euo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -57,7 +63,15 @@ cleanup() {
   log "restarting ai-server"
   service ai-server start >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
+trap 'exit 143' TERM INT HUP
+# The EXIT trap does NOT run when bash is killed by an untrapped signal, so an interrupted gate
+# used to leave ai-server stopped; route signals through `exit` and clean up exactly once.
+cleanup_once() {
+  [ "${cleanup_done:-0}" = 1 ] && return 0
+  cleanup_done=1
+  cleanup
+}
+trap cleanup_once EXIT
 
 run_pass() {
   local name="$1" cache="$2" out="$3" conc="$4" extra="${5:-}"
