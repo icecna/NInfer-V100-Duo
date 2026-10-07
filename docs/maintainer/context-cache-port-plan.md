@@ -387,6 +387,20 @@ slot it is restored into, is wrong. Next: log the slot indices at the capture
 (`linear_state_current_slot_`, `linear_state_frontier_slot_`, `state_.slot_count()`) and hash the
 state at the capture moment, to decide between a wrong capture point and a wrong slot mapping.
 
+DONE, and it narrows the defect further. The capture point is CORRECT: with
+`NINFER_HOST_KV_PROBE=1` the capture prints `current=0 frontier=2 slots=3` (the mapping
+`lane`/`2n+lane`/`3n` is right) and its per-layer recurrent hash is `8a3e90281c629cf2`, which is
+exactly what the first decode round of a cold prefill of the same prompt reports -- twice. The
+claim of that same prompt reports `6e0eee7c2d52bd3b`. Capture, slot mapping, ingress, KV coverage
+and KV content are therefore all correct, and the defect is in the STATE TRANSPORT between the
+capture and the claim: either the frontier slot is overwritten between the capture and the retain
+snapshot, or `snapshot_linear_state_slot_to_host` / `restore_linear_state_slot_from_host` lose or
+misplace it. The next measurement is the same per-layer recurrent hash taken (a) in
+`retain_host_sequence` right where the prefix GDN is snapshotted and (b) after the claim restores
+it; (a) != `8a3e...` means the slot was clobbered, (a) == `8a3e...` with (b) != `8a3e...` means the
+transport is wrong. Note: snapshotting a raw slot from inside `TextContext` faults with
+`cudaErrorIllegalAddress`, so the recurrent view (used by the working probe) is the safe sampler.
+
 1. **B4a state image.** Give every lane that can own a checkpoint its own state-image record
    (`{read, write}` slot pair) in the existing linear-state pool; the pool already reserves the
    third slot group introduced for the frontier snapshot, so no new allocation shape is needed.
