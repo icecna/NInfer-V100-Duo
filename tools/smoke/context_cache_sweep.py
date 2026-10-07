@@ -9,7 +9,7 @@ extending its own conversation turn by turn, and reports:
   * turns that reused a prefix and the tokens that came from the cache;
   * time to first token for reused turns versus recomputed ones;
   * the reuse share over the whole size, from the server's own `prompt_tokens_cached_total` and
-    `computed_prefill_tokens_total` counters;
+    `prefill_tokens_total` counters;
   * the host cache occupancy before and after the size.
 
 The per-request token counters come from `/metrics`, so a concurrent neighbour can contribute to
@@ -45,8 +45,8 @@ CHARS_PER_TOKEN = 6.1
 BLOCK = ("The quarterly access review covers authentication, authorization, audit, availability, "
          "and cost controls across every region and tier, for every team and every service. ")
 COUNTERS = ("prompt_tokens_cached_total", "checkpoint_selections_total",
-            "computed_prefill_tokens_total", "committed_decode_tokens_total",
-            "context_host_cache_occupied_bytes", "context_host_cache_capacity_bytes")
+            "prefill_tokens_total", "decode_tokens_total",
+            "host_context_occupied_bytes", "host_context_capacity_bytes")
 
 
 def scrape(base_url: str, timeout: float) -> dict[str, float]:
@@ -122,10 +122,10 @@ def session_rows(args: argparse.Namespace, size: int, session: int) -> list[dict
                - before.get("prompt_tokens_cached_total", 0.0),
                "checkpoint_selections": after.get("checkpoint_selections_total", 0.0)
                - before.get("checkpoint_selections_total", 0.0),
-               "computed_prefill": after.get("computed_prefill_tokens_total", 0.0)
-               - before.get("computed_prefill_tokens_total", 0.0),
-               "host_occupied_bytes": after.get("context_host_cache_occupied_bytes", 0.0),
-               "host_capacity_bytes": after.get("context_host_cache_capacity_bytes", 0.0)}
+               "computed_prefill": after.get("prefill_tokens_total", 0.0)
+               - before.get("prefill_tokens_total", 0.0),
+               "host_occupied_bytes": after.get("host_context_occupied_bytes", 0.0),
+               "host_capacity_bytes": after.get("host_context_capacity_bytes", 0.0)}
         row.update(result)
         rows.append(row)
         if "error" in result or result.get("empty"):
@@ -146,8 +146,8 @@ def sweep_size(args: argparse.Namespace, size: int) -> dict[str, Any]:
     rows = [row for batch in batches for row in batch]
     end = scrape(args.base_url, args.timeout)
     cached = end.get("prompt_tokens_cached_total", 0.0) - start.get("prompt_tokens_cached_total", 0.0)
-    computed = (end.get("computed_prefill_tokens_total", 0.0)
-                - start.get("computed_prefill_tokens_total", 0.0))
+    computed = (end.get("prefill_tokens_total", 0.0)
+                - start.get("prefill_tokens_total", 0.0))
     reused = [row for row in rows if row.get("reused_tokens", 0.0) > 0]
     cold = [row for row in rows if "ttft" in row and row.get("reused_tokens", 0.0) == 0]
     summary = {
@@ -163,8 +163,8 @@ def sweep_size(args: argparse.Namespace, size: int) -> dict[str, Any]:
                                      for row in rows] or [0])),
         "ttft_reused": median([row["ttft"] for row in reused]),
         "ttft_cold": median([row["ttft"] for row in cold]),
-        "occupied_gib": end.get("context_host_cache_occupied_bytes", 0.0) / 2 ** 30,
-        "capacity_gib": end.get("context_host_cache_capacity_bytes", 0.0) / 2 ** 30,
+        "occupied_gib": end.get("host_context_occupied_bytes", 0.0) / 2 ** 30,
+        "capacity_gib": end.get("host_context_capacity_bytes", 0.0) / 2 ** 30,
     }
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

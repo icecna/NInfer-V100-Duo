@@ -295,26 +295,26 @@ void HttpServer::register_routes() {
                 counters.root_selections);
         counter("checkpoint_selections_total", "Initial bindings with checkpoint reuse.",
                 counters.checkpoint_selections);
-        body += "# TYPE context_host_cache_occupied_bytes gauge\n";
-        body += "context_host_cache_occupied_bytes ";
+        body += "# TYPE host_context_occupied_bytes gauge\n";
+        body += "host_context_occupied_bytes ";
         body += std::to_string(memory.host_kv_cache_occupied_bytes);
         body += '\n';
-        body += "# TYPE context_host_cache_entries gauge\n";
-        body += "context_host_cache_entries ";
+        body += "# TYPE host_context_entries gauge\n";
+        body += "host_context_entries ";
         body += std::to_string(memory.host_kv_cache_entries);
         body += '\n';
-        body += "# TYPE context_host_cache_largest_free_extent_bytes gauge\n";
-        body += "context_host_cache_largest_free_extent_bytes ";
+        body += "# TYPE host_context_largest_free_extent_bytes gauge\n";
+        body += "host_context_largest_free_extent_bytes ";
         body += std::to_string(memory.host_kv_cache_largest_free_extent_bytes);
         body += '\n';
-        body += "# TYPE context_host_cache_capacity_bytes gauge\n";
-        body += "context_host_cache_capacity_bytes ";
+        body += "# TYPE host_context_capacity_bytes gauge\n";
+        body += "host_context_capacity_bytes ";
         body += std::to_string(memory.host_kv_cache_bytes);
         body += '\n';
-        counter("computed_prefill_tokens_total",
+        counter("prefill_tokens_total",
                 "Prompt tokens evaluated by prefill, resident prefix hits excluded.",
                 stats.computed_prefill_tokens);
-        counter("committed_decode_tokens_total", "Tokens committed by decode rounds.",
+        counter("decode_tokens_total", "Tokens committed by decode rounds.",
                 stats.committed_decode_tokens);
         res.set_header("Cache-Control", "no-store");
         res.set_content(body, "text/plain; version=0.0.4; charset=utf-8");
