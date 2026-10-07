@@ -2100,21 +2100,6 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
 
         run_layers_tp2(x, Phase::Prefill, staging);
 
-        // Capture the target's frontier state before any draft work runs: the MTP prefill below
-        // advances the running state, so a copy taken after it is not the state at the checkpoint.
-        if (checkpoint_rel > 0 && len == checkpoint_rel) {
-            if (const char* dbg = std::getenv("NINFER_HOST_KV_DEBUG");
-                dbg != nullptr && *dbg != '\0') {
-                std::fprintf(stderr, "[prefill-capture] abs=%lld rel=%d len=%d base=%lld\n",
-                             static_cast<long long>(checkpoint_abs), checkpoint_rel, len,
-                             static_cast<long long>(base64));
-            }
-            for_each_rank(execution, [&](int rank) {
-                state_for(rank).copy_slot(linear_state_current_slot_,
-                                          linear_state_rewrite_checkpoint_slot_, stream_for(rank));
-            });
-        }
-
         std::array<Tensor, 2> xf;
         xf[0] = prefill_hidden_.data != nullptr ? matrix_window(prefill_hidden_, len)
                                                 : ws[0]->alloc(DType::BF16, {kCfg.hidden, len});
@@ -2262,6 +2247,13 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                                        checkpoint_hidden.data, checkpoint_hidden.bytes(),
                                        cudaMemcpyDeviceToDevice, ctx_.stream));
         }
+    }
+
+    if (checkpoint_rel > 0 && len == checkpoint_rel) {
+        for_each_rank(execution, [&](int rank) {
+            state_for(rank).copy_slot(linear_state_current_slot_,
+                                      linear_state_rewrite_checkpoint_slot_, stream_for(rank));
+        });
     }
 
     prefill_rewrite_checkpoint_frontier_ = -1;

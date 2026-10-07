@@ -6,7 +6,7 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
-/** Qwen3.6's target-local mapping from a stable request lane to its three state roles. */
+/** Qwen3.6's target-local mapping from a stable request lane to its two state roles. */
 struct LinearStateSlots {
     [[nodiscard]] static std::int32_t state_slot_count(std::uint32_t max_concurrency) {
         if (max_concurrency == 0 ||
