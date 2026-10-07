@@ -180,7 +180,9 @@ enum class RetainedResidency : std::uint8_t {
 // One referenced run of pages inside an arena allocation. A residency holds segments instead of
 // one allocation per region so that an entry published after a claim can reference the claimed
 // entry's pages for the common prefix and allocate only the pages this request appended: the
-// arena charges each allocation once, so a shared page is stored and accounted once.
+// arena charges each allocation once, so a shared page is stored and accounted once. A segment
+// names the run inside its allocation and may be longer than one reader needs -- the shorter
+// prefix residency shares the terminal's allocation -- so readers clamp to the pages they want.
 struct HostKvSegment {
     std::shared_ptr<HostKVAllocation> allocation;
     std::uint32_t first_page = 0;
@@ -188,10 +190,10 @@ struct HostKvSegment {
 };
 
 struct HostKVResidency {
-    std::shared_ptr<HostKVAllocation> text_local;
-    std::shared_ptr<HostKVAllocation> text_peer;
-    std::shared_ptr<HostKVAllocation> backend_local;
-    std::shared_ptr<HostKVAllocation> backend_peer;
+    std::vector<HostKvSegment> text_local;
+    std::vector<HostKvSegment> text_peer;
+    std::vector<HostKvSegment> backend_local;
+    std::vector<HostKvSegment> backend_peer;
 };
 
 // Production payload of the content-addressed host prefix table (P2): a self-contained snapshot
@@ -669,9 +671,12 @@ private:
     void copy_kv_pages_to_host(const PagedKVPool& pool, const PagedKVAllocation& allocation,
                                std::uint32_t pages, const HostKVAllocationView& host,
                                cudaStream_t stream) const;
+    // Copies `pages` pages into the device allocation from `host`, landing at `dest_first_page`
+    // so a residency made of several referenced page runs can be restored run by run. The host
+    // side starts where the view starts, which `HostKVAllocationView::subview` positions.
     void copy_kv_pages_from_host(const PagedKVPool& pool, const PagedKVAllocation& allocation,
                                  std::uint32_t pages, const HostKVAllocationView& host,
-                                 cudaStream_t stream) const;
+                                 cudaStream_t stream, std::uint32_t dest_first_page = 0) const;
     bool host_transfer_events_done(std::uint32_t lane) const;
     bool host_retain_copies_done() const;
     void host_transfer_drain(std::uint32_t lane) const;

@@ -1272,7 +1272,8 @@ void ProgramImplCore::copy_kv_pages_from_host(const PagedKVPool& pool,
                                               const PagedKVAllocation& allocation,
                                               std::uint32_t pages,
                                               const HostKVAllocationView& host,
-                                              cudaStream_t stream) const {
+                                              cudaStream_t stream,
+                                              std::uint32_t dest_first_page) const {
     const HostKVPageLayout& layout = host.layout();
     if (pool.spec().plane_order != PagedKVPlaneOrder::PageMajor) {
         throw std::logic_error("host retained-prefix cache requires PageMajor KV pools");
@@ -1281,12 +1282,12 @@ void ProgramImplCore::copy_kv_pages_from_host(const PagedKVPool& pool,
         throw std::logic_error("host KV layout does not match the pool plane set");
     }
     const std::span<const std::int32_t> page_ids = allocation.page_ids();
-    if (page_ids.size() < pages) {
+    if (dest_first_page > page_ids.size() || page_ids.size() - dest_first_page < pages) {
         throw std::logic_error("host KV transfer exceeds the allocation's mapped pages");
     }
     const std::byte* host_base = host.data();
     for (std::uint32_t page = 0; page < pages; ++page) {
-        const std::int32_t physical = page_ids[page];
+        const std::int32_t physical = page_ids[dest_first_page + page];
         const std::byte* src = host_base + static_cast<std::size_t>(page) * layout.page_stride;
         for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
             const Tensor& slab = pool.plane(plane);
@@ -1347,22 +1348,19 @@ void ProgramImplCore::complete_host_transfer(std::uint32_t lane, bool abandoned)
         // Wrap the KV regions in shared ownership first: the optional prefix residency references
         // the terminal's whole pages instead of copying them, and the arena charges them once.
         HostKVResidency kv_shared;
-        if (transfer->text_local) {
-            kv_shared.text_local =
-                std::make_shared<HostKVAllocation>(std::move(*transfer->text_local));
-        }
-        if (transfer->text_peer) {
-            kv_shared.text_peer =
-                std::make_shared<HostKVAllocation>(std::move(*transfer->text_peer));
-        }
-        if (transfer->backend_local) {
-            kv_shared.backend_local =
-                std::make_shared<HostKVAllocation>(std::move(*transfer->backend_local));
-        }
-        if (transfer->backend_peer) {
-            kv_shared.backend_peer =
-                std::make_shared<HostKVAllocation>(std::move(*transfer->backend_peer));
-        }
+        const auto adopt = [](std::optional<HostKVAllocation>& allocation,
+                              std::vector<HostKvSegment>& segments) {
+            if (!allocation) { return; }
+            HostKvSegment segment;
+            segment.allocation = std::make_shared<HostKVAllocation>(std::move(*allocation));
+            segment.first_page = 0;
+            segment.page_count = segment.allocation->page_count();
+            segments.push_back(std::move(segment));
+        };
+        adopt(transfer->text_local, kv_shared.text_local);
+        adopt(transfer->text_peer, kv_shared.text_peer);
+        adopt(transfer->backend_local, kv_shared.backend_local);
+        adopt(transfer->backend_peer, kv_shared.backend_peer);
         // Publish the shorter residency FIRST so its retention age precedes the terminal's: when
         // the arena later needs room, the optional prefix is reclaimed before any terminal.
         if (prefix_ready) {
@@ -1899,7 +1897,7 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
         if (text_pages > 0) {
             const HostKVPageLayout* lt = host_kv_arena->layout_for(decoder->text_kv.pool().spec());
             if (lt) { bytes += static_cast<std::size_t>(text_pages) * lt->page_stride; }
-            if (host.text_peer) {
+            if (!host.text_peer.empty()) {
                 const HostKVPageLayout* lpt =
                     host_kv_arena_peer->layout_for(peer->decoder->text_kv.pool().spec());
                 if (lpt) { bytes += static_cast<std::size_t>(text_pages) * lpt->page_stride; }
@@ -1909,7 +1907,7 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
             const HostKVPageLayout* lb =
                 host_kv_arena->layout_for(backend_kv_cache()->pool().spec());
             if (lb) { bytes += static_cast<std::size_t>(backend_pages) * lb->page_stride; }
-            if (host.backend_peer) {
+            if (!host.backend_peer.empty()) {
                 const HostKVPageLayout* lbp =
                     host_kv_arena_peer->layout_for(peer->decoder->mtp_cache()->pool().spec());
                 if (lbp) { bytes += static_cast<std::size_t>(backend_pages) * lbp->page_stride; }
@@ -1934,29 +1932,42 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
                 sequence.kv->backend_peer->materialize_pages(backend_pages, peer->device.stream);
             }
         }
-        if (text_pages > 0 && host.text_local) {
-            copy_kv_pages_from_host(decoder->text_kv.pool(), sequence.kv->text, text_pages,
-                                    host_kv_arena->view(*host.text_local),
-                                    device.stream);
-            if (sequence.kv->text_peer && host.text_peer) {
+        // Restore `pages` pages of a region from the entry's segments: a segment may be longer
+        // than the reader wants (the shorter prefix residency shares the terminal's allocation),
+        // so each one contributes only what is still missing.
+        const auto restore_region = [&](const std::vector<HostKvSegment>& segments,
+                                        HostKVArena& arena, const PagedKVPool& pool,
+                                        const PagedKVAllocation& dest, std::uint32_t pages,
+                                        cudaStream_t stream) {
+            std::uint32_t dest_page = 0;
+            for (const HostKvSegment& segment : segments) {
+                if (dest_page >= pages) { break; }
+                const std::uint32_t count = std::min(segment.page_count, pages - dest_page);
+                if (count == 0) { continue; }
+                copy_kv_pages_from_host(
+                    pool, dest, count,
+                    arena.view(*segment.allocation).subview(segment.first_page, count), stream,
+                    dest_page);
+                dest_page += count;
+            }
+        };
+        if (text_pages > 0 && !host.text_local.empty()) {
+            restore_region(host.text_local, *host_kv_arena, decoder->text_kv.pool(),
+                           sequence.kv->text, text_pages, device.stream);
+            if (sequence.kv->text_peer && !host.text_peer.empty()) {
                 const ScopedDevice scope(peer->device.device);
-                copy_kv_pages_from_host(peer->decoder->text_kv.pool(), *sequence.kv->text_peer,
-                                        text_pages,
-                                        host_kv_arena_peer->view(*host.text_peer),
-                                        peer->device.stream);
+                restore_region(host.text_peer, *host_kv_arena_peer, peer->decoder->text_kv.pool(),
+                               *sequence.kv->text_peer, text_pages, peer->device.stream);
             }
         }
-        if (backend_pages > 0 && host.backend_local) {
-            copy_kv_pages_from_host(backend_kv_cache()->pool(), *sequence.kv->backend,
-                                    backend_pages,
-                                    host_kv_arena->view(*host.backend_local),
-                                    device.stream);
-            if (sequence.kv->backend_peer && host.backend_peer) {
+        if (backend_pages > 0 && !host.backend_local.empty()) {
+            restore_region(host.backend_local, *host_kv_arena, backend_kv_cache()->pool(),
+                           *sequence.kv->backend, backend_pages, device.stream);
+            if (sequence.kv->backend_peer && !host.backend_peer.empty()) {
                 const ScopedDevice scope(peer->device.device);
-                copy_kv_pages_from_host(peer->decoder->mtp_cache()->pool(),
-                                        *sequence.kv->backend_peer, backend_pages,
-                                        host_kv_arena_peer->view(*host.backend_peer),
-                                        peer->device.stream);
+                restore_region(host.backend_peer, *host_kv_arena_peer,
+                               peer->decoder->mtp_cache()->pool(), *sequence.kv->backend_peer,
+                               backend_pages, peer->device.stream);
             }
         }
         // GDN current state and the rank-0 tail hidden: the bit-exact state the reuse path
