@@ -739,17 +739,24 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                         capacity - prompt_tokens > 0 ? capacity - prompt_tokens - 1 : 0U})
             : 0U;
     request.lifecycle = Lifecycle::Empty;
-    sequence.retained = false;
     if (sequence.retained_residency == RetainedResidency::HostTransferIn) {
-        // Device pages are still in place (the transfer is conservative), so the reuse path
-        // proceeds unchanged; the in-flight copy is abandoned and its host extent drops back to
-        // the arena when the D2H retires. (Host claims are gone from the lane state: entries
-        // live in the table, and the claim above ran before this point.)
-        sequence.retained_residency = RetainedResidency::None;
+        // The lane is being reused before its previous terminal D2H landed. Retire that copy here
+        // instead of dropping it. Its source pages are still the ones it was issued from and
+        // nothing has written to them yet -- the new request's writes start below -- so waiting
+        // for the copy and publishing it is safe, and it is what lets the next turn reuse this
+        // prefix. Dropping it instead cost every turn that followed a fast (cache-hit) turn its
+        // own checkpoint, because those turns leave the next request only a few hundred
+        // milliseconds to land the copy.
+        //
+        // The completion runs while the lane still reads as retained, which is why it precedes
+        // both clears: complete_host_transfer() refuses a lane that already moved on.
         if (auto& transfer = host_retain_transfers[sequence.lane]; transfer) {
-            transfer->abandoned = true;
+            host_transfer_drain(sequence.lane);
+            complete_host_transfer(sequence.lane, /*abandoned=*/false);
         }
+        sequence.retained_residency = RetainedResidency::None;
     }
+    sequence.retained = false;
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
             sequence.kv.reset();
