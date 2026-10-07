@@ -17,6 +17,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -188,15 +189,39 @@ public:
 
     // --- reclaim ---
 
-    // Least valuable first: never-reused checkpoints by age, then reused ones by last demand.
+    // A checkpoint is superseded when a newer owner of its own session lineage has published a
+    // checkpoint and the older owner has finished: the newer prefix contains the older
+    // conversation, so reclaiming the older one loses no reuse the newer does not still offer.
+    // The comparison is by owner rather than by publication alone, so the two residencies of one
+    // request (its shorter frontier and its terminal) never supersede each other, and an active
+    // lineage is left alone because it may still be building on its own checkpoints.
+    [[nodiscard]] bool superseded(CheckpointId id) const {
+        const auto checkpoint = checkpoints_.find(id);
+        if (checkpoint == checkpoints_.end()) { return false; }
+        const auto mine = owners_.find(checkpoint->second.owner);
+        if (mine == owners_.end() || !mine->second.session || mine->second.active) { return false; }
+        const std::string& session = *mine->second.session;
+        for (const auto& [other_id, other] : checkpoints_) {
+            if (other_id == id || other.owner <= checkpoint->second.owner) { continue; }
+            const auto theirs = owners_.find(other.owner);
+            if (theirs != owners_.end() && theirs->second.session &&
+                *theirs->second.session == session) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Least valuable first: superseded checkpoints (a newer prefix of the same session already
+    // covers them), then never-reused ones by age, then reused ones by last demand.
     [[nodiscard]] std::vector<CheckpointId> victims() const {
         std::vector<CheckpointId> ids;
         ids.reserve(checkpoints_.size());
         for (const auto& [id, checkpoint] : checkpoints_) { ids.push_back(id); }
         const auto rank = [this](CheckpointId id) {
             const RetentionPriority priority = priority_of(id);
-            return std::pair<bool, std::uint64_t>{
-                priority.reused,
+            return std::tuple<bool, bool, std::uint64_t>{
+                !superseded(id), priority.reused,
                 priority.reused ? priority.last_demand : checkpoints_.at(id).retained_at};
         };
         std::stable_sort(ids.begin(), ids.end(), [&](CheckpointId left, CheckpointId right) {
@@ -206,11 +231,13 @@ public:
     }
 
     // A new checkpoint with `gain` may replace the sacrificed ones only when its gain exceeds the
-    // combined loss of reclaiming them.
+    // combined loss of reclaiming them. Reclaiming a superseded checkpoint costs nothing, because
+    // the newer checkpoint of that session still offers the prefix it provided.
     [[nodiscard]] bool admits(std::uint64_t gain,
                               std::span<const CheckpointId> sacrificed) const {
         std::uint64_t loss = 0;
         for (const CheckpointId id : sacrificed) {
+            if (superseded(id)) { continue; }
             loss += priority_of(id).reused ? kReusedLoss : kFreshLoss;
         }
         return gain > loss;

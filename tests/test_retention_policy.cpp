@@ -110,12 +110,58 @@ int test_victims_and_admits() {
     return failures;
 }
 
+// A newer checkpoint of the same session supersedes the older one, which makes it the first
+// victim and makes reclaiming it free. Both residencies of one request stay, because they share
+// an owner, and an active or different-session lineage is left alone.
+int test_superseded_within_session() {
+    int failures = 0;
+    ContextRetentionPolicy policy;
+    const ContinuationOwnerToken first = policy.open_owner(std::string("session-1"));
+    policy.publish(first, 20, CheckpointRole::SharedPrefix, true);
+    policy.publish(first, 21, CheckpointRole::SharedPrefix, true);
+    failures += check(!policy.superseded(20) && !policy.superseded(21),
+                      "two residencies of one request do not supersede each other");
+
+    const ContinuationOwnerToken other = policy.open_owner(std::string("session-2"));
+    policy.publish(other, 23, CheckpointRole::SharedPrefix, true);
+    failures += check(!policy.superseded(20),
+                      "a checkpoint of another session does not supersede");
+
+    const ContinuationOwnerToken second = policy.open_owner(std::string("session-1"));
+    policy.publish(second, 22, CheckpointRole::SharedPrefix, true);
+    failures += check(!policy.superseded(20),
+                      "an active same-session lineage does not supersede while it may continue");
+
+    policy.finish_owner(first);
+    failures += check(policy.superseded(20) && policy.superseded(21),
+                      "a finished session's checkpoints are superseded by the newer owner");
+    failures += check(!policy.superseded(22) && !policy.superseded(23),
+                      "the superseding checkpoint and other sessions stay intact");
+
+    // A superseded checkpoint is reclaimed before fresh ones even when it was reused.
+    policy.remember_demand(20, 100);
+    const std::vector<std::uint64_t> victims = policy.victims();
+    failures += check(victims.size() >= 2 && victims[0] == 21 && victims[1] == 20,
+                      "superseded checkpoints are evicted first, freshest of them first");
+
+    // Reclaiming a superseded checkpoint costs nothing: the newer prefix still offers it, so an
+    // admission that would lose against a reused checkpoint succeeds against a superseded one.
+    const std::vector<std::uint64_t> superseded_ten{20};
+    failures += check(policy.admits(1, superseded_ten),
+                      "reclaiming a superseded checkpoint costs no reuse");
+    const std::vector<std::uint64_t> reused_not_superseded{23};
+    failures += check(!policy.admits(1, reused_not_superseded),
+                      "a non-superseded checkpoint keeps its loss");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
     failures += test_session_lineage_and_candidates();
     failures += test_victims_and_admits();
+    failures += test_superseded_within_session();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
