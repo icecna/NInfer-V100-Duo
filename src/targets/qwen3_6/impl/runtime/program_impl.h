@@ -1393,6 +1393,14 @@ void ProgramImplCore::complete_host_transfer(std::uint32_t lane, bool abandoned)
             host_retention.finish_owner(prefix_owner);
             host_prefixes.stamp(prefix_id, ++host_lru_counter);
             ++host_table_version_;
+            // Upstream releases a checkpoint as soon as nothing references it: a newer checkpoint
+            // of the same session covers the older ones, so they hold no reuse the newer one does
+            // not still offer. Reclaim them here instead of waiting for the arena to run out and
+            // then picking them from `victims()`; that is what kept a whole session's older
+            // prefixes, with their state images, resident through an idle cache.
+            for (const qwen3_6::detail::HostPrefixId stale : host_retention.victims()) {
+                if (host_retention.superseded(stale)) { evict_host_entry(stale); }
+            }
         }
         // Publish the self-contained entry and release the lane entirely: the entry owns the
         // arena extents AND the content (tokens/identity) AND the state snapshots (GDN current
