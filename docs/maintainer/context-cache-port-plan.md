@@ -277,6 +277,14 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     at all. Either way the fix is the same: capture the frontier state explicitly at the checkpoint
     (before any draft advance) into a dedicated per-lane buffer rather than reading the rewrite
     slot at retain.
+    Tested: moving the capture to immediately after the target layers (before the draft prefill) does
+    NOT fix the divergence. So the capture point is not the fault either; the rewrite slot simply
+    does not hold the target's frontier state when retain reads it, whether because another consumer
+    owns or advances it during decode or because it is reused. The fix is therefore to stop relying
+    on the rewrite slot: capture the frontier state explicitly into a dedicated per-lane buffer at
+    the checkpoint and read that buffer at retain. That needs a new persistent per-lane state
+    layout (`layouts.h`/`layouts_impl.h`), a `set_*` on `TextContext`, and the retain path to read
+    the buffer instead of `rewrite_checkpoint_state_slot`; the claim needs no change.
   - L5h cost-model ranking — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
