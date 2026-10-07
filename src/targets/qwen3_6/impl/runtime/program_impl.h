@@ -1403,35 +1403,42 @@ void ProgramImplCore::complete_host_transfer(std::uint32_t lane, bool abandoned)
         // arena extents AND the content (tokens/identity) AND the state snapshots (GDN current
         // slot per device, rank-0 tail hidden), so no lane field survives the round trip.
         sequence.kv.reset();
-        HostPrefixResidency residency;
-        residency.kv               = kv_shared;
-        residency.gdn_local        = std::move(transfer->gdn_local);
-        residency.gdn_peer         = std::move(transfer->gdn_peer);
-        residency.tail_local       = std::move(transfer->tail_local);
-        residency.tail_bytes       = sequence.tail_hidden.bytes();
-        residency.tokens           = std::move(sequence.ledger);
-        residency.identity         = std::move(sequence.prefix_identity);
-        residency.origin_lane      = lane;
-        residency.reuse_boundary   = sequence.execution_frontier;
-        // The digest table must reflect the ledger's real token ids (generated tokens included),
-        // so a later request can shortlist this residency before the exact match runs.
-        residency.identity.recompute_digests(residency.tokens);
-        const qwen3_6::detail::PrefixShortlistKey shortlist{
-            .digest       = residency.identity.digest_at(residency.reuse_boundary),
-            .frontier     = static_cast<std::uint32_t>(residency.reuse_boundary),
-            .identity_tag = prefix_identity_tag};
-        const qwen3_6::detail::HostPrefixId id =
-            host_prefixes.insert(std::move(residency),
-                                 [this] { return ++host_prefix_id_counter; });
-        host_prefix_index.insert(id, shortlist);
-        const runtime::ContinuationOwnerToken owner_token = host_retention.open_owner(
-            sequence.session_key.empty() ? std::optional<std::string>{}
-                                         : std::optional<std::string>(sequence.session_key));
-        host_retention.publish(owner_token, id, runtime::CheckpointRole::SharedPrefix,
-                               /*shared=*/false);
-        host_retention.finish_owner(owner_token);
-        host_prefixes.stamp(id, ++host_lru_counter);
-        ++host_table_version_;
+        // Publish the self-contained terminal entry only when this request has no prompt-end
+        // anchor to publish instead: a boundary that includes the tokens this request generated is
+        // unreachable for a client that replays the history, while the anchor already carries the
+        // KV (shared) and the state a claim restores. A shape whose follow-up appends an assistant
+        // message produces no anchor, and there the terminal is what keeps reuse working.
+        if (!prefix_ready) {
+            HostPrefixResidency residency;
+            residency.kv               = kv_shared;
+            residency.gdn_local        = std::move(transfer->gdn_local);
+            residency.gdn_peer         = std::move(transfer->gdn_peer);
+            residency.tail_local       = std::move(transfer->tail_local);
+            residency.tail_bytes       = sequence.tail_hidden.bytes();
+            residency.tokens           = std::move(sequence.ledger);
+            residency.identity         = std::move(sequence.prefix_identity);
+            residency.origin_lane      = lane;
+            residency.reuse_boundary   = sequence.execution_frontier;
+            // The digest table must reflect the ledger's real token ids (generated tokens included),
+            // so a later request can shortlist this residency before the exact match runs.
+            residency.identity.recompute_digests(residency.tokens);
+            const qwen3_6::detail::PrefixShortlistKey shortlist{
+                .digest       = residency.identity.digest_at(residency.reuse_boundary),
+                .frontier     = static_cast<std::uint32_t>(residency.reuse_boundary),
+                .identity_tag = prefix_identity_tag};
+            const qwen3_6::detail::HostPrefixId id =
+                host_prefixes.insert(std::move(residency),
+                                     [this] { return ++host_prefix_id_counter; });
+            host_prefix_index.insert(id, shortlist);
+            const runtime::ContinuationOwnerToken owner_token = host_retention.open_owner(
+                sequence.session_key.empty() ? std::optional<std::string>{}
+                                             : std::optional<std::string>(sequence.session_key));
+            host_retention.publish(owner_token, id, runtime::CheckpointRole::SharedPrefix,
+                                   /*shared=*/false);
+            host_retention.finish_owner(owner_token);
+            host_prefixes.stamp(id, ++host_lru_counter);
+            ++host_table_version_;
+        }
         // Upstream releases a checkpoint as soon as nothing references it, instead of leaving it
         // for the allocator to reclaim when it runs out: `publish` ends in `prune`, and a
         // checkpoint with no references is released outright. The entries this request supersedes
