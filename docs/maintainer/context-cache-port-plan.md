@@ -330,7 +330,16 @@ which means the restored state is wrong rather than shifted. (3) A claim-field p
 prefix entry lands with `exec == ledger.size()` while the terminal entry lands with
 `exec + 1 == ledger.size()`, but testing the "boundary is an index" reading (`reuse_boundary =
 prefix_frontier - 1`) moves the divergence to token 0, i.e. the count reading is the correct one and
-this asymmetry is not the cause. Remaining unexplored surface: what the first MTP verify round does
+this asymmetry is not the cause. (4) The terminal claims were never compared before; comparing them
+now shows the claim path itself drifts from a cold replay: `A_next` first differs at token 26,
+`C_next` at 12, `B_next` not at all (32/32), while the prefix claim differs at token 1. So there is
+an accepted small claim-path difference (the reason the original test deliberately does not compare
+claim outputs across sessions) whose noise floor is tokens 12-32, and the prefix divergence at
+token 1 is far below that floor -- it is a real, much larger error rather than that drift. Any
+future acceptance for the checkpoint must therefore compare against a claim-path baseline (for
+example the same prompt claimed at the terminal frontier, or a cold recompute inside the host
+session), not against the control session. Remaining unexplored surface: what the first MTP verify
+round does
 with the restored state (its inputs and the target forward at the boundary), and whether the peer
 rank's state is restored equivalently.
   - L5h cost-model ranking — pending.
