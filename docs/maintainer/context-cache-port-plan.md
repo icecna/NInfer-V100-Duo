@@ -269,6 +269,14 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     a dedicated per-lane buffer at capture time (or read it before decode starts) and copy that
     buffer at retain, then re-run the comparison. Also observed: filler prompts (frontier 21-24)
     publish prefix residencies; capture should be restricted to real prompt boundaries.
+    Additional pointer from the TP2 prefill order: `mtp_prefill_chunk_tp2` runs before
+    `copy_slot(linear_state_current_slot_, linear_state_rewrite_checkpoint_slot_)` in the same
+    checkpoint chunk (`text_context_impl.h:2233` vs `:2254`), and the GDN updates for both the
+    target and the MTP go through `linear_state_current_slot_`. If the draft prefill advances that
+    slot beyond the checkpoint, the captured rewrite slot is not the target's state at the frontier
+    at all. Either way the fix is the same: capture the frontier state explicitly at the checkpoint
+    (before any draft advance) into a dedicated per-lane buffer rather than reading the rewrite
+    slot at retain.
   - L5h cost-model ranking — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
