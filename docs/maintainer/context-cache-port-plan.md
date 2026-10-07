@@ -301,6 +301,17 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     tail), instead of sharing whole terminal pages unmodified. Verifying this cheaply needs a
     prefix whose last page is either frontier-exclusive or zeroed past the frontier; page-aligning
     the frontier is not enough on its own because the GDN is only captured at the real frontier.
+    Decisive experiment: zeroing the device KV columns past the restored frontier right after the
+    claim's H2D copy (the claimed device KV is private to the lane, so this cannot touch the host
+    copy) changes the TERMINAL append output too -- phase 1's own D2H/H2D round trip now diverges.
+    So the reuse path genuinely DOES read KV beyond `text_kv_valid`, and it is correct only when the
+    bytes there equal what the cold path leaves. For a terminal entry they do: the copied pages are
+    the sequence's own, so the untouched tail matches the control. For the prefix they do not: its
+    last page still holds the terminal's later tokens. The root cause is therefore a reader that
+    runs to page granularity instead of the valid length, not the checkpoint capture. Next: find
+    that reader (attention envelope, MTP draft window, or the KV table row length) and make it stop
+    at `text_kv_valid`; that is what makes a shorter checkpoint restorable at all, and it is the
+    local analogue of upstream's column-level coverage.
   - L5h cost-model ranking — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
