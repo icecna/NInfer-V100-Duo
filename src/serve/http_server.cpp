@@ -329,6 +329,14 @@ void HttpServer::register_routes() {
         counter("decode_rounds_total", "Decode rounds executed.", stats.decode_rounds);
         counter("decode_row_rounds_total", "Decode rows executed across all rounds.",
                 stats.decode_row_rounds);
+        counter("spec_decode_rounds_total", "Speculative decode rounds.",
+                counters.spec_decode_rounds);
+        counter("spec_decode_draft_tokens_total", "Tokens proposed by the draft head.",
+                counters.spec_decode_draft_tokens);
+        counter("spec_decode_accepted_tokens_total", "Draft tokens accepted by verification.",
+                counters.spec_decode_accepted_tokens);
+        counter("spec_decode_fallback_steps_total", "Rounds that fell back to a plain decode.",
+                counters.spec_decode_fallback_steps);
         res.set_header("Cache-Control", "no-store");
         res.set_content(body, "text/plain; version=0.0.4; charset=utf-8");
     });

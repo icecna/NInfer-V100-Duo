@@ -116,12 +116,20 @@ public:
         std::uint64_t prompt_tokens_cached  = 0;
         std::uint64_t root_selections       = 0;
         std::uint64_t checkpoint_selections = 0;
+        std::uint64_t spec_decode_rounds          = 0;
+        std::uint64_t spec_decode_draft_tokens    = 0;
+        std::uint64_t spec_decode_accepted_tokens = 0;
+        std::uint64_t spec_decode_fallback_steps  = 0;
     };
 
     [[nodiscard]] CacheCounters cache_counters() const noexcept {
         return CacheCounters{cache_tokens_cached_.load(std::memory_order_relaxed),
                              cache_root_selections_.load(std::memory_order_relaxed),
-                             cache_checkpoint_selections_.load(std::memory_order_relaxed)};
+                             cache_checkpoint_selections_.load(std::memory_order_relaxed),
+                             spec_decode_rounds_.load(std::memory_order_relaxed),
+                             spec_decode_draft_tokens_.load(std::memory_order_relaxed),
+                             spec_decode_accepted_tokens_.load(std::memory_order_relaxed),
+                             spec_decode_fallback_steps_.load(std::memory_order_relaxed)};
     }
 
     void warmup();
@@ -131,6 +139,15 @@ private:
 
     void record_cache_selection(std::uint32_t hit_tokens) noexcept;
 
+    void record_speculative(std::uint64_t rounds, std::uint64_t draft_tokens,
+                            std::uint64_t accepted_tokens,
+                            std::uint64_t fallback_steps) noexcept {
+        spec_decode_rounds_.fetch_add(rounds, std::memory_order_relaxed);
+        spec_decode_draft_tokens_.fetch_add(draft_tokens, std::memory_order_relaxed);
+        spec_decode_accepted_tokens_.fetch_add(accepted_tokens, std::memory_order_relaxed);
+        spec_decode_fallback_steps_.fetch_add(fallback_steps, std::memory_order_relaxed);
+    }
+
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
     ninfer::PromptCapabilities prompt_capabilities_;
@@ -138,6 +155,10 @@ private:
     std::atomic<std::uint64_t> cache_tokens_cached_{0};
     std::atomic<std::uint64_t> cache_root_selections_{0};
     std::atomic<std::uint64_t> cache_checkpoint_selections_{0};
+    std::atomic<std::uint64_t> spec_decode_rounds_{0};
+    std::atomic<std::uint64_t> spec_decode_draft_tokens_{0};
+    std::atomic<std::uint64_t> spec_decode_accepted_tokens_{0};
+    std::atomic<std::uint64_t> spec_decode_fallback_steps_{0};
 };
 
 } // namespace ninfer::serve

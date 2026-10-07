@@ -60,6 +60,9 @@ public:
         // bound to the Engine's DeviceContext device. Without this the worker runs with the
         // CUDA default device (ordinal 0) current while the streams, allocations and
         // per-device kernel attributes belong to device_.
+        // Sample once before the worker exists, so the first scrape during a long prefill serves
+        // real values instead of the default-constructed summary.
+        published_memory_ = sample_memory();
         worker_ = std::thread([this] {
             CUDA_CHECK(cudaSetDevice(device_));
             worker_loop();
