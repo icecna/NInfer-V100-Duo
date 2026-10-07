@@ -401,6 +401,16 @@ it; (a) != `8a3e...` means the slot was clobbered, (a) == `8a3e...` with (b) != 
 transport is wrong. Note: snapshotting a raw slot from inside `TextContext` faults with
 `cudaErrorIllegalAddress`, so the recurrent view (used by the working probe) is the safe sampler.
 
+DONE, and it pins the defect to the CLAIM's restore. The same per-layer recurrent hash taken in
+`retain_host_sequence` right where the prefix GDN is snapshotted reports `8a3e90281c629cf2 slot=2`
+-- the capture's value, unchanged, so the frontier slot is NOT clobbered between the capture and
+the retain and the snapshot reads the right data. The claim of that entry then decodes with
+`6e0eee7c2d52bd3b`. Everything before the restore is therefore correct, and what remains is either
+the claim's `restore_linear_state_slot_from_host` call (destination slot, byte count, or stream) or
+the identity of `payload.gdn_local` for the checkpoint entry. One measurement left: hash the same
+recurrent view immediately after the claim restores and before any round runs -- `8a3e...` there
+means something advances the state after the restore, anything else means the restore itself.
+
 1. **B4a state image.** Give every lane that can own a checkpoint its own state-image record
    (`{read, write}` slot pair) in the existing linear-state pool; the pool already reserves the
    third slot group introduced for the frontier snapshot, so no new allocation shape is needed.
