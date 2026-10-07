@@ -335,6 +335,17 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         plan->rewrite_checkpoint_action = RewriteCheckpointAction::DeferCapture;
     }
 
+    // One line per request for the audit that decided the prompt-end residency: whether the
+    // frontend marked a rewrite boundary at all, and which action the planner took for it.
+    if (const char* audit = std::getenv("NINFER_HOST_KV_DEBUG");
+        audit != nullptr && *audit != '\0' && *audit != '0') {
+        std::fprintf(stderr,
+                     "[ninfer host-kv] rewrite-plan reuse_base=%u desired_frontier=%u action=%d\n",
+                     plan->reuse_base, desired ? desired->frontier : 0U,
+                     static_cast<int>(plan->rewrite_checkpoint_action));
+        std::fflush(stderr);
+    }
+
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         if (plan->reuse == ReusePath::FullReset) {

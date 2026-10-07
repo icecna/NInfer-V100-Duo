@@ -1761,6 +1761,23 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         if (!transfer.gdn_peer) { fail_allocate(); }
     }
     if (retain_prefix) {
+        // This request publishes a prompt-end residency, so the conversation's anchor moves
+        // forward: drop the entries it contains. Running here, before any of this request's own
+        // residencies reach the table, is what keeps the prune from touching them -- at the publish
+        // site they are indistinguishable from an older request's entry, which is how an earlier
+        // attempt deleted the anchor it had just created. Content is the only identity an anonymous
+        // client has, so an older entry whose tokens are a strict prefix of this ledger holds
+        // nothing the new anchor does not still offer; the cost is not resuming from a boundary
+        // older than the anchor, the same trade the device side makes with two states per lane.
+        for (const qwen3_6::detail::HostPrefixId older : host_retention.victims()) {
+            const auto* entry = host_prefixes.find(older);
+            if (entry == nullptr || entry->in_flight_claims != 0) { continue; }
+            const std::vector<TokenId>& older_tokens = entry->payload.tokens;
+            if (older_tokens.empty() || older_tokens.size() >= sequence.ledger.size()) { continue; }
+            if (std::equal(older_tokens.begin(), older_tokens.end(), sequence.ledger.begin())) {
+                evict_host_entry(older);
+            }
+        }
         // Opportunity-only: the prefix residency shares the terminal's KV pages, so it needs its
         // own arena space only for the GDN snapshot and the hidden. When even that does not fit it
         // is skipped, so it never evicts a terminal residency.
