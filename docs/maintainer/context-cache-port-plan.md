@@ -440,6 +440,19 @@ OPEN again. The correct sampler is `snapshot_linear_state_slot_to_host` (it hono
 BOTH sides, or an explicit strided read; the earlier text-context fault when calling it was a
 host-buffer/device-context problem, not a reason to avoid it.
 
+DONE with the correct sampler, and the state TRANSPORT is now proven exact:
+`retain-host-hash=ec183aba1fe84574`, `claim-host-hash=ec183aba1fe84574` and
+`claim-roundtrip-hash=ec183aba1fe84574` (the destination slot snapshotted back after the restore)
+are all the same value, so what the checkpoint snapshots is exactly what the claim restores. The
+remaining state question -- whether the CAPTURED content is the state a cold prefill has at that
+frontier -- is still undecided because the whole-slot hash is not a pure function of the tokens:
+two cold prefills of the same prompt hash differently (`f7f6792536c7edbe` vs `c8bd0eb7be5e4669`)
+while the checkpoint's snapshot hashes `ec183aba1fe84574`. A probe that is stable across repeats of
+the same request is a prerequisite for that last comparison; until then the honest position is that
+the capture writes a slot whose content is not yet shown to equal the cold working state, and the
+in-session divergence at token 1 is still unexplained. Everything else on this path is now excluded:
+KV coverage, KV content, ingress, host extent lifetime, and the snapshot/restore round trip.
+
 1. **B4a state image.** Give every lane that can own a checkpoint its own state-image record
    (`{read, write}` slot pair) in the existing linear-state pool; the pool already reserves the
    third slot group introduced for the frontier snapshot, so no new allocation shape is needed.
