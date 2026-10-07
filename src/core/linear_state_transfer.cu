@@ -102,66 +102,37 @@ namespace {
 void transfer_slot(const LinearAttentionStatePool& pool, std::int32_t slot, void* host,
                    bool device_to_host, cudaStream_t stream) {
     const LinearAttentionStateAllLayersView view = pool.all_layers_view();
-    const LinearAttentionStatePoolSpec& spec = view.spec;
-    const std::int64_t conv_elements =
-        static_cast<std::int64_t>(spec.conv_channels) * spec.conv_width;
-    const std::int64_t recurrent_elements = static_cast<std::int64_t>(spec.key_head_dim) *
-                                            spec.value_head_dim * spec.value_heads;
-    const std::int64_t layers = spec.layers;
-    const std::int64_t slot_index = slot;
-    // The slot is the fastest axis of each layer tensor, so element i of slot s lives at
-    // i * slot_count + s.
-    const std::int64_t slot_stride = pool.slot_count();
-
-    auto run_conv = [&](auto tag) {
-        using Elem = decltype(tag);
-        // Conv component: one launch per layer (the layer tensors are separate allocations).
-        Elem* device_conv = reinterpret_cast<Elem*>(view.conv_layer0.data);
-        Elem* host_conv   = reinterpret_cast<Elem*>(host);
-        for (std::int64_t layer = 0; layer < layers; ++layer) {
-            Elem* device_layer =
-                reinterpret_cast<Elem*>(reinterpret_cast<std::byte*>(device_conv) +
-                                        layer * view.conv_layer_stride_bytes);
-            Elem* host_layer = host_conv + layer * conv_elements;
-            if (device_to_host) {
-                launch_slot_transfer<Elem>(device_layer, slot_stride, slot_index,
-                                           conv_elements, host_layer, /*host_to_device=*/false,
-                                           stream);
-            } else {
-                launch_slot_transfer<Elem>(host_layer, slot_stride, slot_index,
-                                           conv_elements, device_layer, /*host_to_device=*/true,
-                                           stream);
-            }
-        }
-    };
-
-    auto run_rec = [&]() {
-        // Recurrent state is always FP32, after the conv block in the host buffer.
-        float* device_rec = reinterpret_cast<float*>(view.recurrent_layer0.data);
-        float* host_rec   = reinterpret_cast<float*>(reinterpret_cast<std::byte*>(host) +
-                                                     linear_state_conv_bytes(spec));
-        for (std::int64_t layer = 0; layer < layers; ++layer) {
-            float* device_layer = reinterpret_cast<float*>(
-                reinterpret_cast<std::byte*>(device_rec) + layer * view.recurrent_layer_stride_bytes);
-            float* host_layer = host_rec + layer * recurrent_elements;
-            if (device_to_host) {
-                launch_slot_transfer<float>(device_layer, slot_stride, slot_index,
-                                            recurrent_elements, host_layer,
-                                            /*host_to_device=*/false, stream);
-            } else {
-                launch_slot_transfer<float>(host_layer, slot_stride, slot_index,
-                                            recurrent_elements, device_layer,
-                                            /*host_to_device=*/true, stream);
-            }
-        }
-    };
-
-    if (spec.conv_dtype == DType::BF16) {
-        run_conv(std::uint16_t{});
-    } else {
-        run_conv(0.0F);
+    const LinearAttentionStatePoolSpec& spec     = view.spec;
+    const std::int64_t layers                    = spec.layers;
+    const std::int64_t conv_bytes_per_layer =
+        static_cast<std::int64_t>(spec.conv_channels) * spec.conv_width *
+        static_cast<std::int64_t>(dtype_size(spec.conv_dtype));
+    const std::int64_t rec_bytes_per_layer =
+        static_cast<std::int64_t>(spec.key_head_dim) * spec.value_head_dim * spec.value_heads *
+        static_cast<std::int64_t>(dtype_size(DType::FP32));
+    const std::int64_t conv_total = static_cast<std::int64_t>(linear_state_conv_bytes(spec));
+    // Each layer's slot is a CONTIGUOUS block: `conv_slot`/`recurrent_slot` return contiguous
+    // views, and upstream copies exactly those views (StateImageDevicePool::copy_to_host /
+    // copy_from_host in its state_image.cpp). Copying with a slot stride instead would read and
+    // write outside the slot's own block.
+    for (std::int64_t layer = 0; layer < layers; ++layer) {
+        const auto layer_index = static_cast<std::uint32_t>(layer);
+        const Tensor conv      = pool.conv_slot(layer_index, slot);
+        std::byte* host_conv   = static_cast<std::byte*>(host) + layer * conv_bytes_per_layer;
+        CUDA_CHECK(cudaMemcpyAsync(device_to_host ? host_conv : conv.data,
+                                   device_to_host ? conv.data : host_conv, conv.bytes(),
+                                   device_to_host ? cudaMemcpyDeviceToHost
+                                                  : cudaMemcpyHostToDevice,
+                                   stream));
+        const Tensor rec = pool.recurrent_slot(layer_index, slot);
+        std::byte* host_rec =
+            static_cast<std::byte*>(host) + conv_total + layer * rec_bytes_per_layer;
+        CUDA_CHECK(cudaMemcpyAsync(device_to_host ? host_rec : rec.data,
+                                   device_to_host ? rec.data : host_rec, rec.bytes(),
+                                   device_to_host ? cudaMemcpyDeviceToHost
+                                                  : cudaMemcpyHostToDevice,
+                                   stream));
     }
-    run_rec();
 }
 
 } // namespace
