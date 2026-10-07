@@ -176,6 +176,10 @@ public:
     void cancel_unmapped_entitlement() noexcept;
     void materialize_pages(std::uint32_t pages, cudaStream_t stream = nullptr);
     void materialize_tokens(std::uint32_t tokens, cudaStream_t stream = nullptr);
+    // Pin every page this allocation currently maps so the pool cannot reuse it while a checkpoint
+    // still references it; unpin releases that hold.
+    void pin_mapped_pages();
+    void unpin_mapped_pages() noexcept;
     void trim_pages(std::uint32_t pages);
     void trim_tokens(std::uint32_t tokens);
 

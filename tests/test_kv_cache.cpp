@@ -229,7 +229,7 @@ int main() {
         allocation_d.materialize_pages(2);
         const std::vector<std::int32_t> held(allocation_d.page_ids().begin(),
                                              allocation_d.page_ids().end());
-        paged_pool.pin_pages(held);
+        allocation_d.pin_mapped_pages();
         const std::uint32_t free_before = paged_pool.free_pages();
         allocation_d.release();
         if (paged_pool.free_pages() != free_before || paged_pool.retained_pages() != 2) {

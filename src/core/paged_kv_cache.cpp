@@ -418,6 +418,15 @@ void PagedKVAllocation::trim_pages(std::uint32_t pages) {
 
 void PagedKVAllocation::trim_tokens(std::uint32_t tokens) { trim_pages(pages_for_tokens(tokens)); }
 
+void PagedKVAllocation::pin_mapped_pages() {
+    if (!valid()) { throw std::logic_error("Cannot pin an empty Paged KV allocation"); }
+    pool_->pin_pages(page_ids_);
+}
+
+void PagedKVAllocation::unpin_mapped_pages() noexcept {
+    if (valid()) { pool_->unpin_pages(page_ids_); }
+}
+
 void PagedKVAllocation::bind_row(std::int32_t row, cudaStream_t stream) {
     if (!valid()) { throw std::logic_error("Cannot bind an empty Paged KV allocation"); }
     if (bound_row_ >= 0) { throw std::logic_error("Paged KV allocation is already bound"); }
