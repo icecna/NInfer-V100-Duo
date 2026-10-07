@@ -113,7 +113,7 @@ sleep 3
 # `--no-prefix-reuse` the control is a pure recompute, and any text difference is a real defect in
 # the reuse path (the in-session gate already shows a claim must be numerically exact). The
 # concurrent pass then checks that concurrency still reuses, bounds occupancy and errors.
-run_pass control 0 "$work_dir/control.jsonl" 1 "--no-prefix-reuse"
+run_pass control "$cache_mib" "$work_dir/control.jsonl" 1 "--no-prefix-reuse"
 run_pass host "$cache_mib" "$work_dir/host.jsonl" 1
 
 if [ "$evict_mib" -gt 0 ]; then
