@@ -512,6 +512,19 @@ divergence must come from inside the round -- at which point the honest question
 the review: whether greedy decode here is allowed to differ at all, and the terminal result (which
 became EXACTLY equal once the transfer bug was fixed) is the evidence that it is not.
 
+RESOLVED, and it was self-inflicted. That "coverage experiment" scrub -- the block that zeroed the
+claimed device KV's tail-page columns past the frontier -- was NOT guarded by an environment
+variable, so it ran on every claim from the moment it was added, and every later measurement
+included it. Its offset arithmetic (page size times `slab.nb[3]`, per plane) damaged data the round
+actually reads, which is why every probed input (rank 0 state, rank 1 state, tail hidden, ingress,
+coverage) matched while the output still diverged at token 3: the KV BYTES were the one input that
+had only been argued about, never hashed, and they were being corrupted in the claim itself. With
+that block deleted the same run reports `in-session cold-vs-claim: first diff at 32` (identical),
+`A_next`/`B_next`/`C_next` all 32 (identical), and the whole gate passes phase 1 and phase 2. So the
+checkpoint path is CORRECT once (a) `transfer_slot` copies each layer's slot contiguously
+(`9d22a5e8`) and (b) the scrub is gone. Lesson for this branch: diagnostic code that mutates state
+must be environment-guarded, and an unprobed input must not be treated as excluded by argument.
+
 1. **B4a state image.** Give every lane that can own a checkpoint its own state-image record
    (`{read, write}` slot pair) in the existing linear-state pool; the pool already reserves the
    third slot group introduced for the frontier snapshot, so no new allocation shape is needed.
