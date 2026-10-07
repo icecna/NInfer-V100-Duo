@@ -114,6 +114,39 @@ PagedKVPool::PagedKVPool(DeviceSpan backing, const PagedKVPoolLayout& layout)
     for (std::uint32_t page = 0; page < spec_.page_group_count; ++page) {
         free_page_ids_.push_back(static_cast<std::int32_t>(page));
     }
+    pinned_.assign(spec_.page_group_count, false);
+    retained_.assign(spec_.page_group_count, false);
+}
+
+void PagedKVPool::pin_pages(std::span<const std::int32_t> pages) {
+    for (const std::int32_t page : pages) {
+        if (page < 0 || static_cast<std::uint32_t>(page) >= pinned_.size()) {
+            throw std::invalid_argument("pinned page is outside the pool");
+        }
+        if (std::binary_search(free_page_ids_.begin(), free_page_ids_.end(), page)) {
+            throw std::invalid_argument("pinning a free page");
+        }
+        const auto index = static_cast<std::size_t>(page);
+        if (pinned_[index]) { continue; }
+        pinned_[index] = true;
+        ++pinned_pages_;
+    }
+}
+
+void PagedKVPool::unpin_pages(std::span<const std::int32_t> pages) noexcept {
+    for (const std::int32_t page : pages) {
+        if (page < 0 || static_cast<std::uint32_t>(page) >= pinned_.size()) { continue; }
+        const auto index = static_cast<std::size_t>(page);
+        if (!pinned_[index]) { continue; }
+        pinned_[index] = false;
+        --pinned_pages_;
+        if (retained_[index]) {
+            retained_[index] = false;
+            --retained_pages_;
+            free_page_ids_.push_back(page);
+        }
+    }
+    std::sort(free_page_ids_.begin(), free_page_ids_.end());
 }
 
 std::uint32_t PagedKVPool::page_group_count() const noexcept { return spec_.page_group_count; }
@@ -254,7 +287,17 @@ std::vector<std::int32_t> PagedKVPool::take_pages(std::uint32_t count,
 
 void PagedKVPool::return_pages(std::span<const std::int32_t> pages) noexcept {
     if (pages.empty()) { return; }
-    free_page_ids_.insert(free_page_ids_.end(), pages.begin(), pages.end());
+    for (const std::int32_t page : pages) {
+        const auto index = static_cast<std::size_t>(page);
+        if (pinned_[index]) {
+            if (!retained_[index]) {
+                retained_[index] = true;
+                ++retained_pages_;
+            }
+            continue;
+        }
+        free_page_ids_.push_back(page);
+    }
     std::sort(free_page_ids_.begin(), free_page_ids_.end());
     mapped_pages_ -= static_cast<std::uint32_t>(pages.size());
 }

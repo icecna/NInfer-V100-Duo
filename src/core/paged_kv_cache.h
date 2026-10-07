@@ -119,6 +119,13 @@ public:
     // Zeros only the named physical page groups across every storage plane.
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
 
+    // Retain pages a checkpoint still references so the pool cannot hand them out again. A pinned
+    // page that its owning allocation returns is held back from the free list until it is unpinned.
+    void pin_pages(std::span<const std::int32_t> pages);
+    void unpin_pages(std::span<const std::int32_t> pages) noexcept;
+    [[nodiscard]] std::uint32_t pinned_pages() const noexcept { return pinned_pages_; }
+    [[nodiscard]] std::uint32_t retained_pages() const noexcept { return retained_pages_; }
+
 private:
     friend class PagedKVAllocation;
     friend void resize_paged_kv_bundle(std::span<const PagedKVResize> changes);
@@ -138,8 +145,13 @@ private:
     Tensor block_tables_;
     std::vector<std::int32_t> free_page_ids_;
     std::vector<bool> row_in_use_;
+    // Pages a checkpoint references, and returned pages still held by such a reference.
+    std::vector<bool> pinned_;
+    std::vector<bool> retained_;
     std::uint32_t entitled_pages_ = 0;
     std::uint32_t mapped_pages_   = 0;
+    std::uint32_t pinned_pages_   = 0;
+    std::uint32_t retained_pages_ = 0;
 };
 
 class PagedKVAllocation {

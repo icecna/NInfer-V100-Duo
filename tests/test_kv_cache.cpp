@@ -223,6 +223,26 @@ int main() {
     allocation_c.trim_tokens(64);
     failures += expect_size(allocation_c.mapped_page_count(), 1, "page-aligned mapped pages");
 
+    // A page a checkpoint references stays out of the free list until it is unpinned.
+    {
+        auto allocation_d = paged_pool.reserve(2);
+        allocation_d.materialize_pages(2);
+        const std::vector<std::int32_t> held(allocation_d.page_ids().begin(),
+                                             allocation_d.page_ids().end());
+        paged_pool.pin_pages(held);
+        const std::uint32_t free_before = paged_pool.free_pages();
+        allocation_d.release();
+        if (paged_pool.free_pages() != free_before || paged_pool.retained_pages() != 2) {
+            ++failures;
+            std::cerr << "A pinned page was returned to the free list\n";
+        }
+        paged_pool.unpin_pages(held);
+        if (paged_pool.free_pages() != free_before + 2 || paged_pool.retained_pages() != 0) {
+            ++failures;
+            std::cerr << "Unpinning did not recycle the retained pages\n";
+        }
+    }
+
     auto main_plan    = plan_paged_cache(4, 4, 1, {{ninfer::DType::BF16, 16, 1}});
     auto backend_plan = plan_paged_cache(2, 2, 1, {{ninfer::DType::BF16, 16, 1}});
     ninfer::DeviceArena main_arena(main_plan.bytes);
