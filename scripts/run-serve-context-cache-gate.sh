@@ -147,6 +147,15 @@ mismatch = [
 ]
 hits = sum(1 for row in host.values() if row.get("checkpoint_selections", 0) > 0)
 reused = sum(row.get("reused_tokens", 0) for row in host.values())
+# The compared passes run one request at a time, so a request that failed there is a real failure,
+# not the expected rejection of a deliberately over-subscribed run.
+errors = {
+    name: [row for row in rows.values() if "error" in row]
+    for name, rows in (("control", control), ("host", host))
+}
+for name, bad in errors.items():
+    if bad:
+        print(f"{name}_errors={len(bad)} example={str(bad[0].get('error'))[:80]}")
 print(f"paired={len(paired)} missing={len(missing)} drifted={len(mismatch)} strict={strict}")
 print(f"host_checkpoint_selections={hits} host_reused_tokens={int(reused)}")
 print(f"known_deviation=append_frontier_at_turn_boundary turns={len(mismatch)}")
@@ -154,8 +163,8 @@ for key in mismatch[:5]:
     print(f"  drift session={key[0]} turn={key[1]}")
     print(f"    control={control[key].get('text', '')[:120]!r}")
     print(f"    host   ={host[key].get('text', '')[:120]!r}")
-# Hard failures stay hard: an unpaired or non-reusing run says nothing about the cache at all.
-hard = bool(missing) or hits == 0
+# Hard failures stay hard: an unpaired, non-reusing, or failing run says nothing about the cache.
+hard = bool(missing) or hits == 0 or any(errors.values())
 failed = hard or (strict and bool(mismatch))
 print("RESULT:", "FAIL" if failed else "PASS")
 raise SystemExit(1 if failed else 0)

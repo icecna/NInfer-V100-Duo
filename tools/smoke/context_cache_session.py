@@ -190,18 +190,23 @@ def main() -> int:
 
     hits = sum(1 for row in rows if row.get("checkpoint_selections", 0.0) > 0)
     reused = sum(row.get("reused_tokens", 0.0) for row in rows)
-    ttft_hit = [row["ttft"] for row in rows if row.get("reused_tokens", 0.0) > 0]
-    ttft_miss = [row["ttft"] for row in rows if row.get("reused_tokens", 0.0) == 0]
+    # A row without `ttft` is a request that never completed, so it has no latency to average.
+    done = [row for row in rows if "ttft" in row]
+    ttft_hit = [row["ttft"] for row in done if row.get("reused_tokens", 0.0) > 0]
+    ttft_miss = [row["ttft"] for row in done if row.get("reused_tokens", 0.0) == 0]
     errors = [row for row in rows if "error" in row]
-    empty = [row for row in rows if not row.get("text")]
+    empty = [row for row in done if not row.get("text")]
     print(f"requests={len(rows)} errors={len(errors)} empty_text={len(empty)} hits={hits} "
           f"reused_tokens={int(reused)}")
     print(f"ttft_hit_p50={percentile(ttft_hit, 0.5):.3f} ttft_miss_p50={percentile(ttft_miss, 0.5):.3f}")
     for row in errors[:3]:
         print(f"error session={row['session']} turn={row['turn']}: {row['error']}")
-    # An empty answer makes the cross-pass text comparison vacuous, which is how a passing gate can
-    # prove nothing; treat it as a failure instead.
-    return 1 if (errors or empty) else 0
+    # Whether a failed request fails the run is the caller's policy: a request rejected while
+    # waiting for admission is the expected outcome of a deliberately over-subscribed pass, but it
+    # is a real failure in a pass that runs one request at a time. The gate decides, from these
+    # recorded rows. An empty answer is always a failure, because it makes the cross-pass text
+    # comparison vacuous, which is how a passing gate can prove nothing.
+    return 1 if empty else 0
 
 
 if __name__ == "__main__":
