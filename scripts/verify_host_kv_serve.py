@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Strict live verification of the host retained-prefix feature over HTTP.
 
-Service requirements (run AFTER a fresh `service ai-server stop/start`):
-  - built from this repository with host-KV debug logging enabled
-    (NINFER_HOST_KV_DEBUG=1 in the launcher)
-  - --context-host-cache-mib 4096, --max-concurrency 2, spec mtp
-  - no external traffic: the script asserts that exactly its own requests
-    reach the service (requests.jsonl is the source of truth)
+Run it through `scripts/run-host-kv-verify.sh`, which stops ai-server, starts a private instance
+with NINFER_HOST_KV_DEBUG=1, --context-host-cache-mib 4096, --max-concurrency 2 and `--spec mtp`,
+and restarts the service afterwards. Run directly (no wrapper), it instead checks that the already
+running service satisfies those requirements. Either way the run needs exclusive GPUs and no
+external traffic: the request log is the source of truth for that.
 
 Scenario (3 prefixes of ~39k tokens each, one shared 2-lane service, all
 steps submitted back-to-back -- the drain-at-admission path must make the
@@ -39,10 +38,15 @@ import sys
 import time
 import urllib.request
 from datetime import datetime
+import os
 
-BASE = "http://192.168.1.12:8080/v1/chat/completions"
-MODELS = "http://192.168.1.12:8080/v1/models"
-REQLOG = "/mnt/models/ai-launchers/requests.jsonl"
+# Defaults point at the deployed service; `scripts/run-host-kv-verify.sh` overrides all three so
+# the check can own a private instance instead of borrowing the production one.
+BASE = os.environ.get("NINFER_HOST_KV_BASE",
+                      "http://192.168.1.12:8080/v1/chat/completions")
+MODELS = os.environ.get("NINFER_HOST_KV_MODELS", "http://192.168.1.12:8080/v1/models")
+REQLOG = os.environ.get("NINFER_HOST_KV_REQLOG",
+                        "/mnt/models/ai-launchers/requests.jsonl")
 HOST_CACHE_MIB = 4096
 
 
@@ -110,6 +114,9 @@ def unit_start_epoch():
     """Epoch of the current ai-server unit activation: BEFORE model load and
     warmup. Anchors the journal/jsonl window so the warmup's host-kv events
     are inside it and the previous instance's events are outside."""
+    managed = os.environ.get("NINFER_HOST_KV_VERIFY_SINCE")
+    if managed:
+        return int(managed)
     out = subprocess.run(
         ["systemctl", "show", "ai-server", "-p", "ActiveEnterTimestamp",
          "--value"], capture_output=True, text=True).stdout.strip()
@@ -270,14 +277,17 @@ class ArenaSim:
 
 def main():
     # --- preconditions: exactly one serve process, ours, debug-enabled ---
-    p = subprocess.run(
-        ["pgrep", "-f", "NInfer-V100-Duo/build.*/apps/ninfer-serve"],
-        capture_output=True, text=True)
-    pids = [x for x in p.stdout.split() if x.strip()]
-    assert len(pids) == 1, f"expected one serve process, got {pids}"
-    assert "NINFER_HOST_KV_DEBUG" in open(
-        f"/proc/{pids[0]}/environ", errors="replace").read(), \
-        "serve is not running with NINFER_HOST_KV_DEBUG=1"
+    # A managing wrapper started the instance with the required cache size, concurrency and debug
+    # logging, so there is nothing to assert; without one, the service must already satisfy them.
+    if os.environ.get("NINFER_HOST_KV_VERIFY_MANAGED") != "1":
+        p = subprocess.run(
+            ["pgrep", "-f", "NInfer-V100-Duo/build.*/apps/ninfer-serve"],
+            capture_output=True, text=True)
+        pids = [x for x in p.stdout.split() if x.strip()]
+        assert len(pids) == 1, f"expected one serve process, got {pids}"
+        assert "NINFER_HOST_KV_DEBUG" in open(
+            f"/proc/{pids[0]}/environ", errors="replace").read(), \
+            "serve is not running with NINFER_HOST_KV_DEBUG=1"
 
     inst = json.loads(urllib.request.urlopen(MODELS, timeout=15).read())
     created = unit_start_epoch()  # unit activation, before load + warmup
