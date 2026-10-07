@@ -301,17 +301,23 @@ Dead local leftovers to delete with L0: `src/runtime/engine/shared_capture_plann
     tail), instead of sharing whole terminal pages unmodified. Verifying this cheaply needs a
     prefix whose last page is either frontier-exclusive or zeroed past the frontier; page-aligning
     the frontier is not enough on its own because the GDN is only captured at the real frontier.
-    Decisive experiment: zeroing the device KV columns past the restored frontier right after the
-    claim's H2D copy (the claimed device KV is private to the lane, so this cannot touch the host
-    copy) changes the TERMINAL append output too -- phase 1's own D2H/H2D round trip now diverges.
-    So the reuse path genuinely DOES read KV beyond `text_kv_valid`, and it is correct only when the
-    bytes there equal what the cold path leaves. For a terminal entry they do: the copied pages are
-    the sequence's own, so the untouched tail matches the control. For the prefix they do not: its
-    last page still holds the terminal's later tokens. The root cause is therefore a reader that
-    runs to page granularity instead of the valid length, not the checkpoint capture. Next: find
-    that reader (attention envelope, MTP draft window, or the KV table row length) and make it stop
-    at `text_kv_valid`; that is what makes a shorter checkpoint restorable at all, and it is the
-    local analogue of upstream's column-level coverage.
+    Retracted hypothesis: a scrub that zeroed those columns in the claimed device KV does change
+    phase 1 too, but that does NOT show a read past the valid length. Reading the kernel settles it:
+    `gqa_attention_decode_bf16.cuh` bounds its key loop by `window = pos[tokens - 1] + 1`, and the
+    launcher's `logical_capacity = envelope.max_visible_keys` is only the upper bound for the
+    device-side ACTIVE-SPLIT policy (`gqa_attention_decode.cu:361`, and the file comment at
+    `:29-31`: eager calls pass an exact window, graph calls pass their replay interval). Cached
+    decode passes `valid_columns = nullptr` because a single-query decode needs no mask; the
+    append/prefill path supplies `valid_columns` for its `remaining = valid_columns - column_begin`.
+    So the reader does stop at the position, and neither narrowing `logical_capacity` nor adding a
+    decode mask would be a fix (the former would break graph replay: the guard
+    `last_pos >= logical_capacity` would `write_neutral`). The scrub result must have perturbed
+    something else, so it is not evidence. Open hypothesis for the next session: the prefix's last
+    page is shared with the terminal, so its records for the frontier's own tokens were produced
+    together with the terminal's later tokens (quantised KV records/group bounds), whereas a cold
+    prefill produced them with only the prompt present. Test by giving the prefix a private KV copy
+    taken at its own frontier (`f5dcca48` shape) and comparing again; if that passes, the checkpoint
+    needs its own committed tail columns, which is exactly B2.
   - L5h cost-model ranking — pending.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
