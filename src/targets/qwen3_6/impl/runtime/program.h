@@ -371,6 +371,8 @@ public:
     [[nodiscard]] std::size_t host_kv_cache_used_bytes() const noexcept;
     [[nodiscard]] std::size_t host_kv_cache_entries() const noexcept;
     [[nodiscard]] std::size_t host_kv_cache_peak_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t host_transfer_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t host_transfer_micros() const noexcept;
     [[nodiscard]] std::size_t host_kv_cache_largest_free_extent_bytes() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
@@ -509,6 +511,8 @@ public:
     // tracking the events itself.
     std::array<std::uint64_t, kMaximumConcurrency> lane_release_generation_{};
     std::uint64_t host_lru_counter = 0;
+    std::uint64_t host_transfer_bytes_total_  = 0;
+    std::uint64_t host_transfer_micros_total_ = 0;
     // Monotonic demand stamp: the last request that reused a host entry resists eviction.
     std::uint64_t host_demand_counter = 0;
     // Bumped on every table mutation (insert, evict, claim-consume). Plans stamp the version at

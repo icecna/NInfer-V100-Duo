@@ -315,6 +315,12 @@ void HttpServer::register_routes() {
         body += "host_context_capacity_bytes ";
         body += std::to_string(memory.host_kv_cache_bytes);
         body += '\n';
+        counter("context_transfer_bytes_total",
+                "Host context bytes moved in either direction.", memory.host_kv_transfer_bytes);
+        body += "# TYPE context_transfer_seconds_total counter\n";
+        body += "context_transfer_seconds_total ";
+        body += std::to_string(static_cast<double>(memory.host_kv_transfer_micros) / 1e6);
+        body += '\n';
         counter("prefill_tokens_total",
                 "Prompt tokens evaluated by prefill, resident prefix hits excluded.",
                 stats.computed_prefill_tokens);

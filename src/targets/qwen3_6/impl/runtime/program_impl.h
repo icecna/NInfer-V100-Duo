@@ -1537,6 +1537,14 @@ std::size_t ProgramImplCore::host_kv_cache_peak_bytes() const noexcept {
            (host_kv_arena_peer ? host_kv_arena_peer->peak_occupied_bytes() : 0);
 }
 
+std::uint64_t ProgramImplCore::host_transfer_bytes() const noexcept {
+    return host_transfer_bytes_total_;
+}
+
+std::uint64_t ProgramImplCore::host_transfer_micros() const noexcept {
+    return host_transfer_micros_total_;
+}
+
 std::size_t ProgramImplCore::host_kv_cache_largest_free_extent_bytes() const noexcept {
     const std::size_t local = host_kv_arena ? host_kv_arena->largest_free_extent_bytes() : 0;
     const std::size_t peer =
@@ -1824,16 +1832,19 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         if (i != 0) { evicted_str += ","; }
         evicted_str += std::to_string(evicted[i]);
     }
+    const std::size_t retain_local_bytes =
+        static_cast<std::size_t>(text_pages) * text_layout->page_stride +
+        static_cast<std::size_t>(backend_pages) *
+            (backend_layout ? backend_layout->page_stride : 0);
+    const std::size_t retain_peer_bytes =
+        static_cast<std::size_t>(text_pages) * (peer_text_layout ? peer_text_layout->page_stride : 0) +
+        static_cast<std::size_t>(backend_pages) *
+            (peer_backend_layout ? peer_backend_layout->page_stride : 0);
+    host_transfer_bytes_total_ += retain_local_bytes + retain_peer_bytes;
     host_kv_debugf(
         "retain lane=%u text_pages=%u backend_pages=%u local_bytes=%zu peer_bytes=%zu evicted=%s "
         "occupied=%zu",
-        lane, text_pages, backend_pages,
-        static_cast<std::size_t>(text_pages) * text_layout->page_stride +
-            static_cast<std::size_t>(backend_pages) *
-                (backend_layout ? backend_layout->page_stride : 0),
-        static_cast<std::size_t>(text_pages) * (peer_text_layout ? peer_text_layout->page_stride : 0) +
-            static_cast<std::size_t>(backend_pages) *
-                (peer_backend_layout ? peer_backend_layout->page_stride : 0),
+        lane, text_pages, backend_pages, retain_local_bytes, retain_peer_bytes,
         evicted_str.c_str(), host_kv_cache_used_bytes());
 }
 
@@ -2052,6 +2063,8 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
     // reference the id.
     const std::size_t claimed_boundary = payload.reuse_boundary;
     evict_host_entry(entry_id);
+    host_transfer_bytes_total_ += claim_bytes;
+    host_transfer_micros_total_ += static_cast<std::uint64_t>(h2d_ms * 1000.0);
     host_kv_debugf("claim lane=%u entry=%llu boundary=%zu text_pages=%u backend_pages=%u bytes=%zu h2d_ms=%.3f occupied=%zu",
                    sequence.lane, static_cast<unsigned long long>(entry_id), claimed_boundary,
                    text_pages, backend_pages, claim_bytes, h2d_ms,
@@ -3944,6 +3957,8 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
         (host_kv_arena_peer ? host_kv_arena_peer->occupied_bytes() : 0);
     out.host_kv_cache_entries                   = host_kv_cache_entries();
     out.host_kv_cache_peak_bytes                = host_kv_cache_peak_bytes();
+    out.host_kv_transfer_bytes                  = host_transfer_bytes();
+    out.host_kv_transfer_micros                 = host_transfer_micros();
     out.host_kv_cache_largest_free_extent_bytes = host_kv_cache_largest_free_extent_bytes();
     out.host_kv_retain_complete       = host_retain_copies_done();
     return out;

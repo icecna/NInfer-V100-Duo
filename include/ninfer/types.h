@@ -554,6 +554,10 @@ struct MemorySummary {
     // Sum of the per-arena occupancy peaks, so it is an upper bound on the simultaneous combined
     // peak rather than a sampled maximum.
     std::size_t host_kv_cache_peak_bytes                = 0;
+    // Cumulative host context transfer volume in both directions, and the time spent waiting for
+    // the H2D claim transfers. D2H retain time is not accounted yet.
+    std::uint64_t host_kv_transfer_bytes  = 0;
+    std::uint64_t host_kv_transfer_micros = 0;
     std::size_t host_kv_cache_largest_free_extent_bytes = 0;
     // False while an in-flight terminal D2H retain still has pending device events. A caller
     // may poll this (via memory_summary) before submitting the next request, so that the next
