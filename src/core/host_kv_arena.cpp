@@ -276,6 +276,7 @@ std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& la
     descriptor.active      = true;
     descriptor.raw         = false;
     occupied_bytes_ += bytes;
+    note_occupancy();
     bump_revision();
     return HostKVAllocation(*this, descriptor_index, descriptor.generation);
 }
@@ -306,6 +307,7 @@ std::optional<HostKVAllocation> HostKVArena::allocate_raw(std::size_t bytes) noe
     descriptor.active      = true;
     descriptor.raw         = true;
     occupied_bytes_ += extent_bytes;
+    note_occupancy();
     bump_revision();
     return HostKVAllocation(*this, descriptor_index, descriptor.generation);
 }

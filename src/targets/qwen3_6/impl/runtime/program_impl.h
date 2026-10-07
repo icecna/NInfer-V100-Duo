@@ -1532,6 +1532,11 @@ std::size_t ProgramImplCore::host_kv_cache_entries() const noexcept {
     return host_prefixes.size();
 }
 
+std::size_t ProgramImplCore::host_kv_cache_peak_bytes() const noexcept {
+    return (host_kv_arena ? host_kv_arena->peak_occupied_bytes() : 0) +
+           (host_kv_arena_peer ? host_kv_arena_peer->peak_occupied_bytes() : 0);
+}
+
 std::size_t ProgramImplCore::host_kv_cache_largest_free_extent_bytes() const noexcept {
     const std::size_t local = host_kv_arena ? host_kv_arena->largest_free_extent_bytes() : 0;
     const std::size_t peer =
@@ -3938,6 +3943,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
         (host_kv_arena ? host_kv_arena->occupied_bytes() : 0) +
         (host_kv_arena_peer ? host_kv_arena_peer->occupied_bytes() : 0);
     out.host_kv_cache_entries                   = host_kv_cache_entries();
+    out.host_kv_cache_peak_bytes                = host_kv_cache_peak_bytes();
     out.host_kv_cache_largest_free_extent_bytes = host_kv_cache_largest_free_extent_bytes();
     out.host_kv_retain_complete       = host_retain_copies_done();
     return out;

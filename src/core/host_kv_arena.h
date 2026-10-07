@@ -150,6 +150,10 @@ public:
 
     [[nodiscard]] std::size_t occupied_bytes() const noexcept { return occupied_bytes_; }
 
+    // Highest occupancy the arena has reached. A cache that has been full once keeps reporting its
+    // peak, which is what a capacity decision is made against.
+    [[nodiscard]] std::size_t peak_occupied_bytes() const noexcept { return peak_occupied_bytes_; }
+
     // The largest single free run. A new allocation has to fit in one run, so this is the number
     // that separates "full" from "fragmented"; upstream never compacts, so it is the quantity to
     // watch before deciding to quantize allocations or to page-list the extents.
@@ -225,7 +229,12 @@ private:
 
     std::optional<PinnedHostBuffer> backing_;
     std::size_t capacity_bytes_ = 0;
-    std::size_t occupied_bytes_ = 0;
+    void note_occupancy() noexcept {
+        if (occupied_bytes_ > peak_occupied_bytes_) { peak_occupied_bytes_ = occupied_bytes_; }
+    }
+
+    std::size_t occupied_bytes_      = 0;
+    std::size_t peak_occupied_bytes_ = 0;
     std::vector<HostKVPageLayout> layouts_;
     std::vector<Descriptor> descriptors_;
     std::vector<std::uint32_t> free_descriptors_;

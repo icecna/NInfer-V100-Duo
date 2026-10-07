@@ -370,6 +370,7 @@ public:
     [[nodiscard]] std::size_t host_kv_cache_capacity() const noexcept;
     [[nodiscard]] std::size_t host_kv_cache_used_bytes() const noexcept;
     [[nodiscard]] std::size_t host_kv_cache_entries() const noexcept;
+    [[nodiscard]] std::size_t host_kv_cache_peak_bytes() const noexcept;
     [[nodiscard]] std::size_t host_kv_cache_largest_free_extent_bytes() const noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
