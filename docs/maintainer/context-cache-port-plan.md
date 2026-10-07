@@ -621,3 +621,11 @@ defect needs neither the host cache nor its transfers nor concurrency: the devic
 gate newly exposed, not something the host-cache work introduced. The engine gate's phase-1 append
 case reuses the terminal frontier and is bit-exact, so the missing coverage is the turn/interior
 boundary; that is the case to add next, with the in-session cold-vs-claim comparison.
+
+## 7. Follow-up workstream
+
+The interior-boundary inexactness in section 6 is a pre-existing reuse-path defect, independent of
+this port, and is being fixed on `fix/prefix-reuse-boundary-exactness` under its own temporary plan,
+[Prefix reuse at an interior boundary is not exact](prefix-reuse-boundary-fix.md). That document is
+the authority for the fix and for the separate "unexplained cold fills" finding; this one stays the
+authority for the port.
