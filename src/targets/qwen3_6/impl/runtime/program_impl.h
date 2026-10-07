@@ -1651,7 +1651,13 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         // Evict the least valuable residency first: never-reused by age, then reused by last
         // demand. In-flight entries are unevictable, so scan the order for the first free one.
         qwen3_6::detail::HostPrefixId victim_id = qwen3_6::detail::kInvalidHostPrefixId;
-        for (const qwen3_6::detail::HostPrefixId candidate : host_retention.victims()) {
+        // Above the high-water mark reclaim the oldest demanded checkpoint; below it keep the
+        // ordinary order so cold checkpoints go first (see pressure_victims()).
+        const bool over_watermark = host_kv_cache_used_bytes() * 4 > host_kv_cache_bytes * 3;
+        std::vector<qwen3_6::detail::HostPrefixId> order =
+            over_watermark ? host_retention.pressure_victims() : host_retention.victims();
+        if (order.empty()) { order = host_retention.victims(); }
+        for (const qwen3_6::detail::HostPrefixId candidate : order) {
             const auto* entry = host_prefixes.find(candidate);
             if (entry != nullptr && entry->in_flight_claims == 0) {
                 victim_id = candidate;

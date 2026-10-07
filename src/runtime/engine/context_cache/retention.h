@@ -214,6 +214,24 @@ public:
 
     // Least valuable first: superseded checkpoints (a newer prefix of the same session already
     // covers them), then never-reused ones by age, then reused ones by last demand.
+    // Reclaim order used above the arena's high-water mark: oldest demanded checkpoint first.
+    // A checkpoint published moments ago has no demand yet and is exactly what the next turn is
+    // about to match, while an old demanded one has already paid off; upstream expresses this by
+    // demoting the oldest protected entry when a resource crosses three quarters of capacity.
+    [[nodiscard]] std::vector<CheckpointId> pressure_victims() const {
+        std::vector<CheckpointId> ids;
+        for (const auto& [id, checkpoint] : checkpoints_) {
+            if (priority_of(id).reused) { ids.push_back(id); }
+        }
+        std::stable_sort(ids.begin(), ids.end(), [this](CheckpointId left, CheckpointId right) {
+            return std::pair<bool, std::uint64_t>{
+                       superseded(left), priority_of(left).last_demand} <
+                   std::pair<bool, std::uint64_t>{
+                       superseded(right), priority_of(right).last_demand};
+        });
+        return ids;
+    }
+
     [[nodiscard]] std::vector<CheckpointId> victims() const {
         std::vector<CheckpointId> ids;
         ids.reserve(checkpoints_.size());
