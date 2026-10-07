@@ -2062,7 +2062,12 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
     // or when LRU already evicted it. The table version bump invalidates plans that still
     // reference the id.
     const std::size_t claimed_boundary = payload.reuse_boundary;
-    evict_host_entry(entry_id);
+    // Keep the claimed entry alive. Its host extents are still valid and it is the only reusable
+    // boundary at this request's input: a request that starts from a claim materialises no
+    // rewrite checkpoint, so it publishes only its terminal residency, whose boundary includes
+    // its own generated tokens and is therefore unreachable for a client that replays a shorter
+    // history. Dropping the entry here left such a client with nothing to match on the third
+    // turn; the LRU and the capacity loop reclaim it later like any other entry.
     host_transfer_bytes_total_ += claim_bytes;
     host_transfer_micros_total_ += static_cast<std::uint64_t>(h2d_ms * 1000.0);
     host_kv_debugf("claim lane=%u entry=%llu boundary=%zu text_pages=%u backend_pages=%u bytes=%zu h2d_ms=%.3f occupied=%zu",
