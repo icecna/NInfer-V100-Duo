@@ -71,25 +71,30 @@ def run_pass(args, tag: str, pause_before_last: float) -> list[dict]:
                {"role": "user", "content": f"{tag} ALPHA turn three."}]
 
     log = pathlib.Path(args.request_log)
-    rows = []
-    for name, messages, pause in (("A1", a, 0.0), ("B1", b, 0.0), ("A2", a2, 0.0),
-                                  ("B2", b2, 0.0), ("A3", a3, pause_before_last)):
+    plan = (("A1", a, 0.0), ("B1", b, 0.0), ("A2", a2, 0.0),
+            ("B2", b2, 0.0), ("A3", a3, pause_before_last))
+    start = log.stat().st_size if log.exists() else 0
+    timings = []
+    for name, messages, pause in plan:
         if pause:
             time.sleep(pause)
-        offset = log.stat().st_size if log.exists() else 0
-        seconds = post(base, model, messages, args.timeout)
-        time.sleep(0.5)  # let the log flush
-        done = new_requests(log, offset)
-        result = done[-1] if done else {}
+        timings.append((name, post(base, model, messages, args.timeout)))
+
+    # Read the log once, after the pass: reading it per request means waiting for a flush between
+    # requests, and that wait can outlast the very window this probe exists to measure.
+    done = new_requests(log, start)
+    tail = done[-len(plan):]
+    rows = []
+    for (name, seconds), result in zip(timings, [{}] * (len(plan) - len(tail)) + tail):
         rows.append({"turn": name, "seconds": seconds,
                      "prompt": result.get("prompt_tokens"),
                      "cached": result.get("prefix_cache_hit_tokens"),
                      "path": result.get("prefix_reuse_path"),
-                     "extra": len(done) - 1})
+                     "extra": max(0, len(done) - len(plan))})
         print(f"  {tag}-{name:<2} {seconds:5.2f}s prompt={rows[-1]['prompt']} "
               f"cached={rows[-1]['cached']} path={rows[-1]['path']}"
-              + (f"  (+{rows[-1]['extra']} concurrent request(s) in the window)"
-                 if rows[-1]["extra"] > 0 else ""), flush=True)
+              + (f"  (+{rows[-1]['extra']} extra request(s) in the window)"
+                 if rows[-1]["extra"] else ""), flush=True)
     return rows
 
 

@@ -1310,6 +1310,13 @@ private:
                 // the lane is released entirely). Queued plans see the change through the
                 // table version and the per-lane release generation; no explicit invalidation.
                 instance_.program->harvest_host_retains();
+                // Retire the copies the harvest found still running, before any plan is built for
+                // this round: a request admitted onto a lane with a pending terminal D2H used to
+                // have that copy dropped, so the prefix never reached the table and the following
+                // turn recomputed everything -- while publishing it during request preparation
+                // instead invalidates the reuse plan that preparation had already computed. Here
+                // the table version bump happens before any plan exists, so both work.
+                instance_.program->wait_all_host_retains();
                 const bool have_pending          = expire_pending_requests();
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary);
