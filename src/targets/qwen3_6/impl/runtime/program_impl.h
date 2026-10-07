@@ -1329,15 +1329,77 @@ void ProgramImplCore::complete_host_transfer(std::uint32_t lane, bool abandoned)
         if (!sequence.retained || sequence.retained_residency != RetainedResidency::HostTransferIn) {
             throw std::logic_error("host retain transfer completed for a lane that moved on");
         }
+        // Capture the optional shorter residency's content before the lane fields are moved: its
+        // KV prefix and the identity truncated to its frontier.
+        bool prefix_ready = transfer->has_prefix;
+        std::vector<TokenId> prefix_tokens;
+        qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
+        if (prefix_ready) {
+            const std::size_t frontier = transfer->prefix_frontier;
+            prefix_tokens.assign(sequence.ledger.begin(),
+                                 sequence.ledger.begin() + static_cast<std::ptrdiff_t>(frontier));
+            prefix_identity = sequence.prefix_identity;
+            try {
+                prefix_identity.truncate(frontier);
+                prefix_identity.recompute_digests(prefix_tokens);
+            } catch (const std::exception&) { prefix_ready = false; }
+        }
+        // Wrap the KV regions in shared ownership first: the optional prefix residency references
+        // the terminal's whole pages instead of copying them, and the arena charges them once.
+        HostKVResidency kv_shared;
+        if (transfer->text_local) {
+            kv_shared.text_local =
+                std::make_shared<HostKVAllocation>(std::move(*transfer->text_local));
+        }
+        if (transfer->text_peer) {
+            kv_shared.text_peer =
+                std::make_shared<HostKVAllocation>(std::move(*transfer->text_peer));
+        }
+        if (transfer->backend_local) {
+            kv_shared.backend_local =
+                std::make_shared<HostKVAllocation>(std::move(*transfer->backend_local));
+        }
+        if (transfer->backend_peer) {
+            kv_shared.backend_peer =
+                std::make_shared<HostKVAllocation>(std::move(*transfer->backend_peer));
+        }
+        // Publish the shorter residency FIRST so its retention age precedes the terminal's: when
+        // the arena later needs room, the optional prefix is reclaimed before any terminal.
+        if (prefix_ready) {
+            HostPrefixResidency prefix;
+            prefix.kv               = kv_shared;
+            prefix.gdn_local        = std::move(transfer->prefix_gdn_local);
+            prefix.gdn_peer         = std::move(transfer->prefix_gdn_peer);
+            prefix.tail_local       = std::move(transfer->prefix_tail_local);
+            prefix.tail_bytes       = sequence.tail_hidden.bytes();
+            prefix.tokens           = std::move(prefix_tokens);
+            prefix.identity         = std::move(prefix_identity);
+            prefix.origin_lane      = lane;
+            prefix.reuse_boundary   = transfer->prefix_frontier;
+            prefix.checkpoint       = true;
+            const qwen3_6::detail::PrefixShortlistKey prefix_shortlist{
+                .digest       = prefix.identity.digest_at(prefix.reuse_boundary),
+                .frontier     = static_cast<std::uint32_t>(prefix.reuse_boundary),
+                .identity_tag = prefix_identity_tag};
+            const qwen3_6::detail::HostPrefixId prefix_id =
+                host_prefixes.insert(std::move(prefix),
+                                     [this] { return ++host_prefix_id_counter; });
+            host_prefix_index.insert(prefix_id, prefix_shortlist);
+            const runtime::ContinuationOwnerToken prefix_owner = host_retention.open_owner(
+                sequence.session_key.empty() ? std::optional<std::string>{}
+                                             : std::optional<std::string>(sequence.session_key));
+            host_retention.publish(prefix_owner, prefix_id,
+                                   runtime::CheckpointRole::SharedPrefix, /*shared=*/false);
+            host_retention.finish_owner(prefix_owner);
+            host_prefixes.stamp(prefix_id, ++host_lru_counter);
+            ++host_table_version_;
+        }
         // Publish the self-contained entry and release the lane entirely: the entry owns the
         // arena extents AND the content (tokens/identity) AND the state snapshots (GDN current
         // slot per device, rank-0 tail hidden), so no lane field survives the round trip.
         sequence.kv.reset();
         HostPrefixResidency residency;
-        residency.kv.text_local    = std::move(transfer->text_local);
-        residency.kv.text_peer     = std::move(transfer->text_peer);
-        residency.kv.backend_local = std::move(transfer->backend_local);
-        residency.kv.backend_peer  = std::move(transfer->backend_peer);
+        residency.kv               = kv_shared;
         residency.gdn_local        = std::move(transfer->gdn_local);
         residency.gdn_peer         = std::move(transfer->gdn_peer);
         residency.tail_local       = std::move(transfer->tail_local);
@@ -1498,6 +1560,20 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         return;
     }
 
+    // A second, shorter residency at the rewrite-checkpoint frontier. The lane froze the GDN
+    // state and hidden there during prefill and its KV covers the prefix, so both are still valid
+    // at the terminal; MTP keeps the backend prefix one token short of the frontier.
+    const std::uint32_t prefix_frontier =
+        sequence.rewrite_checkpoint.valid ? sequence.rewrite_checkpoint.frontier : 0;
+    const bool retain_prefix = prefix_frontier > 0 &&
+                               prefix_frontier < sequence.execution_frontier &&
+                               prefix_frontier <= sequence.ledger.size();
+    host_kv_debugf("prefix-capture lane=%u valid=%d kind=%d frontier=%u exec=%u ledger=%zu keep=%d",
+                   lane, static_cast<int>(sequence.rewrite_checkpoint.valid),
+                   static_cast<int>(sequence.rewrite_checkpoint.kind), prefix_frontier,
+                   sequence.execution_frontier, sequence.ledger.size(),
+                   static_cast<int>(retain_prefix));
+
     // Sequential feasibility per arena: text (always), the backend when present, the GDN
     // current-slot snapshot (always; it is what makes the entry claimable on ANY lane once the
     // origin lane is released), and the rank-0 tail hidden (always; MTP bridge and zero-suffix
@@ -1591,6 +1667,36 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         transfer.gdn_peer = host_kv_arena_peer->allocate_raw(gdn_peer_bytes);
         if (!transfer.gdn_peer) { fail_allocate(); }
     }
+    if (retain_prefix) {
+        // Opportunity-only: the prefix residency shares the terminal's KV pages, so it needs its
+        // own arena space only for the GDN snapshot and the hidden. When even that does not fit it
+        // is skipped, so it never evicts a terminal residency.
+        const HostKVAllocationPlan prefix_local[2] = {{nullptr, 0, gdn_local_bytes},
+                                                      {nullptr, 0, tail_bytes}};
+        bool prefix_fits = host_kv_arena->can_allocate_all(prefix_local);
+        if (prefix_fits && have_peer) {
+            const HostKVAllocationPlan prefix_peer[1] = {{nullptr, 0, gdn_peer_bytes}};
+            prefix_fits = host_kv_arena_peer->can_allocate_all(prefix_peer);
+        }
+        if (prefix_fits) {
+            transfer.prefix_gdn_local  = host_kv_arena->allocate_raw(gdn_local_bytes);
+            transfer.prefix_tail_local = host_kv_arena->allocate_raw(tail_bytes);
+            if (have_peer) {
+                const ScopedDevice scope(peer->device.device);
+                transfer.prefix_gdn_peer = host_kv_arena_peer->allocate_raw(gdn_peer_bytes);
+            }
+            const bool complete = transfer.prefix_gdn_local && transfer.prefix_tail_local &&
+                                  (!have_peer || transfer.prefix_gdn_peer);
+            if (complete) {
+                transfer.prefix_frontier = prefix_frontier;
+                transfer.has_prefix      = true;
+            } else {
+                transfer.prefix_gdn_local.reset();
+                transfer.prefix_gdn_peer.reset();
+                transfer.prefix_tail_local.reset();
+            }
+        }
+    }
 
     // The copies run on the dedicated pinned-transfer streams behind a gate on the compute
     // stream, so they cannot stall the other lanes' rounds; the events arm on the copy
@@ -1627,6 +1733,58 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         snapshot_linear_state_slot_to_host(peer->decoder->linear_attention, state_slot,
                                            host_kv_arena_peer->raw_view(*transfer.gdn_peer).data(),
                                            host_copy_stream_peer);
+    }
+    if (transfer.has_prefix) {
+        // The frontier slot holds the target state the prefill froze AT the checkpoint; the rewrite
+        // checkpoint slot cannot be used because decode advances it afterwards.
+        const std::int32_t frontier_slot =
+            LinearStateSlots::frontier_state_slot(lane, max_concurrency);
+        snapshot_linear_state_slot_to_host(
+            decoder->linear_attention, frontier_slot,
+            host_kv_arena->raw_view(*transfer.prefix_gdn_local).data(), host_copy_stream);
+        if (const char* probe_env = std::getenv("NINFER_HOST_KV_PROBE");
+            probe_env != nullptr && *probe_env != '\0') {
+            const ScopedDevice probe_scope(device.device);
+            const auto probe_layers =
+                static_cast<std::uint32_t>(decoder->linear_attention.spec.layers);
+            std::uint64_t h = 1469598103934665603ULL;
+            for (std::uint32_t layer = 0; layer < probe_layers; ++layer) {
+                const Tensor rec =
+                    decoder->linear_attention.recurrent_slot(layer, frontier_slot);
+                auto alloc = host_kv_arena->allocate_raw(rec.bytes());
+                if (!alloc) { break; }
+                CUDA_CHECK(cudaMemcpyAsync(host_kv_arena->raw_view(*alloc).data(), rec.data,
+                                           rec.bytes(), cudaMemcpyDeviceToHost, device.stream));
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                const auto* bytes =
+                    static_cast<const std::byte*>(host_kv_arena->raw_view(*alloc).data());
+                for (std::size_t i = 0; i < rec.bytes(); ++i) {
+                    h = (h ^ static_cast<std::uint64_t>(bytes[i])) * 1099511628211ULL;
+                }
+            }
+            host_kv_debugf("retain-frontier-hash=%016llx slot=%d",
+                           static_cast<unsigned long long>(h), frontier_slot);
+            CUDA_CHECK(cudaStreamSynchronize(host_copy_stream));
+            const auto* host_raw = static_cast<const std::byte*>(
+                host_kv_arena->raw_view(*transfer.prefix_gdn_local).data());
+            const std::size_t host_bytes =
+                linear_state_slot_bytes(decoder->linear_attention.spec);
+            std::uint64_t hh = 1469598103934665603ULL;
+            for (std::size_t i = 0; i < host_bytes; ++i) {
+                hh = (hh ^ static_cast<std::uint64_t>(host_raw[i])) * 1099511628211ULL;
+            }
+            host_kv_debugf("retain-host-hash=%016llx", static_cast<unsigned long long>(hh));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(host_kv_arena->raw_view(*transfer.prefix_tail_local).data(),
+                                   sequence.rewrite_checkpoint_hidden.data, tail_bytes,
+                                   cudaMemcpyDeviceToHost, host_copy_stream));
+        if (have_peer) {
+            const ScopedDevice scope(peer->device.device);
+            snapshot_linear_state_slot_to_host(
+                peer->decoder->linear_attention, frontier_slot,
+                host_kv_arena_peer->raw_view(*transfer.prefix_gdn_peer).data(),
+                host_copy_stream_peer);
+        }
     }
     CUDA_CHECK(cudaEventRecord(host_retain_events[lane][0], host_copy_stream));
     if (peer) { CUDA_CHECK(cudaEventRecord(host_retain_events[lane][1], host_copy_stream_peer)); }
@@ -1761,6 +1919,19 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
         if (!payload.gdn_local) {
             throw std::logic_error("host entry has no GDN snapshot");
         }
+        if (const char* host_probe = std::getenv("NINFER_HOST_KV_PROBE");
+            host_probe != nullptr && *host_probe != '\0') {
+            const auto* host_raw = static_cast<const std::byte*>(
+                host_kv_arena->raw_view(*payload.gdn_local).data());
+            const std::size_t host_bytes =
+                linear_state_slot_bytes(decoder->linear_attention.spec);
+            std::uint64_t hh = 1469598103934665603ULL;
+            for (std::size_t i = 0; i < host_bytes; ++i) {
+                hh = (hh ^ static_cast<std::uint64_t>(host_raw[i])) * 1099511628211ULL;
+            }
+            host_kv_debugf("claim-host-hash=%016llx boundary=%zu",
+                           static_cast<unsigned long long>(hh), payload.reuse_boundary);
+        }
         restore_linear_state_slot_from_host(decoder->linear_attention, state_slot,
                                             host_kv_arena->raw_view(*payload.gdn_local).data(),
                                             device.stream);
@@ -1772,6 +1943,47 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
             restore_linear_state_slot_from_host(peer->decoder->linear_attention, state_slot,
                                                 host_kv_arena_peer->raw_view(*payload.gdn_peer).data(),
                                                 peer->device.stream);
+        }
+        if (const char* probe_env = std::getenv("NINFER_HOST_KV_PROBE");
+            probe_env != nullptr && *probe_env != '\0') {
+            const ScopedDevice probe_scope(device.device);
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
+            const auto probe_layers =
+                static_cast<std::uint32_t>(decoder->linear_attention.spec.layers);
+            std::uint64_t h = 1469598103934665603ULL;
+            for (std::uint32_t layer = 0; layer < probe_layers; ++layer) {
+                const Tensor rec = decoder->linear_attention.recurrent_slot(layer, state_slot);
+                auto alloc = host_kv_arena->allocate_raw(rec.bytes());
+                if (!alloc) { break; }
+                CUDA_CHECK(cudaMemcpyAsync(host_kv_arena->raw_view(*alloc).data(), rec.data,
+                                           rec.bytes(), cudaMemcpyDeviceToHost, device.stream));
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                const auto* bytes =
+                    static_cast<const std::byte*>(host_kv_arena->raw_view(*alloc).data());
+                for (std::size_t i = 0; i < rec.bytes(); ++i) {
+                    h = (h ^ static_cast<std::uint64_t>(bytes[i])) * 1099511628211ULL;
+                }
+            }
+            host_kv_debugf("claim-restored-hash=%016llx slot=%d boundary=%zu",
+                           static_cast<unsigned long long>(h), state_slot, payload.reuse_boundary);
+            auto rt_alloc = host_kv_arena->allocate_raw(
+                linear_state_slot_bytes(decoder->linear_attention.spec));
+            if (rt_alloc) {
+                snapshot_linear_state_slot_to_host(
+                    decoder->linear_attention, state_slot,
+                    host_kv_arena->raw_view(*rt_alloc).data(), device.stream);
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                const auto* rt = static_cast<const std::byte*>(
+                    host_kv_arena->raw_view(*rt_alloc).data());
+                const std::size_t rt_bytes =
+                    linear_state_slot_bytes(decoder->linear_attention.spec);
+                std::uint64_t rth = 1469598103934665603ULL;
+                for (std::size_t i = 0; i < rt_bytes; ++i) {
+                    rth = (rth ^ static_cast<std::uint64_t>(rt[i])) * 1099511628211ULL;
+                }
+                host_kv_debugf("claim-roundtrip-hash=%016llx boundary=%zu",
+                               static_cast<unsigned long long>(rth), payload.reuse_boundary);
+            }
         }
         if (payload.tail_bytes != 0 && payload.tail_local) {
             CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data,
@@ -1790,6 +2002,11 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
         sequence.execution_frontier = payload.reuse_boundary;
         sequence.ledger_frontier    = payload.reuse_boundary;
         sequence.text_kv_valid      = payload.reuse_boundary;
+        host_kv_debugf("claim-fields lane=%u exec=%u ledger_frontier=%u ledger=%zu text_valid=%u "
+                       "mtp_valid=%u rope_delta=%d drafts=%u",
+                       sequence.lane, sequence.execution_frontier, sequence.ledger_frontier,
+                       sequence.ledger.size(), sequence.text_kv_valid, sequence.mtp_kv_valid,
+                       sequence.rope_delta, sequence.mtp_draft_count);
         sequence.mtp_kv_valid       = payload.reuse_boundary;
         sequence.tail_hidden_valid  = payload.tail_bytes != 0 && payload.tail_local.has_value();
         sequence.retained           = true;
@@ -3278,6 +3495,86 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
                           capacity - sequence.execution_frontier - 1});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
+            host_kv_debugf("mtp-row lane=%u retained=%d frontier=%u text_valid=%u mtp_valid=%u "
+                           "ledger=%zu drafts=%u extent=%u",
+                           sequence.lane, static_cast<int>(sequence.retained), frontier,
+                           sequence.text_kv_valid, sequence.mtp_kv_valid, sequence.ledger.size(),
+                           sequence.mtp_draft_count, extent);
+            if (host_kv_arena.has_value()) {
+            if (const char* probe_env = std::getenv("NINFER_HOST_KV_PROBE");
+                probe_env != nullptr && *probe_env != '\0') {
+                const ScopedDevice probe_scope(device.device);
+                const std::int32_t probe_slot =
+                    LinearStateSlots::current_state_slot(sequence.lane, max_concurrency);
+                std::uint64_t h = 1469598103934665603ULL;
+                auto probe_alloc = host_kv_arena->allocate_raw(
+                    linear_state_slot_bytes(decoder->linear_attention.spec));
+                if (probe_alloc) {
+                    snapshot_linear_state_slot_to_host(
+                        decoder->linear_attention, probe_slot,
+                        host_kv_arena->raw_view(*probe_alloc).data(), device.stream);
+                    CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                    const auto* bytes = static_cast<const std::byte*>(
+                        host_kv_arena->raw_view(*probe_alloc).data());
+                    const std::size_t probe_bytes =
+                        linear_state_slot_bytes(decoder->linear_attention.spec);
+                    for (std::size_t i = 0; i < probe_bytes; ++i) {
+                        h = (h ^ static_cast<std::uint64_t>(bytes[i])) * 1099511628211ULL;
+                    }
+                }
+                host_kv_debugf("mtp-state lane=%u frontier=%u hash=%016llx", sequence.lane,
+                               frontier, static_cast<unsigned long long>(h));
+                {
+                    auto tail_alloc = host_kv_arena->allocate_raw(sequence.tail_hidden.bytes());
+                    if (tail_alloc) {
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            host_kv_arena->raw_view(*tail_alloc).data(), sequence.tail_hidden.data,
+                            sequence.tail_hidden.bytes(), cudaMemcpyDeviceToHost, device.stream));
+                        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                        const auto* tb = static_cast<const std::byte*>(
+                            host_kv_arena->raw_view(*tail_alloc).data());
+                        std::uint64_t th = 1469598103934665603ULL;
+                        for (std::size_t i = 0; i < sequence.tail_hidden.bytes(); ++i) {
+                            th = (th ^ static_cast<std::uint64_t>(tb[i])) * 1099511628211ULL;
+                        }
+                        host_kv_debugf("mtp-tail lane=%u frontier=%u hash=%016llx", sequence.lane,
+                                       frontier, static_cast<unsigned long long>(th));
+                    }
+                }
+                if (peer.has_value() && host_kv_arena_peer.has_value()) {
+                    const ScopedDevice peer_scope(peer->device.device);
+                    auto peer_alloc = host_kv_arena_peer->allocate_raw(
+                        linear_state_slot_bytes(peer->decoder->linear_attention.spec));
+                    if (peer_alloc) {
+                        snapshot_linear_state_slot_to_host(
+                            peer->decoder->linear_attention, probe_slot,
+                            host_kv_arena_peer->raw_view(*peer_alloc).data(), peer->device.stream);
+                        CUDA_CHECK(cudaStreamSynchronize(peer->device.stream));
+                        const auto* pb = static_cast<const std::byte*>(
+                            host_kv_arena_peer->raw_view(*peer_alloc).data());
+                        const std::size_t peer_bytes =
+                            linear_state_slot_bytes(peer->decoder->linear_attention.spec);
+                        std::uint64_t ph = 1469598103934665603ULL;
+                        for (std::size_t i = 0; i < peer_bytes; ++i) {
+                            ph = (ph ^ static_cast<std::uint64_t>(pb[i])) * 1099511628211ULL;
+                        }
+                        host_kv_debugf("mtp-peer-state lane=%u frontier=%u hash=%016llx",
+                                       sequence.lane, frontier,
+                                       static_cast<unsigned long long>(ph));
+                    }
+                }
+                {
+                    const Tensor rec0 = decoder->linear_attention.recurrent_slot(0, probe_slot);
+                    const Tensor cv0  = decoder->linear_attention.conv_slot(0, probe_slot);
+                    host_kv_debugf("mtp-slot sb=%lld slots=%lld rec_nb0=%lld rec_bytes=%zu "
+                                   "conv_nb0=%lld conv_bytes=%zu",
+                                   static_cast<long long>(decoder->linear_attention.slot_count()),
+                                   static_cast<long long>(decoder->linear_attention.slot_count()),
+                                   static_cast<long long>(rec0.nb[0]), rec0.bytes(),
+                                   static_cast<long long>(cv0.nb[0]), cv0.bytes());
+                }
+            }
+            }
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
                 checked_i32(budgets[row].generated_tokens_remaining, "MTP batch remaining budget");

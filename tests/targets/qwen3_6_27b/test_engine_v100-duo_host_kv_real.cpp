@@ -58,6 +58,11 @@ ninfer::EngineOptions engine_options(const char* artifact, bool host_cache, std:
     options.speculative.backend        = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens   = 3;
     options.speculative.proposal_head  = ninfer::ProposalHead::Optimized;
+    if (std::getenv("NINFER_HOST_GATE_NO_MTP") != nullptr) {
+        options.speculative.backend       = ninfer::SpeculativeBackend::None;
+        options.speculative.draft_tokens  = 0;
+        options.speculative.proposal_head = ninfer::ProposalHead::Full;
+    }
     options.context_host_cache_bytes   = host_cache ? host_cache_bytes : 0;
     options.max_concurrency            = lanes;
     return options;
@@ -116,13 +121,17 @@ struct Round {
     std::uint32_t reused = 0;
 };
 
+inline bool mtp_expected() { return std::getenv("NINFER_HOST_GATE_NO_MTP") == nullptr; }
+
 Round run(ninfer::Engine& engine, std::string name, ninfer::PreparedPrompt prompt, bool reuse) {
     auto result = engine.generate(std::move(prompt), request_options(reuse));
     require(result.generated_token_ids.size() == kOutput, name + ": unexpected output count");
     require(result.finish_reason == ninfer::FinishReason::OutputLimit,
             name + ": unexpected finish reason");
-    require(result.speculative.enabled && result.speculative.rounds > 0,
-            name + ": MTP3 did not execute");
+    if (mtp_expected()) {
+        require(result.speculative.enabled && result.speculative.rounds > 0,
+                name + ": MTP3 did not execute");
+    }
     std::cout << name << " reused=" << result.reused_prompt_tokens << " ttft_s="
               << result.timings.first_token_seconds << std::endl;
     return {std::move(name), result.generated_token_ids, result.reused_prompt_tokens};
@@ -133,8 +142,10 @@ Round run_wait(ninfer::GenerationHandle& handle, const std::string& name) {
     require(result.generated_token_ids.size() == kOutput, name + ": unexpected output count");
     require(result.finish_reason == ninfer::FinishReason::OutputLimit,
             name + ": unexpected finish reason");
-    require(result.speculative.enabled && result.speculative.rounds > 0,
-            name + ": MTP3 did not execute");
+    if (mtp_expected()) {
+        require(result.speculative.enabled && result.speculative.rounds > 0,
+                name + ": MTP3 did not execute");
+    }
     std::cout << name << " reused=" << result.reused_prompt_tokens << " ttft_s="
               << result.timings.first_token_seconds << std::endl;
     return {name, result.generated_token_ids, result.reused_prompt_tokens};
@@ -311,15 +322,21 @@ CrossLane cross_lane_session(const char* artifact, bool host_cache) {
         r.rounds["B"] = std::move(rb);
         r.rounds["C"] = std::move(rc);
 
-        // Exact-frontier regression: a prompt that is a STRICT PREFIX of a retained session must
-        // NOT claim that session's entry. The entry's GDN snapshot and rank-0 tail hidden are the
-        // state at its frontier, so a shorter boundary is not restorable from it; a content match
-        // that accepted the shared prefix would replay GDN from the wrong position. Replaying A's
-        // base prompt (strictly shorter than A's prompt+output frontier) must fall back to a cold
-        // recompute: same output as the control and zero reused tokens. (Pre-fix, the partial
-        // content match claimed base_a tokens here.)
+        // Exact-frontier regression, updated for the prefix residency. A's rendered prompt captured
+        // a rewrite checkpoint at its own prompt frontier, so a shorter residency now exists at
+        // exactly that frontier: replaying A's base prompt reuses it (host cache only). A prompt
+        // that is a STRICT PREFIX of every retained frontier must still not claim a longer entry,
+        // because an entry's GDN snapshot and rank-0 tail hidden are the state AT its frontier.
         {
-            auto hprefix = engine.submit(engine.prepare_tokens(ids_a), request_options(true));
+            auto hexact = engine.submit(engine.prepare_tokens(ids_a), request_options(true));
+            r.rounds["prefix_exact"] = run_wait(hexact, tag + "prefix_exact");
+            require(r.rounds["prefix_exact"].reused == (host_cache ? r.base_a : 0U),
+                    "A's exact prompt did not reuse its prefix residency");
+
+            Tokens strict = ids_a;
+            strict.pop_back();
+            auto hprefix = engine.submit(engine.prepare_tokens(std::move(strict)),
+                                         request_options(true));
             r.rounds["prefix_only"] = run_wait(hprefix, tag + "prefix_only");
             require(r.rounds["prefix_only"].reused == 0,
                     "strict-prefix replay claimed a longer retained entry");
@@ -412,6 +429,50 @@ int main() {
                     std::string("phase 2: ") + n +
                         " continuation did not restore the full committed frontier");
         }
+        // DIAGNOSTIC: do the terminal claims themselves decode like a cold replay? These rounds
+        // were never compared before; if they also differ, the claim path in general is suspect
+        // and the prefix divergence is not special.
+        for (const char* n : {"A", "B", "C"}) {
+            const std::string next = std::string(n) + "_next";
+            const auto& a = ctl2.rounds.at(next).output;
+            const auto& b = hos2.rounds.at(next).output;
+            std::size_t first = 0;
+            while (first < a.size() && first < b.size() && a[first] == b[first]) { ++first; }
+            std::fprintf(stderr, "%s: len %zu vs %zu, first diff at %zu\n", next.c_str(), a.size(),
+                         b.size(), first);
+        }
+        // DEFINITIVE: compare the prefix claim against an in-session cold prefill of the SAME
+        // prompt. Both are single-request rounds in the same session, so the decode schedule and
+        // profile are identical and the claim-path drift measured across sessions is excluded.
+        {
+            const auto& a = hos2.rounds.at("A").output;
+            const auto& b = hos2.rounds.at("prefix_exact").output;
+            std::size_t first = 0;
+            while (first < a.size() && first < b.size() && a[first] == b[first]) { ++first; }
+            std::fprintf(stderr, "in-session cold-vs-claim: first diff at %zu (len %zu/%zu)\n", first,
+                         a.size(), b.size());
+        }
+        // Sanity: if even a cold round differs between the two sessions, the sessions are not
+        // schedule-comparable and the prefix comparison below would be meaningless.
+        require(ctl2.rounds.at("A").output == hos2.rounds.at("A").output,
+                "phase 2: cold round A already differs between control and host sessions");
+        {
+            const auto& a = ctl2.rounds.at("prefix_exact").output;
+            const auto& b = hos2.rounds.at("prefix_exact").output;
+            std::size_t first = 0;
+            while (first < a.size() && first < b.size() && a[first] == b[first]) { ++first; }
+            std::fprintf(stderr, "prefix_exact: len %zu vs %zu, first diff at %zu\n", a.size(),
+                         b.size(), first);
+            for (std::size_t i = first; i < std::min<std::size_t>(first + 8, a.size()) && i < b.size();
+                 ++i) {
+                std::fprintf(stderr, "  [%zu] ctl=%d host=%d\n", i, a[i], b[i]);
+            }
+        }
+        // The prefix residency restores state at A's prompt frontier; replaying that exact prompt
+        // on the host session must decode exactly like the control's cold prefill.
+        require(ctl2.rounds.at("prefix_exact").output ==
+                    hos2.rounds.at("prefix_exact").output,
+                "phase 2: the prefix residency decoded differently from a cold prefill");
         // The per-round outputs are intentionally NOT compared across the two sessions: the host
         // and control sessions run different decode schedules, and per-batch-size CUDA graphs
         // make greedy tokens schedule-dependent (even cold fillers that never touch host state

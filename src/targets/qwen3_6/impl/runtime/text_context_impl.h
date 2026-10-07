@@ -258,6 +258,9 @@ void TextContext::set_linear_state_slots(std::int32_t current_slot,
     }
     linear_state_current_slot_            = current_slot;
     linear_state_rewrite_checkpoint_slot_ = rewrite_checkpoint_slot;
+    // The pool groups each lane's slots as [current][rewrite][frontier], so the frontier slot is
+    // one group past the rewrite slot.
+    linear_state_frontier_slot_ = rewrite_checkpoint_slot + (state_.slot_count() / 3);
 }
 
 void TextContext::set_gdn_state_action(GdnStateAction action,
@@ -2100,6 +2103,45 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
 
         run_layers_tp2(x, Phase::Prefill, staging);
 
+        // Capture the target's frontier state before any draft work runs: the MTP prefill below
+        // advances the running state, so a copy taken after it is not the state at the checkpoint.
+        if (checkpoint_rel > 0 && len == checkpoint_rel) {
+            if (const char* dbg = std::getenv("NINFER_HOST_KV_DEBUG");
+                dbg != nullptr && *dbg != '\0') {
+                std::fprintf(stderr, "[prefill-capture] abs=%lld rel=%d len=%d base=%lld\n",
+                             static_cast<long long>(checkpoint_abs), checkpoint_rel, len,
+                             static_cast<long long>(base64));
+            }
+            for_each_rank(execution, [&](int rank) {
+                state_for(rank).copy_slot(linear_state_current_slot_,
+                                          linear_state_rewrite_checkpoint_slot_, stream_for(rank));
+                state_for(rank).copy_slot(linear_state_current_slot_,
+                                          linear_state_frontier_slot_, stream_for(rank));
+            });
+            if (const char* probe_env = std::getenv("NINFER_HOST_KV_PROBE");
+                probe_env != nullptr && *probe_env != '\0') {
+                std::fprintf(stderr, "[prefill-state] current=%d frontier=%d slots=%d\n",
+                             linear_state_current_slot_, linear_state_frontier_slot_,
+                             state_.slot_count());
+                const CurrentDevice probe_restore;
+                CUDA_CHECK(cudaSetDevice(ctx_.device));
+                std::uint64_t h = 1469598103934665603ULL;
+                static thread_local std::vector<std::byte> probe;
+                for (std::uint32_t layer = 0; layer < static_cast<std::uint32_t>(gdn_.size()); ++layer) {
+                    const Tensor rec = state_.recurrent_slot(layer, linear_state_frontier_slot_);
+                    probe.resize(rec.bytes());
+                    CUDA_CHECK(cudaMemcpyAsync(probe.data(), rec.data, rec.bytes(),
+                                               cudaMemcpyDeviceToHost, ctx_.stream));
+                    CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+                    for (const std::byte b : probe) {
+                        h = (h ^ static_cast<std::uint64_t>(b)) * 1099511628211ULL;
+                    }
+                }
+                std::fprintf(stderr, "[prefill-state] frontier-hash=%016llx\n",
+                             static_cast<unsigned long long>(h));
+            }
+        }
+
         std::array<Tensor, 2> xf;
         xf[0] = prefill_hidden_.data != nullptr ? matrix_window(prefill_hidden_, len)
                                                 : ws[0]->alloc(DType::BF16, {kCfg.hidden, len});
@@ -2249,11 +2291,14 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         }
     }
 
-    if (checkpoint_rel > 0 && len == checkpoint_rel) {
-        for_each_rank(execution, [&](int rank) {
-            state_for(rank).copy_slot(linear_state_current_slot_,
-                                      linear_state_rewrite_checkpoint_slot_, stream_for(rank));
-        });
+    if (const char* late_env = std::getenv("NINFER_HOST_KV_LATE_CAPTURE");
+        late_env != nullptr && *late_env != '\0') {
+        if (checkpoint_rel > 0 && len == checkpoint_rel) {
+            for_each_rank(execution, [&](int rank) {
+                state_for(rank).copy_slot(linear_state_current_slot_,
+                                          linear_state_frontier_slot_, stream_for(rank));
+            });
+        }
     }
 
     prefill_rewrite_checkpoint_frontier_ = -1;
