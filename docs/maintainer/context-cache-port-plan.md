@@ -338,10 +338,14 @@ claim outputs across sessions) whose noise floor is tokens 12-32, and the prefix
 token 1 is far below that floor -- it is a real, much larger error rather than that drift. Any
 future acceptance for the checkpoint must therefore compare against a claim-path baseline (for
 example the same prompt claimed at the terminal frontier, or a cold recompute inside the host
-session), not against the control session. Remaining unexplored surface: what the first MTP verify
-round does
-with the restored state (its inputs and the target forward at the boundary), and whether the peer
-rank's state is restored equivalently.
+session), not against the control session. (5) That in-session baseline was then run: the host
+session's own cold prefill of A's prompt versus the prefix claim of the same prompt (both single
+requests in one session, identical schedule) differ at token 1. The restore is therefore
+DETERMINISTICALLY wrong, not drift, and the acceptance for any future fix is that in-session
+comparison. Remaining unexplored surface: which restored input the first verify round disagrees on
+-- with the state captured in its own frontier slot the candidates are the claimed KV (coverage
+and table length) and the peer rank's state, and upstream's answer is to fork both the state image
+and the KV address space so that no claim-time field list or whole-page copy exists at all.
   - L5g upstream mechanism (read at `Neroued/ninfer@68c54356`, `src/models/qwen3_5/program/storage/`).
     A checkpoint is a FORK of two things, and the decode addresses them directly:
     `sequence.state` is a `{read, write}` pair of state-image handles; `state_selectors()` maps them
