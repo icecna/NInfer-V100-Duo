@@ -269,6 +269,48 @@ void HttpServer::register_routes() {
     server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
+    // Prometheus text surface, named after the upstream serving metrics so the production harness
+    // can scrape reuse, selection and host-cache occupancy directly instead of parsing logs.
+    server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
+        const GenerationService::CacheCounters counters = service_->cache_counters();
+        const ninfer::MemorySummary memory              = service_->memory_summary();
+        const ninfer::RuntimeStats stats                = service_->runtime_stats();
+        std::string body;
+        const auto counter = [&body](const char* name, const char* help, std::uint64_t value) {
+            body += "# HELP ";
+            body += name;
+            body += ' ';
+            body += help;
+            body += "\n# TYPE ";
+            body += name;
+            body += " counter\n";
+            body += name;
+            body += ' ';
+            body += std::to_string(value);
+            body += '\n';
+        };
+        counter("prompt_tokens_cached_total", "Input tokens supplied by exact checkpoints.",
+                counters.prompt_tokens_cached);
+        counter("root_selections_total", "Initial bindings without checkpoint reuse.",
+                counters.root_selections);
+        counter("checkpoint_selections_total", "Initial bindings with checkpoint reuse.",
+                counters.checkpoint_selections);
+        body += "# TYPE context_host_cache_occupied_bytes gauge\n";
+        body += "context_host_cache_occupied_bytes ";
+        body += std::to_string(memory.host_kv_cache_occupied_bytes);
+        body += '\n';
+        body += "# TYPE context_host_cache_capacity_bytes gauge\n";
+        body += "context_host_cache_capacity_bytes ";
+        body += std::to_string(memory.host_kv_cache_bytes);
+        body += '\n';
+        counter("computed_prefill_tokens_total",
+                "Prompt tokens evaluated by prefill, resident prefix hits excluded.",
+                stats.computed_prefill_tokens);
+        counter("committed_decode_tokens_total", "Tokens committed by decode rounds.",
+                stats.committed_decode_tokens);
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(body, "text/plain; version=0.0.4; charset=utf-8");
+    });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });

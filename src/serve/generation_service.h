@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -109,15 +110,34 @@ public:
     GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink,
                           std::function<bool()> is_cancelled = {});
 
+    // Cumulative context-cache counters published on /metrics, named after the upstream serving
+    // surface so the production harness can reuse its scrape/threshold conventions.
+    struct CacheCounters {
+        std::uint64_t prompt_tokens_cached  = 0;
+        std::uint64_t root_selections       = 0;
+        std::uint64_t checkpoint_selections = 0;
+    };
+
+    [[nodiscard]] CacheCounters cache_counters() const noexcept {
+        return CacheCounters{cache_tokens_cached_.load(std::memory_order_relaxed),
+                             cache_root_selections_.load(std::memory_order_relaxed),
+                             cache_checkpoint_selections_.load(std::memory_order_relaxed)};
+    }
+
     void warmup();
 
 private:
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
 
+    void record_cache_selection(std::uint32_t hit_tokens) noexcept;
+
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
     ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
+    std::atomic<std::uint64_t> cache_tokens_cached_{0};
+    std::atomic<std::uint64_t> cache_root_selections_{0};
+    std::atomic<std::uint64_t> cache_checkpoint_selections_{0};
 };
 
 } // namespace ninfer::serve

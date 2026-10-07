@@ -358,6 +358,15 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
 }
 
+void GenerationService::record_cache_selection(std::uint32_t hit_tokens) noexcept {
+    cache_tokens_cached_.fetch_add(hit_tokens, std::memory_order_relaxed);
+    if (hit_tokens == 0) {
+        cache_root_selections_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        cache_checkpoint_selections_.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 GenerationOutcome GenerationService::run(PreparedRequest& prepared, const StreamSink* sink,
                                          std::function<bool()> is_cancelled) {
     std::unique_ptr<ServiceOutputSink> output_sink;
@@ -396,6 +405,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
+    record_cache_selection(outcome.metrics.prefix_cache_hit_tokens);
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
     outcome.metrics.speculative_backend         = result.speculative.backend;
     outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
