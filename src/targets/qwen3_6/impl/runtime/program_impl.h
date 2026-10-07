@@ -1873,6 +1873,7 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
         throw std::logic_error("host prefix entry missing at claim");
     }
     const HostPrefixResidency& payload = entry->payload;
+    sequence.claimed_entry = entry_id;
     if (payload.reuse_boundary < base || base == 0) {
         throw std::logic_error("host claim base exceeds the entry frontier");
     }
@@ -2093,6 +2094,7 @@ SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) con
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
+    sequence.claimed_entry = qwen3_6::detail::kInvalidHostPrefixId;
     // A still-in-flight retain is abandoned -- its host extent stays owned by the transfer table
     // until the stream-ordered D2H retires, so no other allocation can observe the partially
     // written extent. The device pages released here MAY be re-issued to another request on

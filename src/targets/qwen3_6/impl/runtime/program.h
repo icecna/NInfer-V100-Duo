@@ -256,6 +256,10 @@ struct SequenceState {
     // Session lineage of the request that owns this lane; published with the retained entry so a
     // later request from the same lineage can reuse it, and anonymous requests still can.
     std::string session_key;
+    // The entry this lane's request claimed from the host table, if any. The retain path uses it
+    // to share the claimed prefix's pages with the entry it publishes instead of storing a second
+    // full copy of the same tokens.
+    qwen3_6::detail::HostPrefixId claimed_entry = qwen3_6::detail::kInvalidHostPrefixId;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
