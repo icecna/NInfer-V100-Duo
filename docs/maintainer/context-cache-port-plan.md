@@ -391,6 +391,13 @@ B4 first, because it is the structural difference that makes the local restore a
 
 B2 second, to make coverage structural rather than a safety margin:
 
+NOTE: B2 is NOT required for the current defect. A scoped experiment that cleared exactly the tail
+page's columns past the frontier for checkpoint entries only (terminal entries untouched) left the
+in-session cold-vs-claim comparison completely unchanged (`first diff at 1`). Coverage past the
+frontier therefore does not reach the decode path, and the divergence stays in B4. B2 remains in
+the plan as the structural guard upstream has, but it is not the fix and must not be started
+before B4 is finished.
+
 3. **B2a committed columns in the KV address space.** `KvAddressSpace` (already built, B1) becomes
    the authority for a sequence's coverage: whole pages are shared by reference, the tail page is
    owned and commits only `frontier % tokens_per_page` columns, and the PagedKV pool pinning added
