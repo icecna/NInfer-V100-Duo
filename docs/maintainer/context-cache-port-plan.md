@@ -425,6 +425,21 @@ the snapshot and again right before the restore, and audit the arena extent owne
 residency that is published before its terminal (the run needs the checkpoint to coexist with the
 terminal and with a third entry).
 
+CORRECTION: the host extent is NOT corrupt. Its raw bytes hash identically right after the snapshot
+and right before the restore (`retain-host-hash=ec183aba1fe84574` ==
+`claim-host-hash=ec183aba1fe84574`), so the arena keeps the checkpoint's bytes intact. The earlier
+state conclusions are also NOT trustworthy, because the probe they used is biased:
+`linear_state_transfer.cu` documents that the slot is the FASTEST axis of each layer tensor
+("element i of slot s lives at `i * slot_count + s`", `slot_stride = pool.slot_count()`), while the
+probe copied `recurrent_slot(layer, slot).bytes()` linearly from `.data`. A strided slot view read
+as if contiguous mixes neighbouring slots, and the capture probe sampled slot `2n+lane` while the
+claim probe sampled slot `lane`, so the two numbers were never comparable. What remains established:
+capture-time slot indices are correct (`current=0 frontier=2 slots=3`), the host extent round trips
+intact, ingress fields are identical, KV coverage and KV content are excluded. The state question is
+OPEN again. The correct sampler is `snapshot_linear_state_slot_to_host` (it honours the stride) for
+BOTH sides, or an explicit strided read; the earlier text-context fault when calling it was a
+host-buffer/device-context problem, not a reason to avoid it.
+
 1. **B4a state image.** Give every lane that can own a checkpoint its own state-image record
    (`{read, write}` slot pair) in the existing linear-state pool; the pool already reserves the
    third slot group introduced for the frontier snapshot, so no new allocation shape is needed.
