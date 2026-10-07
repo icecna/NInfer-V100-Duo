@@ -578,3 +578,36 @@ behaviour, and therefore `docs/serving.md`'s cache description, is unchanged unt
 - Risks: TP2 replica divergence, non-exact frontier silently disabling a boundary, DFlash host
   snapshot growth, and reclaim latency during prefill. Each has a fallback: reject the marker,
   drop DFlash from host replicas, and pause-to-snapshot respectively.
+
+## 6. Open defect: AppendAtFrontier is not exact at a turn boundary (production gate)
+
+Found by `scripts/run-serve-context-cache-gate.sh` on the real product binary, and it is real, not
+an artefact of the driver. Two passes over the same 2-session x 4-turn workload, ONE request at a
+time, the control with `--no-prefix-reuse` (so it never reuses anything) and the host pass with
+`--context-host-cache-mib 2048`:
+
+| turn | control prompt / hit / path | host prompt / hit / path |
+|---|---|---|
+| 0 | 200 / 0 / full_reset | 200 / 0 / full_reset |
+| 1 | 268 / 0 / full_reset | 268 / 198 / append_frontier |
+| 2 | 336 / 0 / full_reset | 336 / 266 / append_frontier |
+| 3 | 404 / 0 / full_reset | 404 / 334 / append_frontier |
+
+`prompt_tokens` are identical turn by turn, so both passes rendered the same token sequence; the
+first differing answer is at session 0's turn 2, whose input is built from turns 0 and 1, which
+already matched. Same input, same single-request schedule, reuse versus recompute, different greedy
+text: the `AppendAtFrontier` restore is not numerically faithful. 3 of 8 turns differ; the same run
+at 4 sessions x 6 turns differs on 7 of 24.
+
+Note the boundary the product uses: `reuse = 198` where the previous turn's prompt was 200 and its
+terminal frontier would be about 247, i.e. the engine reuses to the end of the previous TURN's
+prompt, which is EARLIER than the terminal frontier. The engine gate's phase-1 append case reuses
+the terminal frontier and is bit-exact, so it does not cover this boundary. Next: add an engine-gate
+case for a turn boundary (interior frontier) with the same in-session cold-vs-claim comparison, then
+find what differs there (state, KV table row, or the boundary token's ownership).
+
+Until it is fixed, a server started with `--context-host-cache-mib > 0` silently changes multi-turn
+answers; `--no-prefix-reuse` (or cache 0 plus no reuse) is the safe configuration.
+
+Reproduce:
+`scripts/run-serve-context-cache-gate.sh --cache-mib 2048 --sessions 2 --turns 4 --concurrency 1 --evict-mib 0`
