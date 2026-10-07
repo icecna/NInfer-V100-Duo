@@ -366,6 +366,48 @@ and the KV address space so that no claim-time field list or whole-page copy exi
     upstream's coverage matters because it removes the possibility, not because a local reader is
     known to run past the frontier.
   - L5h cost-model ranking — pending.
+
+### 4.2 Route B implementation plan (chosen)
+
+The frontier checkpoint is rebuilt on upstream's model instead of the claim-time field list. The
+acceptance for every slice is the same three checks: the in-session `cold prefill vs claim`
+comparison for the same prompt (must report no divergence), phase 1 + phase 2 of
+`ninfer_qwen3_8_27b_v100-duo_host_kv_real_test`, and the real-artifact gate on both artifacts.
+
+B4 first, because it is the structural difference that makes the local restore a field list:
+
+1. **B4a state image.** Give every lane that can own a checkpoint its own state-image record
+   (`{read, write}` slot pair) in the existing linear-state pool; the pool already reserves the
+   third slot group introduced for the frontier snapshot, so no new allocation shape is needed.
+   `state_selectors()` (`program_impl`) returns the pair, `settle_state_fork()` commits it, and
+   `refresh_state_views()` rebinds `sequence.tail_hidden` to the read slot. Files:
+   `program.h`, `program_impl.h`, `linear_state_slots.h`.
+2. **B4b decode reads the image.** The compact/MTP decode takes the row's state slot from the
+   selector instead of `current_state_slot(lane)`, so a claim needs no GDN copy at all: it only
+   points the lane's `{read, write}` at the checkpoint's image and rebuilds the KV address space.
+   This removes the `snapshot_linear_state_slot_to_host`/`restore_linear_state_slot_from_host`
+   round trip for checkpoints. Files: `program_impl.h`, `schedule.h`, `mtp_impl.h`,
+   `text_context{,_impl}.h`, `text_prefill_impl.h`.
+
+B2 second, to make coverage structural rather than a safety margin:
+
+3. **B2a committed columns in the KV address space.** `KvAddressSpace` (already built, B1) becomes
+   the authority for a sequence's coverage: whole pages are shared by reference, the tail page is
+   owned and commits only `frontier % tokens_per_page` columns, and the PagedKV pool pinning added
+   in this branch keeps a referenced page from being re-issued. Files:
+   `kv_page_registry.{h,cpp}`, `program.h`, `program_impl.h`.
+4. **B2b readers use the address space.** The claimed row's KV view/table length comes from the
+   address space's committed columns, so no reader can address past the frontier regardless of
+   which kernel reads it. Files: `program_impl.h`, `schedule.h`.
+
+B5 last, and only once B4+B2 pass:
+
+5. **B5 capture at the frontier.** Re-enable the checkpoint capture (published at the prompt
+   frontier, not the terminal) and the multi-turn acceptance; the current capture code, the
+   in-session comparison, and the upstream mechanism notes above are the starting material.
+
+While B is in flight the feature stays off: the branch keeps the verified terminal-only behaviour
+and a green gate, so any slice can stop without leaving a half-wired path in use.
 - L6 serving surface (retention/session end to end, live verification) — pending.
 
 L1/L2 are observable only through the parsed markers and resolved frontiers; Engine reuse
