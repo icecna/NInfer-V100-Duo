@@ -2027,11 +2027,6 @@ void ProgramImplCore::claim_host_sequence(SequenceState& sequence, const Request
         sequence.execution_frontier = payload.reuse_boundary;
         sequence.ledger_frontier    = payload.reuse_boundary;
         sequence.text_kv_valid      = payload.reuse_boundary;
-        host_kv_debugf("claim-fields lane=%u exec=%u ledger_frontier=%u ledger=%zu text_valid=%u "
-                       "mtp_valid=%u rope_delta=%d drafts=%u",
-                       sequence.lane, sequence.execution_frontier, sequence.ledger_frontier,
-                       sequence.ledger.size(), sequence.text_kv_valid, sequence.mtp_kv_valid,
-                       sequence.rope_delta, sequence.mtp_draft_count);
         sequence.mtp_kv_valid       = payload.reuse_boundary;
         sequence.tail_hidden_valid  = payload.tail_bytes != 0 && payload.tail_local.has_value();
         sequence.retained           = true;
@@ -3520,11 +3515,6 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                 std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
                           capacity - sequence.execution_frontier - 1});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
-            host_kv_debugf("mtp-row lane=%u retained=%d frontier=%u text_valid=%u mtp_valid=%u "
-                           "ledger=%zu drafts=%u extent=%u",
-                           sequence.lane, static_cast<int>(sequence.retained), frontier,
-                           sequence.text_kv_valid, sequence.mtp_kv_valid, sequence.ledger.size(),
-                           sequence.mtp_draft_count, extent);
             if (host_kv_arena.has_value()) {
             if (const char* probe_env = std::getenv("NINFER_HOST_KV_PROBE");
                 probe_env != nullptr && *probe_env != '\0') {
