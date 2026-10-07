@@ -495,6 +495,23 @@ remaining uncompared input of its first decode round; the strongest remaining ca
 tail hidden (the checkpoint's `rewrite_checkpoint_hidden` versus the terminal's `tail_hidden`),
 which is the only other piece the two entry kinds snapshot differently.
 
+MEASURED SINCE, and the picture is now paradoxical. At the first decode round of the same prompt,
+for two cold prefills and for the claim, every probed input is BIT-IDENTICAL: rank 0's linear state
+(`f7f6792536c7edbe`-class values reproduced per sampler), rank 1's linear state
+(`b27b9de1482c4a73` three times), the tail hidden (`94d53c0914bd7321` three times), the ingress row
+(`frontier=3274 text_valid=3274 mtp_valid=3274 ledger=3275 drafts=3 extent=3`), and the KV coverage.
+The in-session output comparison still differs, now at token 3. Two candidate changes were tested
+and rejected: a late capture after the MTP draft advance (`NINFER_HOST_KV_LATE_CAPTURE`) and
+decrementing `mtp_kv_valid` for checkpoints -- both leave token 3 unchanged. So the remaining
+difference is in an input that has NOT been probed, the text/backend KV BYTES themselves (excluded so
+far by argument -- same tokens, same causal writes, INT8 groups run along the head dim -- and by the
+coverage experiment, but never by hashing the bytes the round actually reads). Next: hash the row's
+KV pages as the round sees them (through the block table) for the cold and the claim rows at the
+first round. If those are also identical, then the first round's inputs are provably equal and the
+divergence must come from inside the round -- at which point the honest question is the one raised by
+the review: whether greedy decode here is allowed to differ at all, and the terminal result (which
+became EXACTLY equal once the transfer bug was fixed) is the evidence that it is not.
+
 1. **B4a state image.** Give every lane that can own a checkpoint its own state-image record
    (`{read, write}` slot pair) in the existing linear-state pool; the pool already reserves the
    third slot group introduced for the frontier snapshot, so no new allocation shape is needed.
