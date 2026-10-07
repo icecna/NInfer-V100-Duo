@@ -639,3 +639,26 @@ Consequences to keep visible:
   is what the gate's control pass uses;
 - the engine gate's exactness claims only cover the whole-prompt and terminal frontiers, which are
   bit-exact; the interior boundary is the uncovered case and is recorded in §6.
+
+## 7. Retention decision: session lineage stays a stateful-protocol feature
+
+Session lineage stays where upstream has it. `session_key` is set only by the stateful Responses
+protocol, which chains it through `previous_response_id` (`responses_http.cpp:222,239`,
+`request.h:206`); `/v1/chat/completions` carries no session identity at all. `superseded()` and the
+release-at-publish path therefore do nothing for chat clients, and that is accepted rather than
+worked around: deriving a key from the prompt (a shared system prompt, or an edited first turn)
+would merge unrelated conversations, and content-containment supersede would also drop the ability
+to resume from an earlier boundary.
+
+Consequences to keep visible:
+
+- For chat clients the host cache holds one checkpoint per *request* (its rewrite frontier and its
+  terminal) and relies on `victims()` alone: never-reused by age, then reused by least recent
+  demand. Size `--context-host-cache-mib` for turns-times-prompt, not sessions-times-prompt.
+- Measured on the live 16 GiB service with the sweep (`tools/smoke/context_cache_sweep.py`,
+  3 sessions x 3 turns, concurrency 2): 4K/8K/16K/32K prompts occupied 11.4/15.8/14.9 GiB, i.e. the
+  cache saturates, while the reuse share stayed 0.46-0.66 and hit TTFT stayed 0.4-0.8 s against
+  3.4-10.4 s cold. Reuse keeps working at saturation; what it costs is that older prefixes of live
+  conversations occupy the cache until LRU reclaims them.
+- Responses clients do get the supersede path, so the two `superseded()` commits and the
+  release-at-publish commit stay.
