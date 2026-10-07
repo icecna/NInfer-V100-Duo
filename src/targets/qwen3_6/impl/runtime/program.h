@@ -512,6 +512,17 @@ public:
         // KV pages and owns only the GDN state and hidden the rewrite checkpoint froze there.
         // Publishing it lets a later request that re-renders only up to that boundary reuse the
         // prefill state instead of recomputing the whole prompt.
+        // The pages this request shares with the host entry it was claimed from: the common
+        // prefix's KV is identical (same tokens at the same positions, never rewritten), so the
+        // new residency references the claimed entry's host pages and only the pages this request
+        // appended are copied and stored. Captured at issue time, because the lane's claimed-entry
+        // marker is cleared before the transfer publishes.
+        std::vector<HostKvSegment> shared_text;
+        std::vector<HostKvSegment> shared_text_peer;
+        std::vector<HostKvSegment> shared_backend;
+        std::vector<HostKvSegment> shared_backend_peer;
+        std::uint32_t shared_text_pages    = 0;
+        std::uint32_t shared_backend_pages = 0;
         std::optional<HostKVAllocation> prefix_gdn_local;
         std::optional<HostKVAllocation> prefix_gdn_peer;
         std::optional<HostKVAllocation> prefix_tail_local;

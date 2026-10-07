@@ -1349,6 +1349,12 @@ void ProgramImplCore::complete_host_transfer(std::uint32_t lane, bool abandoned)
         // Wrap the KV regions in shared ownership first: the optional prefix residency references
         // the terminal's whole pages instead of copying them, and the arena charges them once.
         HostKVResidency kv_shared;
+        // Shared pages first, then this request's own pages, so the residency still reads as the
+        // whole prefix in order and a later claim restores it run by run.
+        kv_shared.text_local    = transfer->shared_text;
+        kv_shared.text_peer     = transfer->shared_text_peer;
+        kv_shared.backend_local = transfer->shared_backend;
+        kv_shared.backend_peer  = transfer->shared_backend_peer;
         const auto adopt = [](std::optional<HostKVAllocation>& allocation,
                               std::vector<HostKvSegment>& segments) {
             if (!allocation) { return; }
@@ -1688,10 +1694,52 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         host_retain_transfers[lane].reset();
         throw std::logic_error("host retain allocation failed after feasibility check");
     };
-    transfer.text_local = host_kv_arena->allocate(*text_layout, text_pages);
-    if (!transfer.text_local) { fail_allocate(); }
-    if (have_backend) {
-        transfer.backend_local = host_kv_arena->allocate(*backend_layout, backend_pages);
+    // Share the common prefix's pages with the host entry this request was claimed from: its KV
+    // is identical (same tokens at the same positions, and the cache never rewrites them), so
+    // storing it again would double the host cost of every turn of a conversation. Only the pages
+    // this request appended are copied and stored; the residency references the rest.
+    if (const qwen3_6::detail::HostPrefixEntry<HostPrefixResidency>* claimed =
+            host_prefixes.find(sequence.claimed_entry);
+        claimed != nullptr) {
+        const auto take = [](const std::vector<HostKvSegment>& from, std::uint32_t pages,
+                             std::vector<HostKvSegment>& into) {
+            std::uint32_t taken = 0;
+            for (const HostKvSegment& segment : from) {
+                if (taken >= pages) { break; }
+                const std::uint32_t count = std::min(segment.page_count, pages - taken);
+                if (count == 0) { continue; }
+                into.push_back(HostKvSegment{segment.allocation, segment.first_page, count});
+                taken += count;
+            }
+            return taken;
+        };
+        const std::uint32_t claim_boundary = claimed->payload.reuse_boundary;
+        transfer.shared_text_pages =
+            take(claimed->payload.kv.text_local,
+                 std::min(pages_for_tokens(claim_boundary), text_pages), transfer.shared_text);
+        if (have_peer) {
+            take(claimed->payload.kv.text_peer, transfer.shared_text_pages,
+                 transfer.shared_text_peer);
+        }
+        if (have_backend && claim_boundary > 0) {
+            transfer.shared_backend_pages =
+                take(claimed->payload.kv.backend_local,
+                     std::min(pages_for_tokens(claim_boundary - 1), backend_pages),
+                     transfer.shared_backend);
+            if (have_peer_backend) {
+                take(claimed->payload.kv.backend_peer, transfer.shared_backend_pages,
+                     transfer.shared_backend_peer);
+            }
+        }
+    }
+    const std::uint32_t own_text_pages    = text_pages - transfer.shared_text_pages;
+    const std::uint32_t own_backend_pages = backend_pages - transfer.shared_backend_pages;
+    if (own_text_pages > 0) {
+        transfer.text_local = host_kv_arena->allocate(*text_layout, own_text_pages);
+        if (!transfer.text_local) { fail_allocate(); }
+    }
+    if (have_backend && own_backend_pages > 0) {
+        transfer.backend_local = host_kv_arena->allocate(*backend_layout, own_backend_pages);
         if (!transfer.backend_local) { fail_allocate(); }
     }
     transfer.gdn_local = host_kv_arena->allocate_raw(gdn_local_bytes);
@@ -1700,11 +1748,13 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
     if (!transfer.tail_local) { fail_allocate(); }
     if (have_peer) {
         const ScopedDevice scope(peer->device.device);
-        transfer.text_peer = host_kv_arena_peer->allocate(*peer_text_layout, text_pages);
-        if (!transfer.text_peer) { fail_allocate(); }
-        if (have_peer_backend) {
+        if (own_text_pages > 0) {
+            transfer.text_peer = host_kv_arena_peer->allocate(*peer_text_layout, own_text_pages);
+            if (!transfer.text_peer) { fail_allocate(); }
+        }
+        if (have_peer_backend && own_backend_pages > 0) {
             transfer.backend_peer = host_kv_arena_peer->allocate(*peer_backend_layout,
-                                                                 backend_pages);
+                                                                 own_backend_pages);
             if (!transfer.backend_peer) { fail_allocate(); }
         }
         transfer.gdn_peer = host_kv_arena_peer->allocate_raw(gdn_peer_bytes);
@@ -1749,11 +1799,15 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         LinearStateSlots::current_state_slot(lane, max_concurrency);
     CUDA_CHECK(cudaEventRecord(host_copy_gate, device.stream));
     CUDA_CHECK(cudaStreamWaitEvent(host_copy_stream, host_copy_gate, 0));
-    copy_kv_pages_to_host(decoder->text_kv.pool(), sequence.kv->text, text_pages,
-                          host_kv_arena->view(*transfer.text_local), host_copy_stream);
-    if (have_backend) {
-        copy_kv_pages_to_host(backend_kv_cache()->pool(), *sequence.kv->backend, backend_pages,
-                              host_kv_arena->view(*transfer.backend_local), host_copy_stream);
+    if (transfer.text_local) {
+        copy_kv_pages_to_host(decoder->text_kv.pool(), sequence.kv->text, own_text_pages,
+                              host_kv_arena->view(*transfer.text_local), host_copy_stream,
+                              transfer.shared_text_pages);
+    }
+    if (have_backend && transfer.backend_local) {
+        copy_kv_pages_to_host(backend_kv_cache()->pool(), *sequence.kv->backend, own_backend_pages,
+                              host_kv_arena->view(*transfer.backend_local), host_copy_stream,
+                              transfer.shared_backend_pages);
     }
     snapshot_linear_state_slot_to_host(decoder->linear_attention, state_slot,
                                        host_kv_arena->raw_view(*transfer.gdn_local).data(),
@@ -1765,13 +1819,17 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         const ScopedDevice scope(peer->device.device);
         CUDA_CHECK(cudaEventRecord(host_copy_gate_peer, peer->device.stream));
         CUDA_CHECK(cudaStreamWaitEvent(host_copy_stream_peer, host_copy_gate_peer, 0));
-        copy_kv_pages_to_host(peer->decoder->text_kv.pool(), *sequence.kv->text_peer, text_pages,
-                              host_kv_arena_peer->view(*transfer.text_peer), host_copy_stream_peer);
-        if (have_peer_backend) {
+        if (transfer.text_peer) {
+            copy_kv_pages_to_host(peer->decoder->text_kv.pool(), *sequence.kv->text_peer,
+                                  own_text_pages,
+                                  host_kv_arena_peer->view(*transfer.text_peer),
+                                  host_copy_stream_peer, transfer.shared_text_pages);
+        }
+        if (have_peer_backend && transfer.backend_peer) {
             copy_kv_pages_to_host(peer->decoder->mtp_cache()->pool(), *sequence.kv->backend_peer,
-                                  backend_pages,
+                                  own_backend_pages,
                                   host_kv_arena_peer->view(*transfer.backend_peer),
-                                  host_copy_stream_peer);
+                                  host_copy_stream_peer, transfer.shared_backend_pages);
         }
         snapshot_linear_state_slot_to_host(peer->decoder->linear_attention, state_slot,
                                            host_kv_arena_peer->raw_view(*transfer.gdn_peer).data(),
