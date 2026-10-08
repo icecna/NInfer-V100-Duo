@@ -30,7 +30,9 @@ approval requirements beyond the user's instructions and the actual execution en
 NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU performance on explicitly
 registered artifacts. Current identities are `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`,
 `qwen3.8-27b/groupwise-int`, `qwen3.8-27b/nvfp4`, and `qwen3.6-35b-a3b/groupwise-int`.
-The implementation targets `sm_120a` and is tuned on NVIDIA GeForce RTX 5090.
+The default build targets `sm_120a` (tuned on an NVIDIA GeForce RTX 5090); this host runs the
+peer `sm_70` build (Volta; requires CUDA 12.8, see `CMakeLists.txt` and `docs/v100.md`) on its two
+Tesla V100-SXM2-16GB GPUs.
 
 Generation uses one GPU, one resident model, startup-fixed concurrency of one to eight requests,
 bounded FIFO ingress, no active-request preemption, and one compact decode batch per round.
@@ -146,11 +148,10 @@ matching restart step, restart it immediately. Pattern: `scripts/run-host-kv-gat
 Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual resource pressure
 causes failures or interferes with the task, and briefly explain why.
 
-Use the selected Python 3.11 interpreter explicitly. On this machine it is
-`/home/neroued/miniconda3/envs/py311/bin/python`; the default shell's `python3` may be a different
-version. Use `python3` only after selecting the maintainer environment or checking its version.
-Normal resources are `build/`, `out/qwen3_6_27b.ninfer`, its `.conversion.json` report, and
-`profiles/ncu/`, `profiles/nsys/`, `profiles/bench/`; the local toolchain is CUDA 13.1.
+Use the selected Python interpreter explicitly. On this machine the only one is the system
+`python3` (3.13); the `py311` conda environment referenced by other hosts does not exist here.
+Normal resources are `build-host-retained/` (the build behind the running `ai-server` service) and
+`build-v100-duo/` (target of `tools/v100/build.sh`); the local toolchain is CUDA 12.8.
 Select model artifacts by explicit path, never glob order, modification time, or unqualified
 “latest”. Source checkpoints and large artifacts are prerequisites; download or regenerate them
 only when that work is in scope. Install or upgrade dependencies only when the task needs it.
