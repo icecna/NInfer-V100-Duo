@@ -752,6 +752,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     }
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
+            // A full reset rebuilds the sequence from scratch: the host entry this lane claimed
+            // earlier no longer describes the prefix being materialized, so the terminal retain
+            // must not share its pages (doing so grafts another sequence's KV onto this one).
+            sequence.claimed_entry = qwen3_6::detail::kInvalidHostPrefixId;
             sequence.kv.reset();
             ordered_reset(sequence);
             sequence.ledger.clear();
@@ -1705,6 +1709,10 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
     // is identical (same tokens at the same positions, and the cache never rewrites them), so
     // storing it again would double the host cost of every turn of a conversation. Only the pages
     // this request appended are copied and stored; the residency references the rest.
+    host_kv_debugf("retain-share lane=%u claimed=%llu found=%d text_pages=%u ledger=%zu", lane,
+                   static_cast<unsigned long long>(sequence.claimed_entry),
+                   static_cast<int>(host_prefixes.find(sequence.claimed_entry) != nullptr),
+                   text_pages, sequence.ledger.size());
     if (const qwen3_6::detail::HostPrefixEntry<HostPrefixResidency>* claimed =
             host_prefixes.find(sequence.claimed_entry);
         claimed != nullptr) {
@@ -1738,6 +1746,9 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
                      transfer.shared_backend_peer);
             }
         }
+        host_kv_debugf("retain-share lane=%u shared_text=%u shared_backend=%u claim_boundary=%u",
+                       lane, transfer.shared_text_pages, transfer.shared_backend_pages,
+                       claim_boundary);
     }
     const std::uint32_t own_text_pages    = text_pages - transfer.shared_text_pages;
     const std::uint32_t own_backend_pages = backend_pages - transfer.shared_backend_pages;
@@ -1780,10 +1791,14 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
             const auto* entry = host_prefixes.find(older);
             if (entry == nullptr || entry->in_flight_claims != 0) { continue; }
             const std::vector<TokenId>& older_tokens = entry->payload.tokens;
-            if (older_tokens.empty() || older_tokens.size() >= sequence.ledger.size()) { continue; }
-            if (std::equal(older_tokens.begin(), older_tokens.end(), sequence.ledger.begin())) {
-                evict_host_entry(older);
-            }
+            const bool is_prefix =
+                !older_tokens.empty() && older_tokens.size() < sequence.ledger.size() &&
+                std::equal(older_tokens.begin(), older_tokens.end(), sequence.ledger.begin());
+            host_kv_debugf(
+                "prune-scan id=%llu entry_tokens=%zu entry_boundary=%u ledger=%zu prefix=%d",
+                static_cast<unsigned long long>(older), older_tokens.size(),
+                entry->payload.reuse_boundary, sequence.ledger.size(), static_cast<int>(is_prefix));
+            if (is_prefix) { evict_host_entry(older); }
         }
         // Opportunity-only: the prefix residency shares the terminal's KV pages, so it needs its
         // own arena space only for the GDN snapshot and the hidden. When even that does not fit it

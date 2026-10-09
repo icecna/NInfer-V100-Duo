@@ -235,6 +235,7 @@ struct CrossLane {
     std::size_t capacity      = 0;
     std::size_t occupied_2ab  = 0;  // after A and B terminals
     std::size_t occupied_3abc = 0;  // after C terminal: all three coexist
+    std::size_t fresh_occupied = 0; // after the fresh FullReset terminal
     std::uint32_t base_a      = 0;
     std::uint32_t base_b      = 0;
     std::uint32_t base_c      = 0;
@@ -365,7 +366,158 @@ CrossLane cross_lane_session(const char* artifact, bool host_cache) {
         follow_step(ids_b, r.rounds["B"], ids_follow_b, std::move(filler_b), "B");
         follow_step(ids_c, r.rounds["C"], ids_follow_c, std::move(filler_c), "C");
 
+        // Phase 3: a brand-new prompt matches NO retained entry, so it can only be admitted by
+        // an in-place FullReset on one of the retained lanes. Those lanes may still carry a
+        // `claimed_entry` left by an earlier claim (A's continuation, or the exact-prefix
+        // replay). The FullReset must drop that claim: if the terminal retain keeps sharing the
+        // stale entry's pages, the fresh entry inherits another sequence's KV prefix and the
+        // decoded output diverges from the host-cache-free control.
+        {
+            const auto fresh_input = user_prompt("Write a haiku about rain on a tin roof.");
+            const std::size_t before = host_cache
+                ? engine.memory_summary().host_kv_cache_occupied_bytes : 0;
+            auto hfresh = engine.submit(engine.prepare(fresh_input), request_options(true));
+            r.rounds["fresh"] = run_wait(hfresh, tag + "fresh");
+            require(r.rounds["fresh"].reused == 0,
+                    "fresh FullReset unexpectedly reused a retained prefix");
+            if (host_cache) {
+                wait_host_residency(engine,
+                    [before] (std::size_t occupied) { return occupied != before; },
+                    "fresh FullReset entry did not change the arena");
+                r.fresh_occupied = engine.memory_summary().host_kv_cache_occupied_bytes;
+            }
+        }
+
         r.capacity = engine.memory_summary().host_kv_cache_bytes;
+    }
+    return r;
+}
+
+// ---------------- Phase 3: a fresh FullReset must drop a stale claim ----------------
+
+struct Phase3 {
+    Round fresh;
+    Round fresh_next;
+    Round next;
+};
+
+// Phase 3 isolates the stale-claim path. A filler is submitted first so FIFO admission puts it
+// on lane 0 (A's origin lane); A's continuation therefore has to claim A's host entry onto the
+// OTHER lane, leaving that lane with a `claimed_entry`. A brand-new prompt then matches no
+// entry and must be admitted by an in-place FullReset on a retained lane. The FullReset has to
+// drop the stale claim: otherwise the terminal retain shares the stale entry's pages and the
+// fresh decode sees a foreign KV prefix.
+Phase3 phase3_session(const char* artifact, bool host_cache) {
+    Phase3 r;
+    {
+        ninfer::Engine engine(engine_options(artifact, host_cache, 2, kHostCacheGate));
+        require(engine.load_summary().tp == 2 && engine.load_summary().model_id == "qwen3.8-27b",
+                "this test requires the TP2 Qwen3.8 artifact");
+
+        const auto ids_a = engine.prepare(coding_prompt()).debug_token_ids();
+        auto ha = engine.submit(engine.prepare(coding_prompt()), request_options(false));
+        Round ra = run_wait(ha, host_cache ? "p3_host_A" : "p3_ctl_A");
+        require(ra.reused == 0, "p3: A cold run reported a reuse");
+        if (host_cache) {
+            wait_host_residency(engine, [] (std::size_t occupied) { return occupied > 0; },
+                                "p3: A's entry was not retained");
+        }
+
+        const auto ids_follow = engine.prepare(
+            user_prompt("Now add a stress test for the FIFO queue with 10k items.")).
+            debug_token_ids();
+        Tokens cont = ids_a;
+        cont.insert(cont.end(), ra.output.begin(), ra.output.end());
+        cont.push_back(248046);
+        cont.push_back(198);
+        cont.insert(cont.end(), ids_follow.begin(), ids_follow.end());
+        auto hfill = engine.submit(
+            engine.prepare(user_prompt("Explain in one paragraph what a vtable is.")),
+            request_options(false));
+        auto hnext = engine.submit(engine.prepare_tokens(std::move(cont)), request_options(true));
+        (void) run_wait(hfill, host_cache ? "p3_host_filler" : "p3_ctl_filler");
+        r.next = run_wait(hnext, host_cache ? "p3_host_next" : "p3_ctl_next");
+        require(host_cache ? r.next.reused > 0 : r.next.reused == 0,
+                "p3: continuation reuse did not follow the host cache setting");
+
+        auto hfresh = engine.submit(
+            engine.prepare(user_prompt("Write a haiku about rain on a tin roof.")),
+            request_options(true));
+        r.fresh = run_wait(hfresh, host_cache ? "p3_host_fresh" : "p3_ctl_fresh");
+        require(r.fresh.reused == 0, "p3: fresh FullReset unexpectedly reused a prefix");
+    }
+    return r;
+}
+
+Phase3 phase3_lane1_session(const char* artifact, bool host_cache) {
+    Phase3 r;
+    {
+        ninfer::Engine engine(engine_options(artifact, host_cache, 1, kHostCacheGate));
+        require(engine.load_summary().tp == 2 && engine.load_summary().model_id == "qwen3.8-27b",
+                "this test requires the TP2 Qwen3.8 artifact");
+
+        const auto ids_a = engine.prepare(coding_prompt()).debug_token_ids();
+        auto ha = engine.submit(engine.prepare(coding_prompt()), request_options(false));
+        Round ra = run_wait(ha, host_cache ? "p3_host_A" : "p3_ctl_A");
+        require(ra.reused == 0, "p3: A cold run reported a reuse");
+        if (host_cache) {
+            wait_host_residency(engine, [] (std::size_t occupied) { return occupied > 0; },
+                                "p3: A's entry was not retained");
+        }
+
+        // An unrelated filler with reuse disabled evicts the retained lane; A's table entry stays.
+        auto hf = engine.submit(
+            engine.prepare(user_prompt("Explain in one paragraph what a vtable is.")),
+            request_options(false));
+        (void) run_wait(hf, host_cache ? "p3_host_filler" : "p3_ctl_filler");
+
+        // A's continuation cannot reuse the lane's device state (the filler overwrote it); with
+        // the host cache it is claimed from A's entry, leaving the lane claimed to that entry.
+        const auto ids_follow = engine.prepare(
+            user_prompt("Now add a stress test for the FIFO queue with 10k items.")).
+            debug_token_ids();
+        Tokens cont = ids_a;
+        cont.insert(cont.end(), ra.output.begin(), ra.output.end());
+        cont.push_back(248046);
+        cont.push_back(198);
+        cont.insert(cont.end(), ids_follow.begin(), ids_follow.end());
+        auto hn = engine.submit(engine.prepare_tokens(std::move(cont)), request_options(true));
+        r.next = run_wait(hn, host_cache ? "p3_host_next" : "p3_ctl_next");
+
+        // Brand-new prompt: no entry matches, so it is an in-place FullReset on the retained
+        // lane. Make it large enough to cover several of the stale entry's pages, so a stale
+        // share would replace the whole fresh KV prefix with A's content.
+        const auto ids_fresh = engine.prepare(long_prompt(
+            "Translate this operations runbook into a checklist for on-call rotations.", "rb", 160)).
+            debug_token_ids();
+        auto hx = engine.submit(
+            engine.prepare(long_prompt(
+                "Translate this operations runbook into a checklist for on-call rotations.",
+                "rb", 160)),
+            request_options(true));
+        r.fresh = run_wait(hx, host_cache ? "p3_host_fresh" : "p3_ctl_fresh");
+        require(r.fresh.reused == 0, "p3: fresh FullReset unexpectedly reused a prefix");
+
+        // The fresh residency is now in the table. Its follow-up claims it; if the FullReset left
+        // a stale claim behind, that residency's pages belong to A, and the follow-up decodes from
+        // a foreign KV prefix -- the observable串台.
+        const auto ids_after = engine.prepare(
+            user_prompt("Now list the first three steps of that checklist.")).debug_token_ids();
+        Tokens fcont = ids_fresh;
+        fcont.insert(fcont.end(), r.fresh.output.begin(), r.fresh.output.end());
+        fcont.push_back(248046);
+        fcont.push_back(198);
+        fcont.insert(fcont.end(), ids_after.begin(), ids_after.end());
+        auto hfn = engine.submit(engine.prepare_tokens(Tokens(fcont)), request_options(true));
+        r.fresh_next = run_wait(hfn, host_cache ? "p3_host_fresh_next" : "p3_ctl_fresh_next");
+        // Schedule-matched control inside the same session: replay the exact same token stream
+        // with reuse disabled. If the claimed residency was poisoned by a stale page share, the
+        // claim path decodes differently from the cold replay.
+        auto hcold = engine.submit(engine.prepare_tokens(std::move(fcont)), request_options(false));
+        Round cold_next = run_wait(hcold, host_cache ? "p3_host_cold_next" : "p3_ctl_cold_next");
+        require(r.fresh_next.output == cold_next.output,
+                "p3: the turn after a FullReset decoded differently from a cold replay "
+                "(stale host page share)");
     }
     return r;
 }
@@ -385,6 +537,13 @@ int main() {
         return 77;
     }
     try {
+        if (std::getenv("NINFER_HOST_GATE_PHASE3_ONLY") != nullptr) {
+            (void) &phase3_session;
+            const auto hos3 = phase3_lane1_session(artifact, /*host_cache=*/true);
+            (void) hos3;
+            std::cout << "phase 3 only: fresh FullReset after a claim PASS\n";
+            return 0;
+        }
         // Phase 1: same-lane round trip regression.
         const auto control = session(artifact, /*host_cache=*/false);
         const auto host    = session(artifact, /*host_cache=*/true);
@@ -478,6 +637,13 @@ int main() {
         // make greedy tokens schedule-dependent (even cold fillers that never touch host state
         // differ). Cross-lane claim mechanics, the exact-frontier guard, and the schedule-matched
         // claim-vs-recompute numeric check are all asserted inside cross_lane_session.
+        // Phase 3: the fresh FullReset ran on a lane that had claimed another session's entry.
+        // Its terminal retain must not have shared that stale entry's pages; if it did, the
+        // fresh decode sees a foreign KV prefix and diverges from the control session (both are
+        // short single-request rounds, so their decode schedules are comparable).
+        require(ctl2.rounds.at("fresh").output == hos2.rounds.at("fresh").output,
+                "phase 3: FullReset after a claim decoded differently (stale host page share)");
+        std::cout << "phase 3: FullReset after a claim PASS\n";
         std::cout << "phase 2: cross-lane content-addressed claims PASS\n";
         return 0;
     } catch (const std::exception& error) {
