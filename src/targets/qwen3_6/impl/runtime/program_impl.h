@@ -1709,6 +1709,7 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
     // is identical (same tokens at the same positions, and the cache never rewrites them), so
     // storing it again would double the host cost of every turn of a conversation. Only the pages
     // this request appended are copied and stored; the residency references the rest.
+    host_kv_last_retain_shared_pages = 0;
     host_kv_debugf("retain-share lane=%u claimed=%llu found=%d text_pages=%u ledger=%zu", lane,
                    static_cast<unsigned long long>(sequence.claimed_entry),
                    static_cast<int>(host_prefixes.find(sequence.claimed_entry) != nullptr),
@@ -1746,6 +1747,7 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
                      transfer.shared_backend_peer);
             }
         }
+        host_kv_last_retain_shared_pages = transfer.shared_text_pages;
         host_kv_debugf("retain-share lane=%u shared_text=%u shared_backend=%u claim_boundary=%u",
                        lane, transfer.shared_text_pages, transfer.shared_backend_pages,
                        claim_boundary);
@@ -4082,6 +4084,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.host_kv_transfer_bytes                  = host_transfer_bytes();
     out.host_kv_transfer_micros                 = host_transfer_micros();
     out.host_kv_cache_largest_free_extent_bytes = host_kv_cache_largest_free_extent_bytes();
+    out.host_kv_last_retain_shared_pages        = host_kv_last_retain_shared_pages;
     out.host_kv_retain_complete       = host_retain_copies_done();
     return out;
 }

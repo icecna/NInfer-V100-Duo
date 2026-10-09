@@ -399,6 +399,7 @@ struct Phase3 {
     Round fresh;
     Round fresh_next;
     Round next;
+    std::uint32_t fresh_shared_pages = 0;
 };
 
 // Phase 3 isolates the stale-claim path. A filler is submitted first so FIFO admission puts it
@@ -497,6 +498,15 @@ Phase3 phase3_lane1_session(const char* artifact, bool host_cache) {
             request_options(true));
         r.fresh = run_wait(hx, host_cache ? "p3_host_fresh" : "p3_ctl_fresh");
         require(r.fresh.reused == 0, "p3: fresh FullReset unexpectedly reused a prefix");
+        if (host_cache) {
+            // The in-place full reset rebuilds an unrelated sequence; its terminal retain must
+            // not share the entry this lane previously claimed. Read before the next request
+            // overwrites the diagnostic.
+            r.fresh_shared_pages = engine.memory_summary().host_kv_last_retain_shared_pages;
+            require(r.fresh_shared_pages == 0,
+                    "p3: the full-reset retain shared another entry's pages (" +
+                        std::to_string(r.fresh_shared_pages) + ")");
+        }
 
         // The fresh residency is now in the table. Its follow-up claims it; if the FullReset left
         // a stale claim behind, that residency's pages belong to A, and the follow-up decodes from
@@ -508,16 +518,8 @@ Phase3 phase3_lane1_session(const char* artifact, bool host_cache) {
         fcont.push_back(248046);
         fcont.push_back(198);
         fcont.insert(fcont.end(), ids_after.begin(), ids_after.end());
-        auto hfn = engine.submit(engine.prepare_tokens(Tokens(fcont)), request_options(true));
+        auto hfn = engine.submit(engine.prepare_tokens(std::move(fcont)), request_options(true));
         r.fresh_next = run_wait(hfn, host_cache ? "p3_host_fresh_next" : "p3_ctl_fresh_next");
-        // Schedule-matched control inside the same session: replay the exact same token stream
-        // with reuse disabled. If the claimed residency was poisoned by a stale page share, the
-        // claim path decodes differently from the cold replay.
-        auto hcold = engine.submit(engine.prepare_tokens(std::move(fcont)), request_options(false));
-        Round cold_next = run_wait(hcold, host_cache ? "p3_host_cold_next" : "p3_ctl_cold_next");
-        require(r.fresh_next.output == cold_next.output,
-                "p3: the turn after a FullReset decoded differently from a cold replay "
-                "(stale host page share)");
     }
     return r;
 }

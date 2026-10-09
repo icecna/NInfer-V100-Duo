@@ -559,6 +559,9 @@ struct MemorySummary {
     std::uint64_t host_kv_transfer_bytes  = 0;
     std::uint64_t host_kv_transfer_micros = 0;
     std::size_t host_kv_cache_largest_free_extent_bytes = 0;
+    // Text pages the most recent terminal retain shared from the entry its lane had claimed.
+    // A full reset rebuilds an unrelated sequence and must report 0 (diagnostic).
+    std::uint32_t host_kv_last_retain_shared_pages      = 0;
     // False while an in-flight terminal D2H retain still has pending device events. A caller
     // may poll this (via memory_summary) before submitting the next request, so that the next
     // admission boundary harvests a completed transfer and prefix reuse is served by the H2D

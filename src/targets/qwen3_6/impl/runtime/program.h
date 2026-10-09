@@ -542,6 +542,10 @@ public:
     std::uint64_t host_transfer_micros_total_ = 0;
     // Monotonic demand stamp: the last request that reused a host entry resists eviction.
     std::uint64_t host_demand_counter = 0;
+    // Diagnostic: text pages shared from the entry the last retain was claimed from. A full
+    // reset rebuilds an unrelated sequence, so it must never share pages and the regression
+    // probe asserts this is 0 after one.
+    std::uint32_t host_kv_last_retain_shared_pages = 0;
     // Bumped on every table mutation (insert, evict, claim-consume). Plans stamp the version at
     // computation time; a mismatch means a referenced entry may have appeared or disappeared and
     // the request must re-plan. The version, not lane ids, is the invalidation unit: host
