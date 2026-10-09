@@ -1780,28 +1780,61 @@ void ProgramImplCore::retain_host_sequence(SequenceState& sequence, std::uint32_
         transfer.gdn_peer = host_kv_arena_peer->allocate_raw(gdn_peer_bytes);
         if (!transfer.gdn_peer) { fail_allocate(); }
     }
-    if (retain_prefix) {
-        // This request publishes a prompt-end residency, so the conversation's anchor moves
-        // forward: drop the entries it contains. Running here, before any of this request's own
-        // residencies reach the table, is what keeps the prune from touching them -- at the publish
-        // site they are indistinguishable from an older request's entry, which is how an earlier
-        // attempt deleted the anchor it had just created. Content is the only identity an anonymous
-        // client has, so an older entry whose tokens are a strict prefix of this ledger holds
-        // nothing the new anchor does not still offer; the cost is not resuming from a boundary
-        // older than the anchor, the same trade the device side makes with two states per lane.
-        for (const qwen3_6::detail::HostPrefixId older : host_retention.victims()) {
-            const auto* entry = host_prefixes.find(older);
-            if (entry == nullptr || entry->in_flight_claims != 0) { continue; }
-            const std::vector<TokenId>& older_tokens = entry->payload.tokens;
-            const bool is_prefix =
-                !older_tokens.empty() && older_tokens.size() < sequence.ledger.size() &&
-                std::equal(older_tokens.begin(), older_tokens.end(), sequence.ledger.begin());
-            host_kv_debugf(
-                "prune-scan id=%llu entry_tokens=%zu entry_boundary=%u ledger=%zu prefix=%d",
-                static_cast<unsigned long long>(older), older_tokens.size(),
-                entry->payload.reuse_boundary, sequence.ledger.size(), static_cast<int>(is_prefix));
-            if (is_prefix) { evict_host_entry(older); }
+    // Drop the entries this request's own residency contains, before any of this request's own
+    // residencies reach the table (at the publish site they are indistinguishable from an older
+    // request's entry). This must run for terminal residencies too: a client shape that produces
+    // no anchor (rewrite_checkpoint invalid -- the common tool-loop shape) otherwise keeps every
+    // boundary it ever produced and the cache fills with stale checkpoints. Content is the only
+    // identity an anonymous client has, so an older entry whose tokens are a strict prefix of
+    // this ledger holds nothing this request's residency does not still offer.
+    for (const qwen3_6::detail::HostPrefixId older : host_retention.victims()) {
+        const auto* entry = host_prefixes.find(older);
+        if (entry == nullptr || entry->in_flight_claims != 0) { continue; }
+        const std::vector<TokenId>& older_tokens = entry->payload.tokens;
+        // Compare only up to the entry's reusable boundary: the tokens past it are the model's
+        // own generation (thinking included) and a follow-up that replays only the history never
+        // reproduces them verbatim, so a full-sequence prefix test would never reclaim the entry
+        // even though everything it can reuse is contained in this ledger.
+        const std::size_t usable =
+            std::min<std::size_t>(entry->payload.reuse_boundary, older_tokens.size());
+        const bool is_prefix =
+            usable > 0 && usable <= sequence.ledger.size() &&
+            std::equal(older_tokens.begin(), older_tokens.begin() + usable,
+                       sequence.ledger.begin());
+        std::size_t diff = 0;
+        while (diff < usable && diff < sequence.ledger.size() &&
+               older_tokens[diff] == sequence.ledger[diff]) {
+            ++diff;
         }
+        host_kv_debugf(
+            "prune-scan id=%llu entry_tokens=%zu entry_boundary=%u ledger=%zu prefix=%d "
+            "first_diff=%zu",
+            static_cast<unsigned long long>(older), older_tokens.size(),
+            entry->payload.reuse_boundary, sequence.ledger.size(), static_cast<int>(is_prefix),
+            diff);
+        if (is_prefix) { evict_host_entry(older); }
+    }
+    // Bound the number of resident checkpoints so stale ones cannot pin the arena while the
+    // content test above misses them (tool-call rendering makes an older prompt no longer a
+    // byte-exact prefix). Keep the most recently demanded entries -- the ones an active
+    // conversation is likely to reuse -- and evict the least recently used beyond the cap. This
+    // never inspects content, so it cannot make a wrong reuse decision; it only chooses which idle
+    // snapshot to drop. Two per lane plus two covers the concurrent conversations and their
+    // previous boundary.
+    const std::size_t checkpoint_cap = static_cast<std::size_t>(max_concurrency) * 2 + 2;
+    while (host_prefixes.size() > checkpoint_cap) {
+        bool evicted = false;
+        for (const qwen3_6::detail::HostPrefixId victim : host_retention.victims()) {
+            const auto* entry = host_prefixes.find(victim);
+            if (entry != nullptr && entry->in_flight_claims == 0) {
+                evict_host_entry(victim);
+                evicted = true;
+                break;
+            }
+        }
+        if (!evicted) { break; }
+    }
+    if (retain_prefix) {
         // Opportunity-only: the prefix residency shares the terminal's KV pages, so it needs its
         // own arena space only for the GDN snapshot and the hidden. When even that does not fit it
         // is skipped, so it never evicts a terminal residency.

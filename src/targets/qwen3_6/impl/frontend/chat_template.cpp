@@ -522,7 +522,11 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
 
     if (options.add_generation_prompt) {
         rendered += "<|im_start|>assistant\n";
-        if (!preserve_thinking && !rewrite_checkpoint) {
+        // The generation prompt is the frontier every follow-up replay reaches, so it is the
+        // right anchor even when an earlier assistant turn (a tool call) already claimed one: that
+        // earlier boundary sits before the tool results and is unreachable for the next request,
+        // which is what left the host cache holding huge terminal residencies.
+        if (!preserve_thinking) {
             rewrite_checkpoint = RewriteCheckpointByteSpec{
                 .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
         }
