@@ -287,8 +287,14 @@ Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptio
                        const media::decode::Policy& policy, MediaPreprocessCache& cache,
                        ConcurrentMediaBudget& request_budget, const PreparationControl& control) {
     media::decode::Image image = media::decode::decode_image(bytes, policy);
+    // A single image is capped at the per-request token budget in pixels, so an oversized image is
+    // shrunk by smart_resize_image instead of failing the request against the budget check below.
+    const std::uint64_t budget_pixels = static_cast<std::uint64_t>(options.max_vision_tokens) *
+                                        (std::uint64_t{kFactor} * std::uint64_t{kFactor});
+    const std::uint64_t effective_max_pixels = std::max(
+        options.image_min_pixels, std::min(options.image_max_pixels, budget_pixels));
     const Size size = smart_resize_image(image.height, image.width, options.image_min_pixels,
-                                         options.image_max_pixels);
+                                         effective_max_pixels);
     const int gh    = size.h / kPatch;
     const int gw    = size.w / kPatch;
     Prepared out;

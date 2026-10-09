@@ -1204,11 +1204,11 @@ int test_disabled_vision() {
 }
 
 int test_visual_budget_independent_of_text_context() {
-    const auto prepare_image = [](const Frontend& frontend) {
+    const auto prepare_image = [](const Frontend& frontend, const std::vector<std::uint8_t>& bytes) {
         ninfer::MessagePart image;
         image.kind = ninfer::MessagePartKind::Media;
         image.media.kind = ninfer::MediaKind::Image;
-        image.media.bytes = gradient_ppm();
+        image.media.bytes = bytes;
         image.media.media_type = "image/x-portable-pixmap";
         image.media.source_name = "budget.ppm";
         ninfer::ChatMessage message;
@@ -1220,15 +1220,21 @@ int test_visual_budget_independent_of_text_context() {
     };
     const Frontend allowed = FrontendFactory::create_component(resources(), true, 4);
     const Frontend blocked = FrontendFactory::create_component(resources(), true, 3);
-    int failures = check(FrontendFactory::inspect(prepare_image(allowed)).prepare.vision_tokens == 4,
+    int failures = check(FrontendFactory::inspect(prepare_image(allowed, gradient_ppm()))
+                             .prepare.vision_tokens == 4,
                          "visual budget rejected media within its token limit");
     bool rejected = false;
     try {
-        (void)prepare_image(blocked);
+        (void)prepare_image(blocked, gradient_ppm());
     } catch (const fi::ProcessorError& error) {
         rejected = error.kind() == fi::ProcessorErrorKind::BudgetExceeded;
     }
     failures += check(rejected, "visual token limit did not reject excess media");
+    // An image above the budget is resized down instead of rejected when the minimum pixel
+    // floor lets it fit: 128x128 (16 tokens) shrinks to the 64x64 floor (4 tokens) at budget 4.
+    failures += check(FrontendFactory::inspect(prepare_image(allowed, block_ppm(128, 128, 7)))
+                         .prepare.vision_tokens == 4,
+                     "oversized image was not resized to fit the visual budget");
     return failures;
 }
 

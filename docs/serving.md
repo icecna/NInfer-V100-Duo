@@ -213,8 +213,9 @@ media-token expansion, the result must fit Engine `--max-context`. The separatel
 token); it defaults to 32,768, and the effective Vision limit is
 `min(--max-context, --vision-max-tokens)`. Both its media-processing allowance and the startup
 Vision scratch/output reservations use this bound. A smaller visual-token budget leaves room for
-long text context on memory-constrained hardware; exceeding the media budget returns an error,
-not a shorter image. There is no fixed image/video item-count limit: item count is admitted
+long text context on memory-constrained hardware. A single image is additionally capped at the
+visual-token budget in pixels (budget × 32 × 32) and is resized down to fit instead of erroring;
+only an aggregate multi-item request exceeding the budget returns an error. There is no fixed image/video item-count limit: item count is admitted
 through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
 
 Media cache misses run as independent decode → resize → BF16-pack tasks on a bounded host worker
