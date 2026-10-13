@@ -18,6 +18,8 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -1025,6 +1027,16 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     result.context_cache.session_key          = cache_hints.session_key;
     result.context_cache.update_session_index = cache_hints.update_session_index;
     (void)checked_token_count(result.token_ids.size());
+    if (std::getenv("NINFER_PROMPT_DEBUG") != nullptr) {
+        std::fprintf(stderr,
+                     "[prompt-debug] anchor=%s frontier=%u tokens=%zu add_gen=%d preserve=%d\n",
+                     result.identity.rewrite_checkpoint ? "yes" : "no",
+                     result.identity.rewrite_checkpoint
+                         ? result.identity.rewrite_checkpoint->frontier
+                         : 0U,
+                     result.token_ids.size(), static_cast<int>(options.add_generation_prompt),
+                     static_cast<int>(options.preserve_thinking));
+    }
     result.identity.reusable   = true;
     result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
     result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
